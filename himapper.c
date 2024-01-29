@@ -1,36 +1,12 @@
 /*********************************************************************************************\
  *
- *  Find best map of long, noisy DNA reads to a set of reference contigs:
- *    Compare each read in each 'reads' read block against all the contigs (and their complements)
- *    in the 'reference' dam looking for the best alignments of all or disjoint parts of
- *    the read.  An output stream of 'Overlap' records (see align.h) is written in binary to
- *    the standard output, each encoding a given found local alignment between two of the
- *    sequences.  The -v option turns on a verbose reporting mode that gives statistics on
- *    each major stage.
- *
- *    The filter operates by looking for a pair of diagonal bands of width |A|*(1-"-e") that
- *    contain a collection of exact matching 'k'-mers between the two sequences, such that
- *    the total number of bases covered by the interval covered by 'k'-mers is not dominated
- *    by any other band pair.
- *
- *    Some k-mers are significantly over-represented (e.g. homopolymer runs).  These are
- *    suppressed as seed hits, with the parameter 't' -- any k-mer that occurs more than
- *    't' times in either the subject or target is not counted as a seed hit.  If the -t
- *    option is absent then no k-mer is suppressed.  Alternatively the option -M specifies
- *    that 't' is dynamically set to the largest value such that less than -M memory is
- *    used.
- *
- *    For each subject, target pair, say XXX and YYY, the program outputs a file containing
- *    overlaps of the form XXX.YYY.N#.las that contain overlaps in both the normal and
- *    complemented orientation.  # is the thread that detected and wrote out the collection
- *    of overlaps.  For example, if NTHREAD in the program is 4, then 4 files are output for
- *    each reference, reads pair.
+ *  Find best map of long, HiFi DNA reads to a set of reference contigs:
  *
  *  Author:  Gene Myers
  *  Date  :  Feb 9, 2016
  *
  *********************************************************************************************/
- 
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -147,6 +123,7 @@ typedef struct
     int  out;
   } Event;
 
+// TODO: hl,dlにはない
 static void reheap(int s, Event **heap, int hsize)
 { int      c, l, r;
   Event   *hs, *hr, *hl;
@@ -178,6 +155,7 @@ static void reheap(int s, Event **heap, int hsize)
     heap[c] = hs;
 }
 
+// TODO: hlにはない
 static int64 merge_size(DAZZ_DB *block, int mtop)
 { Event       ev[mtop+1];
   Event      *heap[mtop+2];
@@ -250,6 +228,7 @@ static int64 merge_size(DAZZ_DB *block, int mtop)
   return (nsize);
 }
 
+// TODO: hlにはない
 static DAZZ_TRACK *merge_tracks(DAZZ_DB *block, int mtop, int64 nsize)
 { DAZZ_TRACK *ntrack;
   Event       ev[mtop+1];
@@ -414,6 +393,7 @@ static int read_DB(DAZZ_DB *block, char *name, char **mask, int *mstat, int mtop
   return (isdam);
 }
 
+// TODO: hl,dlにはない
 static void complement(char *s, int len)
 { char *t;
   int   c;
@@ -430,6 +410,7 @@ static void complement(char *s, int len)
     *s = (char) (3-*s);
 }
 
+// TODO: hl,dlにはない
 static DAZZ_DB *complement_DB(DAZZ_DB *block, int inplace)
 { static DAZZ_DB _cblock, *cblock = &_cblock;
   int            nreads;
@@ -556,6 +537,7 @@ void Clean_Exit(int val)
 int main(int argc, char *argv[])
 { DAZZ_DB    _ablock, _bblock;
   DAZZ_DB    *ablock = &_ablock, *bblock = &_bblock;
+  // TODO: ここに[a|b]class
   char       *afile,  *bfile;
   char       *aroot,  *broot, *apwd;
   void       *aindex, *bindex;
@@ -568,7 +550,7 @@ int main(int argc, char *argv[])
 
   int    COVER, NOMAP;
   int    KMER_LEN;
-  int    MAX_REPS;
+  // int    MAX_REPS;
   double AVE_ERROR;
   int    NTHREADS;
   int    MAP_ORDER;
@@ -580,13 +562,13 @@ int main(int argc, char *argv[])
     char  *eptr;
     DIR   *dirp;
 
-    ARG_INIT("damapper")
+    ARG_INIT("himapper")
 
-    KMER_LEN  = 20;
-    MAX_REPS  = 0;
-    AVE_ERROR = .85;
+    KMER_LEN  = 40;
+    // MAX_REPS  = 0;
+    AVE_ERROR = .97;
     SPACING   = 100;       //   Globally visible to map.c
-    BEST_TIE  = 1.0;
+    BEST_TIE  = 1.0;   // TODO: なんのオプション？
     NTHREADS  = 4;
     SORT_PATH = "/tmp";
 
@@ -597,12 +579,12 @@ int main(int argc, char *argv[])
         fflush(stderr);
       }
 
-    MTOP  = 0;
-    MMAX  = 10;
-    MASK  = (char **) Malloc(MMAX*sizeof(char *),"Allocating mask track array");
-    MSTAT = (int *) Malloc(MMAX*sizeof(int),"Allocating mask status array");
-    if (MASK == NULL || MSTAT == NULL)
-      exit (1);
+    // MTOP  = 0;
+    // MMAX  = 10;
+    // MASK  = (char **) Malloc(MMAX*sizeof(char *),"Allocating mask track array");
+    // MSTAT = (int *) Malloc(MMAX*sizeof(int),"Allocating mask status array");
+    // if (MASK == NULL || MSTAT == NULL)
+    //   exit (1);
 
     j = 1;
     for (i = 1; i < argc; i++)
@@ -621,21 +603,26 @@ int main(int argc, char *argv[])
             break;
           case 'k':
             ARG_POSITIVE(KMER_LEN,"K-mer length")
-            if (KMER_LEN > 32)
-              { fprintf(stderr,"%s: K-mer length must be 32 or less\n",Prog_Name);
+            // if (KMER_LEN > 32)
+            //   { fprintf(stderr,"%s: K-mer length must be 32 or less\n",Prog_Name);
+            //     exit (1);
+            //   }
+            if (KMER_LEN <= 16 || KMER_LEN > 48)
+              { fprintf(stderr,"%s: K-mer length must be between 17 and 48\n",Prog_Name);
                 exit (1);
-              }
+              }   // TODO: このKMER_LENに対応しているか確認
             break;
-          case 'm':
-            if (MTOP >= MMAX)
-              { MMAX  = 1.2*MTOP + 10;
-                MASK  = (char **) Realloc(MASK,MMAX*sizeof(char *),"Reallocating mask track array");
-                MSTAT = (int *) Realloc(MSTAT,MMAX*sizeof(int),"Reallocating mask status array");
-                if (MASK == NULL || MSTAT == NULL)
-                  exit (1);
-              }
-            MASK[MTOP++] = argv[i]+2;
-            break;
+            // TODO: hlだと -m は MASK_DIFF_THRES。こちらもそうする？
+          // case 'm':
+          //   if (MTOP >= MMAX)
+          //     { MMAX  = 1.2*MTOP + 10;
+          //       MASK  = (char **) Realloc(MASK,MMAX*sizeof(char *),"Reallocating mask track array");
+          //       MSTAT = (int *) Realloc(MSTAT,MMAX*sizeof(int),"Reallocating mask status array");
+          //       if (MASK == NULL || MSTAT == NULL)
+          //         exit (1);
+          //     }
+          //   MASK[MTOP++] = argv[i]+2;
+          //   break;
           case 'n':
             ARG_REAL(BEST_TIE)
             if (BEST_TIE < .7 || BEST_TIE > 1.)
@@ -647,9 +634,9 @@ int main(int argc, char *argv[])
           case 's':
             ARG_POSITIVE(SPACING,"Trace spacing")
             break;
-          case 't':
-            ARG_POSITIVE(MAX_REPS,"Tuple supression frequency")
-            break;
+          // case 't':
+          //   ARG_POSITIVE(MAX_REPS,"Tuple supression frequency")
+          //   break;
           case 'M':
             { int limit;
 
@@ -674,7 +661,7 @@ int main(int argc, char *argv[])
     argc = j;
 
     VERBOSE   = flags['v'];   //  Globally declared in map.h
-    PROFILE   = flags['p'];
+    // PROFILE   = flags['p'];
     COVER     = flags['C'];
     NOMAP     = flags['N'];
     MAP_ORDER = 1-flags['z'];
@@ -685,7 +672,7 @@ int main(int argc, char *argv[])
         fprintf(stderr,"       %*s %s\n",(int) strlen(Prog_Name),"",Usage[2]);
         fprintf(stderr,"\n");
         fprintf(stderr,"      -k: k-mer size (must be <= 32).\n");
-        fprintf(stderr,"      -t: Ignore k-mers that occur >= -t times in a block.\n");
+        // fprintf(stderr,"      -t: Ignore k-mers that occur >= -t times in a block.\n");
         fprintf(stderr,"      -M: Use only -M GB of memory by ignoring most frequent k-mers.\n");
         fprintf(stderr,"\n");
         fprintf(stderr,"      -e: Look for alignments with -e percent similarity.\n");
@@ -694,13 +681,13 @@ int main(int argc, char *argv[])
         fprintf(stderr,"\n");
         fprintf(stderr,"      -T: Use -T threads.\n");
         fprintf(stderr,"      -P: Do sorts and merges in directory -P.\n");
-        fprintf(stderr,"      -m: Soft mask the blocks with the specified mask.\n");
+        // fprintf(stderr,"      -m: Soft mask the blocks with the specified mask.\n");
         fprintf(stderr,"\n");
         fprintf(stderr,"      -v: Verbose mode, output statistics as proceed.\n");
         fprintf(stderr,"      -z: sort .las by A,B-read pairs (overlap piles)\n");
         fprintf(stderr,"          off => sort .las by A-read,A-position pairs");
         fprintf(stderr," (default for mapping)\n");
-        fprintf(stderr,"      -p: Output repeat profile track\n");
+        // fprintf(stderr,"      -p: Output repeat profile track\n");
         fprintf(stderr,"      -C: Output reference vs reads .las.\n");
         fprintf(stderr,"      -N: Do not output reads vs reference .las.\n");
         exit (1);
@@ -719,18 +706,19 @@ int main(int argc, char *argv[])
       else
         mflag = FLAG_DOA;
 
-    if (NOMAP && PROFILE)
-      { fprintf(stderr,"%s: Cannot specify both N and p flags together\n",Prog_Name);
-        exit (1);
-      }
+    // if (NOMAP && PROFILE)
+    //   { fprintf(stderr,"%s: Cannot specify both N and p flags together\n",Prog_Name);
+    //     exit (1);
+    //   }
 
-    for (j = 0; j < MTOP; j++)
-      MSTAT[j] = -2;
+    // for (j = 0; j < MTOP; j++)
+    //   MSTAT[j] = -2;
   }
 
   //  For reference argv[1]: get file path parts (apwd/aroot), whether it is a dam or db,
   //    number of blocks, and set alignment specification with its frequencies.
 
+  // TODO: ここからmapper-specific
   { int     p, part, nfiles, tlast, plen;
     char   *cat, *bptr, *fptr;
     char    fname[MAX_NAME], prolog[MAX_NAME];
@@ -742,7 +730,7 @@ int main(int argc, char *argv[])
       aroot = Root(argv[1],".dam");
     else
       aroot = Root(argv[1],".db");
-    apwd = PathTo(argv[1]);
+    apwd = PathTo(argv[1]);   // TODO: hlだとapath
 
     bptr = rindex(aroot,'.');
     if (bptr != NULL && bptr[1] != '\0' && bptr[1] != '-')
@@ -793,9 +781,11 @@ int main(int argc, char *argv[])
       }
     fclose(index);
 
-    settings = New_Align_Spec( AVE_ERROR, SPACING, dbase.freq, 1);
+    settings = New_Align_Spec(AVE_ERROR, SPACING, dbase.freq, 1);
   }
+  // TODO: ここまでmapper-specific
 
+  // TODO: S_F_P の args が変わっている
   if (Set_Filter_Params(KMER_LEN,MAX_REPS,NTHREADS))
     { fprintf(stderr,"Illegal combination of filter parameters\n");
       exit (1);
@@ -808,7 +798,7 @@ int main(int argc, char *argv[])
     newpath = (char *) Malloc(strlen(SORT_PATH)+30,"Allocating sort path");
     if (newpath == NULL)
       exit (1);
-    sprintf(newpath,"%s/damapper.%d",SORT_PATH,getpid());
+    sprintf(newpath,"%s/himapper.%d",SORT_PATH,getpid());
     if (mkdir(newpath,S_IRWXU) !=  0)
       { fprintf(stderr,"%s: Could not create directory %s\n",Prog_Name,newpath);
         exit (1);
@@ -832,6 +822,7 @@ int main(int argc, char *argv[])
           printf("\nBuilding index for %s\n",broot);
         bindex = Sort_Kmers(bblock,&blen);
 
+        // TODO: hl,dlだとAdvance_Block_Arg(parse)としている。aとb逆だからだめ？
         for (k = 1; k <= nblocks; k++)
           { if (isdam)
               afile = Strdup(Catenate(apwd,"/",aroot,Numbered_Suffix(".",k,".dam")),
@@ -861,13 +852,13 @@ int main(int argc, char *argv[])
             Match_Filter(bblock,ablock,bindex,blen,aindex,alen,1,0);
 
             Close_DB(ablock);
-          }
+          }   // for (k = 1; k <= nblocks; k++)
 
         if (isdam)
           afile = Strdup(Catenate(apwd,"/",aroot,".dam"),"Allocating name");
-	else
+        else
           afile = Strdup(Catenate(apwd,"/",aroot,".db"),"Allocating name");
-        read_DB(ablock,afile,MASK,MSTAT,0,KMER_LEN);
+        read_DB(ablock,afile,MASK,MSTAT,0,KMER_LEN);   // TODO: 何をしている？
         free(afile);
 
         if (VERBOSE)
@@ -879,6 +870,7 @@ int main(int argc, char *argv[])
         free(bindex);
         Close_DB(bblock);
 
+
 #define SYSTEM_CHECK(command)                                           \
  if (VERBOSE)                                                           \
    printf("%s\n",command);                                              \
@@ -887,6 +879,7 @@ int main(int argc, char *argv[])
                     Prog_Name,(int) strlen(Prog_Name),"",command);      \
      Clean_Exit(1);                                                     \
    }
+
 
         command = CommandBuffer(aroot,broot,SORT_PATH);
 
@@ -911,11 +904,11 @@ int main(int argc, char *argv[])
           }
 
         free(broot);
-      }
+      }   // for (i = 2; i < argc; i++)
 
-    for (j = 0; j < MTOP; j++)
-      if (MSTAT[j] == 0)
-        printf("%s: Warning: Track %s given but never used.\n", Prog_Name,MASK[j]);
+    // for (j = 0; j < MTOP; j++)
+    //   if (MSTAT[j] == 0)
+    //     printf("%s: Warning: Track %s given but never used.\n", Prog_Name,MASK[j]);
   }
 
   Clean_Exit(0);
