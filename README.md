@@ -1,3 +1,15 @@
+# Himapper_rp
+
+Fast, haplotype-aware HiFi read mapper using relative k-mer profiles.
+
+
+
+
+
+---
+
+Below are the original description of DAMAPPER
+
 # The Damapper Library
 
 ## _Author:  Gene Myers_

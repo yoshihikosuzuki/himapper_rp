@@ -550,7 +550,7 @@ int main(int argc, char *argv[])
 
   int    COVER, NOMAP;
   int    KMER_LEN;
-  // int    MAX_REPS;
+  int    MAX_REPS;
   double AVE_ERROR;
   int    NTHREADS;
   int    MAP_ORDER;
@@ -565,7 +565,7 @@ int main(int argc, char *argv[])
     ARG_INIT("himapper")
 
     KMER_LEN  = 40;
-    // MAX_REPS  = 0;
+    MAX_REPS  = 0;
     AVE_ERROR = .97;
     SPACING   = 100;       //   Globally visible to map.c
     BEST_TIE  = 1.0;   // TODO: なんのオプション？
@@ -634,9 +634,9 @@ int main(int argc, char *argv[])
           case 's':
             ARG_POSITIVE(SPACING,"Trace spacing")
             break;
-          // case 't':
-          //   ARG_POSITIVE(MAX_REPS,"Tuple supression frequency")
-          //   break;
+          case 't':
+            ARG_POSITIVE(MAX_REPS,"Tuple supression frequency")
+            break;
           case 'M':
             { int limit;
 
