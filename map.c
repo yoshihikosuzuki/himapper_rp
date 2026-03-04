@@ -31,6 +31,9 @@
 
 #define MAXGRAM 10000  //  Cap on k-mer count histogram (in count_thread, merge_thread)
 
+// #define DEBUG_SEED_HIT      //  Print every seed hit: ref_id/pos, read_id/pos, kmer string
+#define DEBUG_CANDIDATE_STATS  //  Print per-strand seed-hit distribution over reads
+
 #define HITMIN    3    //  minimum # of k-mers in a potential seed
 
 #define MAX_GAP   1000 //  maximum separation between two k-mers in a chain
@@ -824,6 +827,143 @@ no_mers:
 
 /*******************************************************************************************
  *
+ *  LOAD PRE-COMPUTED KPOS INDEX
+ *
+ *  Read a .kpos file produced by modimizer and return a KmerPos array sorted
+ *  by code, with two sentinel entries appended — exactly the same contract as
+ *  Sort_Kmers.  If comp != 0 each code is replaced by its reverse-complement
+ *  2-bit representation before sorting (for RC-strand seed matching).
+ *
+ ********************************************************************************************/
+
+static int cmp_kmerpos(const void *a, const void *b)
+{ const KmerPos *ka = (const KmerPos *) a;
+  const KmerPos *kb = (const KmerPos *) b;
+  if (ka->code < kb->code) return (-1);
+  if (ka->code > kb->code) return ( 1);
+  return (0);
+}
+
+void *Load_Kpos(const char *path, int comp, DAZZ_DB *block, int *len)
+{ FILE    *f;
+  uint8_t  ver, flags, idx_bytes, reserved;
+  int32_t  kval, entry_size;
+  uint64   n_entries;
+  KmerPos *arr;
+  uint64   i;
+  char     magic[4];
+
+  f = fopen(path, "rb");
+  if (f == NULL)
+    { fprintf(stderr, "%s: Cannot open kpos file %s\n", Prog_Name, path);
+      Clean_Exit(1);
+    }
+
+  if (fread(magic,       4,               1, f) != 1 ||
+      fread(&ver,        1,               1, f) != 1 ||
+      fread(&flags,      1,               1, f) != 1 ||
+      fread(&idx_bytes,  1,               1, f) != 1 ||
+      fread(&reserved,   1,               1, f) != 1 ||
+      fread(&kval,       sizeof(int32_t), 1, f) != 1 ||
+      fread(&entry_size, sizeof(int32_t), 1, f) != 1 ||
+      fread(&n_entries,  sizeof(uint64),  1, f) != 1)
+    { fprintf(stderr, "%s: Failed to read header of %s\n", Prog_Name, path);
+      fclose(f); Clean_Exit(1);
+    }
+
+  if (magic[0]!='K' || magic[1]!='P' || magic[2]!='O' || magic[3]!='S')
+    { fprintf(stderr, "%s: Bad magic in kpos file %s\n", Prog_Name, path);
+      fclose(f); Clean_Exit(1);
+    }
+
+  if (kval != Kmer)
+    { fprintf(stderr, "%s: kpos K=%d but filter K=%d\n", Prog_Name, kval, Kmer);
+      fclose(f); Clean_Exit(1);
+    }
+
+  if (n_entries == 0)
+    { fclose(f); *len = 0; return (NULL); }
+
+  // KmerPos { uint64 code; int rpos; int read; } is binary-compatible with
+  // the modimizer entry { uint64_t code; int32_t rpos; int32_t rid; }.
+  arr = (KmerPos *) Malloc(sizeof(KmerPos)*(n_entries+2), "Allocating Load_Kpos array");
+  if (arr == NULL)
+    { fclose(f); Clean_Exit(1); }
+
+  if (fread(arr, sizeof(KmerPos), (size_t)n_entries, f) != (size_t)n_entries)
+    { fprintf(stderr, "%s: Failed to read all entries from %s\n", Prog_Name, path);
+      free(arr); fclose(f); Clean_Exit(1);
+    }
+  fclose(f);
+
+  if (comp)
+    { // Replace each forward code with its reverse-complement 2-bit code.
+      // Also convert rpos from modimizer's start-of-kmer convention to
+      // tuple_thread's last-base convention in the RC sequence:
+      //   rpos_RC = rlen - 1 - rpos_start
+      // Derivation: forward k-mer at start s occupies [s, s+K-1].
+      // Its RC occupies [rlen-s-K, rlen-s-1] in the RC sequence.
+      // tuple_thread stores last-base position = rlen - s - 1 = rlen - 1 - rpos.
+      for (i = 0; i < n_entries; i++)
+        { uint64 c = arr[i].code, r = 0;
+          int    b;
+          int    orig_rpos = arr[i].rpos;
+          int    rlen      = block->reads[arr[i].read].rlen;
+          for (b = 0; b < Kmer; b++)
+            { r = (r << 2) | (3 - (c & 3));
+              c >>= 2;
+            }
+          arr[i].code = r & Kmask;
+          arr[i].rpos = rlen - 1 - orig_rpos;
+
+#ifdef DEBUG_CANDIDATE_STATS
+          // Spot-check first 3 entries: decode both codes and verify complement+reverse
+          if (i < 3)
+            { char fstr[65], rstr[65];
+              // reconstruct forward code from RC code's RC
+              uint64 rc2 = arr[i].code, fc2 = 0;
+              for (b = 0; b < Kmer; b++)
+                { fc2 = (fc2 << 2) | (3 - (rc2 & 3));
+                  rc2 >>= 2;
+                }
+              fc2 &= Kmask;  // this should equal the original forward code
+              // decode RC code
+              uint64 tmp = arr[i].code;
+              for (b = Kmer-1; b >= 0; b--) { rstr[b] = "ACGT"[tmp & 3]; tmp >>= 2; }
+              rstr[Kmer] = '\0';
+              tmp = fc2;
+              for (b = Kmer-1; b >= 0; b--) { fstr[b] = "ACGT"[tmp & 3]; tmp >>= 2; }
+              fstr[Kmer] = '\0';
+              fprintf(stderr,
+                "[RC_CHECK] entry %llu: read=%d rlen=%d"
+                " fwd_rpos=%d -> rc_rpos=%d"
+                " fwd=%s  rc=%s\n",
+                (unsigned long long)i,
+                arr[i].read, rlen, orig_rpos, arr[i].rpos,
+                fstr, rstr);
+            }
+#endif
+        }
+    }
+
+  qsort(arr, (size_t)n_entries, sizeof(KmerPos), cmp_kmerpos);
+
+  arr[n_entries  ].code = 0xffffffffffffffffllu;
+  arr[n_entries+1].code = 0;
+
+  if (VERBOSE)
+    { printf("   Loaded %llu %sk-mers from %s\n",
+             (unsigned long long)n_entries, comp ? "RC " : "", path);
+      fflush(stdout);
+    }
+
+  *len = (int) n_entries;
+  return (arr);
+}
+
+
+/*******************************************************************************************
+ *
  *  MERGE SORTED K-MER LISTS
  *
  ********************************************************************************************/
@@ -989,6 +1129,17 @@ static void *merge_thread(void *arg)
                       hits[nhits].aread = asort[a].read;
                       hits[nhits].apos  = ap;
                       hits[nhits].diag  = ap - bsort[b].rpos;
+#ifdef DEBUG_SEED_HIT
+                      { char kstr[65]; uint64 tmp = asort[a].code; int _b;
+                        for (_b = Kmer-1; _b >= 0; _b--) { kstr[_b] = "ACGT"[tmp & 3]; tmp >>= 2; }
+                        kstr[Kmer] = '\0';
+                        fprintf(stderr,
+                          "  hit: read=%d rpos=%d ref=%d rpos=%d kmer=%s\n",
+                          asort[a].read, ap,
+                          bsort[b].read, bsort[b].rpos,
+                          kstr);
+                      }
+#endif
                       nhits += 1;
                     }
                 }
@@ -3177,6 +3328,55 @@ void Match_Filter(DAZZ_DB *ablock, DAZZ_DB *bblock,
         tfilt += nfilt;
       }
   }
+
+#ifdef DEBUG_CANDIDATE_STATS
+  if (nhits > 0)
+    { // Collect per-read (b-side) seed-hit counts and print distribution.
+      // bread == read ID on the b-side (reads in this pipeline).
+      int   nbreads = bblock->nreads;
+      int  *rcnt    = (int *) calloc((size_t)nbreads, sizeof(int));
+      if (rcnt != NULL)
+        { int64 si;
+          int   nr_with_hits = 0;
+          int   max_hits     = 0;
+          int   b1=0, b2=0, b3=0, b4=0, b5=0;  // <4, 4-9, 10-19, 20-49, >=50
+          for (si = 0; si < nhits; si++)
+            rcnt[khit[si].bread] += 1;
+          for (int r = 0; r < nbreads; r++)
+            { if (rcnt[r] > 0)
+                { nr_with_hits++;
+                  if (rcnt[r] > max_hits) max_hits = rcnt[r];
+                  if      (rcnt[r] <  4)  b1++;
+                  else if (rcnt[r] < 10)  b2++;
+                  else if (rcnt[r] < 20)  b3++;
+                  else if (rcnt[r] < 50)  b4++;
+                  else                    b5++;
+                }
+            }
+          // Count unique ref contigs hit on each strand
+          int   nareads = ablock->nreads;
+          int  *acnt    = (int *) calloc((size_t)nareads, sizeof(int));
+          if (acnt != NULL)
+            { for (si = 0; si < nhits; si++)
+                acnt[khit[si].aread] += 1;
+              int nr_ref_hit = 0;
+              for (int r = 0; r < nareads; r++)
+                if (acnt[r] > 0) nr_ref_hit++;
+              fprintf(stderr,
+                "[CAND_STATS %s] nhits=%lld  reads_with_hits=%d / %d"
+                "  max_hits_per_read=%d  ref_contigs_hit=%d / %d\n"
+                "  hits/read dist:  <4:%-6d  4-9:%-6d  10-19:%-6d  20-49:%-6d  >=50:%-6d\n",
+                comp ? "RC" : "FW",
+                (long long)nhits, nr_with_hits, nbreads,
+                max_hits, nr_ref_hit, nareads,
+                b1, b2, b3, b4, b5);
+              fflush(stderr);
+              free(acnt);
+            }
+          free(rcnt);
+        }
+    }
+#endif
 
   free(work2);
   free(work1);

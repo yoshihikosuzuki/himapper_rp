@@ -27,6 +27,11 @@ int Set_Filter_Params(int kmer, int suppress, int nthreads);
 
 void *Sort_Kmers(DAZZ_DB *block, int *len);
 
+// Load a .kpos file produced by modimizer.  Returns the same KmerPos array
+// (sorted by code, +2 sentinels) that Sort_Kmers would return.
+// comp=0: forward-strand codes;  comp=1: reverse-complement codes.
+void *Load_Kpos(const char *path, int comp, DAZZ_DB *block, int *len);
+
 void Match_Filter(DAZZ_DB *ablock, DAZZ_DB *bblock,
                   void *atable, int alen, void *btable, int blen, int comp, int start);
 

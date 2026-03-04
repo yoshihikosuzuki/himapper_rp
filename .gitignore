@@ -5,3 +5,13 @@ FASTK
 himapper
 HPC.himapper
 hiligner_cp
+modimizer
+copy_minimizer
+minimaxmer
+dump_kpos
+
+work
+run.sh
+*.txt
+*.kpos
+*.las

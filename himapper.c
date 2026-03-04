@@ -28,7 +28,7 @@
 static char *Usage[] =
   { "[-vpzCN] [-k<int(20)>] [-t<int>] [-M<int>] [-T<int(4)>] [-P<dir(/tmp)>]",
     "         [-e<double(.85)] [-s<int(100)>] [-n<double(1.00)>]",
-    "         [-m<track>]+  <reference:dam> <reads:db> ...",
+    "         [-m<track>]+  <reference:dam> <ref.kpos> <reads:db> ...",
   };
 
 int     VERBOSE;   //   Globally visible to map.c
@@ -540,6 +540,7 @@ int main(int argc, char *argv[])
   // TODO: ここに[a|b]class
   char       *afile,  *bfile;
   char       *aroot,  *broot, *apwd;
+  char       *kpos_path;
   void       *aindex, *bindex;
   int         alen,    blen;
   int         isdam, nblocks;   //  of reference (a-argument)
@@ -564,7 +565,7 @@ int main(int argc, char *argv[])
 
     ARG_INIT("himapper")
 
-    KMER_LEN  = 40;
+    KMER_LEN  = 32;
     MAX_REPS  = 0;
     AVE_ERROR = .97;
     SPACING   = 100;       //   Globally visible to map.c
@@ -666,7 +667,7 @@ int main(int argc, char *argv[])
     NOMAP     = flags['N'];
     MAP_ORDER = 1-flags['z'];
 
-    if (argc <= 2)
+    if (argc <= 3)
       { fprintf(stderr,"Usage: %s %s\n",Prog_Name,Usage[0]);
         fprintf(stderr,"       %*s %s\n",(int) strlen(Prog_Name),"",Usage[1]);
         fprintf(stderr,"       %*s %s\n",(int) strlen(Prog_Name),"",Usage[2]);
@@ -692,6 +693,14 @@ int main(int argc, char *argv[])
         fprintf(stderr,"      -N: Do not output reads vs reference .las.\n");
         exit (1);
       }
+
+    // Extract the ref.kpos path (argv[2]) and shift reads to argv[2..]
+    kpos_path = argv[2];
+    { int i;
+      for (i = 3; i < argc; i++)
+        argv[i-1] = argv[i];
+      argc -= 1;
+    }
 
     if (COVER)
       if (NOMAP)
@@ -834,8 +843,8 @@ int main(int argc, char *argv[])
             free(afile);
 
             if (VERBOSE)
-              printf("\nBuilding index for %s.%d\n",aroot,k);
-            aindex = Sort_Kmers(ablock,&alen);
+              printf("\nBuilding index for %s.%d (from %s)\n",aroot,k,kpos_path);
+            aindex = Load_Kpos(kpos_path, 0, ablock, &alen);
 
             if (VERBOSE)
               printf("\nComparing %s to %s.%d\n",broot,aroot,k);
@@ -844,8 +853,8 @@ int main(int argc, char *argv[])
             ablock = complement_DB(ablock,1);
  
             if (VERBOSE)
-              printf("\nBuilding index for c(%s.%d)\n",aroot,k);
-            aindex = Sort_Kmers(ablock,&alen);
+              printf("\nBuilding index for c(%s.%d) (from %s)\n",aroot,k,kpos_path);
+            aindex = Load_Kpos(kpos_path, 1, ablock, &alen);
 
             if (VERBOSE)
               printf("\nComparing %s to c(%s.%d)\n",broot,aroot,k);
