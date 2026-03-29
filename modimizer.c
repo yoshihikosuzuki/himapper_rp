@@ -10,7 +10,7 @@
 
 const int K = 32;
 const int Km1 = K - 1;
-const int MOD = 1001;
+const int MOD = 101;
 const int MOD_THRES = 1;
 
 // ASCII base → 2-bit value  (A=0, C=1, G=2, T=3), matching the DAZZ_DB

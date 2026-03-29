@@ -2,17 +2,20 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "DB.h"
 #include "nthash.h"
 #include "libfastk.h"  // FASTK profile API (compile with -IFASTK)
 
 // #define DEBUG_HASH
+// #define DEBUG_NW
 
 const int K = 32;
 const int Km1 = K - 1;
-#define WSIZE 2000   // sliding window width for (count, hash) minimizer
-#define MOD   1001   // hash modulus for tiebreaking (prime > WSIZE recommended)
+#define WSIZE  2000   // sliding window width for (count, hash) minimizer
+#define MOD    2003   // hash modulus for tiebreaking (prime > WSIZE recommended)
+#define RSPACE  500   // minimum spacing between uniformly sparse seeds
 
 // ASCII base → 2-bit value  (A=0, C=1, G=2, T=3), matching the DAZZ_DB
 // numeric encoding used by himapper's tuple_thread.
@@ -30,6 +33,30 @@ static const uint64_t KMASK =
 // Compare (ca, ha) < (cb, hb) lexicographically: count first, hash to break ties.
 static inline int tuple_lt(uint16_t ca, uint64_t ha, uint16_t cb, uint64_t hb)
 { return (ca < cb) || (ca == cb && ha < hb); }
+
+// Candidate for uniformly sparse thinning.
+typedef struct {
+  int      pos;
+  int      nw_val;
+  uint16_t g_count;
+  uint64_t hash;
+} Candidate;
+
+// Compare candidates by descending h_nw priority:
+//   1. nw      descending (more windows → higher priority)
+//   2. g_count ascending  (rarer in genome → better seed)
+//   3. hash    ascending  (stable tiebreaker)
+static int cand_cmp(const void *a, const void *b)
+{ const Candidate *ca = (const Candidate *)a;
+  const Candidate *cb = (const Candidate *)b;
+  if (ca->nw_val != cb->nw_val)
+    return (cb->nw_val > ca->nw_val) ? 1 : -1;
+  if (ca->g_count != cb->g_count)
+    return (ca->g_count > cb->g_count) ? 1 : -1;
+  if (ca->hash != cb->hash)
+    return (ca->hash > cb->hash) ? 1 : -1;
+  return 0;
+}
 
 // Select seeds using a sliding-window (count, hash) minimizer.
 //
@@ -75,7 +102,8 @@ int find_seeds(const char    *seq,
   //   (it can never win a future window while the new element is around).
   int  *dq      = (int  *) malloc((size_t)plen * sizeof(int));
   bool *is_seed = (bool *) calloc((size_t)plen,  sizeof(bool));
-  if (!dq || !is_seed) { perror("malloc deque/is_seed"); exit(1); }
+  int  *nw      = (int  *) calloc((size_t)plen,  sizeof(int));   // # of windows for which position i is minimizer
+  if (!dq || !is_seed || !nw) { perror("malloc deque/is_seed/nw"); exit(1); }
 
   int dq_head = 0, dq_tail = 0;
   for (int i = 0; i < plen; i++)
@@ -94,8 +122,103 @@ int find_seeds(const char    *seq,
 
       // Only consider complete windows of exactly WSIZE k-mers (standard minimizer definition).
       if (i >= WSIZE - 1)
-        is_seed[dq[dq_head]] = true;
+        { is_seed[dq[dq_head]] = true;
+          nw[dq[dq_head]]++;
+        }
+#ifdef DEBUG_HASH
+      if (i >= WSIZE - 1)
+      { int win_start = i - WSIZE + 1;
+        int min_pos   = dq[dq_head];
+        fprintf(stderr, "WINDOW read=%d [%d..%d]  minimizer=@%d g=%u h=%lu\n",
+                read_id, win_start, i, min_pos,
+                (unsigned)profile[min_pos], hvals[min_pos]);
+        for (int j = win_start; j <= i; j++) {
+          const char *wkp = seq - K + 1 + j;
+          char wkstr[65];
+          for (int b2 = 0; b2 < K; b2++) wkstr[b2] = wkp[b2];
+          wkstr[K] = '\0';
+          fprintf(stderr, "  j=%-6d g=%-5u h=%-4lu  %s%s\n",
+                  j,
+                  (unsigned)profile[j], hvals[j],
+                  wkstr,
+                  (j == min_pos) ? "  <-- MIN" : "");
+        }
+      }
+#endif
     }
+
+  // Step 2.5: Uniformly sparse thinning.
+  // Sort candidates by descending h_nw = (NW, -h_minimax) priority, then
+  // greedily accept only those whose position is ≥ RSPACE from every
+  // already-accepted seed.
+  { int ncand = 0;
+    for (int i = 0; i < plen; i++)
+      if (is_seed[i]) ncand++;
+
+    if (ncand > 1)
+      { Candidate *cands = (Candidate *) malloc((size_t)ncand * sizeof(Candidate));
+        if (!cands) { perror("malloc cands"); exit(1); }
+        { int ci = 0;
+          for (int i = 0; i < plen; i++)
+            if (is_seed[i])
+              { cands[ci].pos     = i;
+                cands[ci].nw_val  = nw[i];
+                cands[ci].g_count = profile[i];
+                cands[ci].hash    = hvals[i];
+                ci++;
+              }
+        }
+        qsort(cands, (size_t)ncand, sizeof(Candidate), cand_cmp);
+
+        // Reset is_seed; re-mark only accepted positions.
+        memset(is_seed, 0, (size_t)plen * sizeof(bool));
+
+        // Maintain accepted positions in sorted order (by position) for
+        // O(log n) nearest-neighbour distance checks.
+        int *acc = (int *) malloc((size_t)ncand * sizeof(int));
+        if (!acc) { perror("malloc acc"); exit(1); }
+        int nacc = 0;
+
+        for (int ci = 0; ci < ncand; ci++)
+          { int p = cands[ci].pos;
+            // Binary search for insertion point in acc[].
+            int lo = 0, hi = nacc;
+            while (lo < hi)
+              { int mid = (lo + hi) / 2;
+                if (acc[mid] < p) lo = mid + 1;
+                else              hi = mid;
+              }
+            // Check left and right neighbours in accepted set.
+            int ok = 1;
+            if (lo > 0    && p - acc[lo-1] < RSPACE) ok = 0;
+            if (lo < nacc && acc[lo] - p   < RSPACE) ok = 0;
+            if (ok)
+              { memmove(acc + lo + 1, acc + lo,
+                        (size_t)(nacc - lo) * sizeof(int));
+                acc[lo] = p;
+                nacc++;
+                is_seed[p] = true;
+              }
+          }
+        free(acc);
+        free(cands);
+      }
+  }
+
+#ifdef DEBUG_NW
+  // Print per-position window-count; mark final selected seeds with *****.
+  fprintf(stderr, "NW read=%d plen=%d\n", read_id, plen);
+  for (int i = 0; i < plen; i++)
+    { const char *wkp = seq - K + 1 + i;
+      char wkstr[65];
+      for (int b2 = 0; b2 < K; b2++) wkstr[b2] = wkp[b2];
+      wkstr[K] = '\0';
+      fprintf(stderr, "  i=%-6d nw=%-5d g=%-5u h=%-4lu  %s  %s%s\n",
+              i, nw[i],
+              (unsigned)profile[i], hvals[i],
+              wkstr, nw[i] ? "*" : "", is_seed[i] ? "****" : "");
+    }
+#endif
 
   // Step 3: write selected seeds.
   int written = 0;
@@ -111,18 +234,10 @@ int find_seeds(const char    *seq,
       fwrite(&rpos, sizeof(int32_t),  1, out);
       fwrite(&rid,  sizeof(int32_t),  1, out);
       written++;
-#ifdef DEBUG_HASH
-      { char cstr[65]; uint64_t tmp = c;
-        for (int b = K - 1; b >= 0; b--) { cstr[b] = "ACGT"[tmp & 3]; tmp >>= 2; }
-        cstr[K] = '\0';
-        fprintf(stderr,
-                "  seed: read=%d rpos=%d kmer=%.*s code=%s count=%u hash=%lu\n",
-                rid, rpos, K, kp, cstr, (unsigned)profile[i], hvals[i]);
-      }
-#endif
     }
 
   free(is_seed);
+  free(nw);
   free(dq);
   free(hvals);
   return written;

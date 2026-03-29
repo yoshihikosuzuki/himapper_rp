@@ -28,7 +28,7 @@
 static char *Usage[] =
   { "[-vpzCN] [-k<int(20)>] [-t<int>] [-M<int>] [-T<int(4)>] [-P<dir(/tmp)>]",
     "         [-e<double(.85)] [-s<int(100)>] [-n<double(1.00)>]",
-    "         [-m<track>]+  <reference:dam> <ref.kpos> <reads:db> ...",
+    "         [-m<track>]+  <reference:dam> <ref.kpos|all> <reads:db> <reads.kpos|all>",
   };
 
 int     VERBOSE;   //   Globally visible to map.c
@@ -541,6 +541,7 @@ int main(int argc, char *argv[])
   char       *afile,  *bfile;
   char       *aroot,  *broot, *apwd;
   char       *kpos_path;
+  char       *bkpos_path;
   void       *aindex, *bindex;
   int         alen,    blen;
   int         isdam, nblocks;   //  of reference (a-argument)
@@ -667,7 +668,7 @@ int main(int argc, char *argv[])
     NOMAP     = flags['N'];
     MAP_ORDER = 1-flags['z'];
 
-    if (argc <= 3)
+    if (argc <= 4)
       { fprintf(stderr,"Usage: %s %s\n",Prog_Name,Usage[0]);
         fprintf(stderr,"       %*s %s\n",(int) strlen(Prog_Name),"",Usage[1]);
         fprintf(stderr,"       %*s %s\n",(int) strlen(Prog_Name),"",Usage[2]);
@@ -691,16 +692,20 @@ int main(int argc, char *argv[])
         // fprintf(stderr,"      -p: Output repeat profile track\n");
         fprintf(stderr,"      -C: Output reference vs reads .las.\n");
         fprintf(stderr,"      -N: Do not output reads vs reference .las.\n");
+        fprintf(stderr,"\n");
+        fprintf(stderr,"      For <ref.kpos|all> and <reads.kpos|all>:\n");
+        fprintf(stderr,"        Specify a .kpos file to use precomputed seeds,\n");
+        fprintf(stderr,"        or 'all' to use all k-mers as seeds.\n");
         exit (1);
       }
 
-    // Extract the ref.kpos path (argv[2]) and shift reads to argv[2..]
-    kpos_path = argv[2];
-    { int i;
-      for (i = 3; i < argc; i++)
-        argv[i-1] = argv[i];
-      argc -= 1;
-    }
+    // Extract the ref.kpos and reads.kpos paths, then adjust argv.
+    // argv[1]=ref.dam  argv[2]=ref.kpos|all  argv[3]=reads.db  argv[4]=reads.kpos|all
+    kpos_path  = argv[2];
+    bkpos_path = argv[4];
+    // Shift: argv[3] (reads.db) becomes argv[2]
+    argv[2] = argv[3];
+    argc -= 2;   // now argc counts: prog ref.dam reads.db
 
     if (COVER)
       if (NOMAP)
@@ -829,7 +834,10 @@ int main(int argc, char *argv[])
           broot = Root(bfile,".db");
         if (VERBOSE)
           printf("\nBuilding index for %s\n",broot);
-        bindex = Sort_Kmers(bblock,&blen);
+        if (strcmp(bkpos_path, "all") == 0)
+          bindex = Sort_Kmers(bblock,&blen);
+        else
+          bindex = Load_Kpos(bkpos_path, 0, bblock, &blen);
 
         // TODO: hl,dlだとAdvance_Block_Arg(parse)としている。aとb逆だからだめ？
         for (k = 1; k <= nblocks; k++)
@@ -843,8 +851,11 @@ int main(int argc, char *argv[])
             free(afile);
 
             if (VERBOSE)
-              printf("\nBuilding index for %s.%d (from %s)\n",aroot,k,kpos_path);
-            aindex = Load_Kpos(kpos_path, 0, ablock, &alen);
+              printf("\nBuilding index for %s.%d\n",aroot,k);
+            if (strcmp(kpos_path, "all") == 0)
+              aindex = Sort_Kmers(ablock, &alen);
+            else
+              aindex = Load_Kpos(kpos_path, 0, ablock, &alen);
 
             if (VERBOSE)
               printf("\nComparing %s to %s.%d\n",broot,aroot,k);
@@ -853,8 +864,12 @@ int main(int argc, char *argv[])
             ablock = complement_DB(ablock,1);
  
             if (VERBOSE)
-              printf("\nBuilding index for c(%s.%d) (from %s)\n",aroot,k,kpos_path);
-            aindex = Load_Kpos(kpos_path, 1, ablock, &alen);
+              printf("\nBuilding index for c(%s.%d)\n",aroot,k);
+            if (strcmp(kpos_path, "all") == 0)
+              { aindex = Sort_Kmers(ablock, &alen);
+              }
+            else
+              aindex = Load_Kpos(kpos_path, 1, ablock, &alen);
 
             if (VERBOSE)
               printf("\nComparing %s to c(%s.%d)\n",broot,aroot,k);

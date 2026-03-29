@@ -10,7 +10,9 @@ copy_minimizer
 minimaxmer
 dump_kpos
 
+archive
 work
+work_mdx
 run.sh
 *.txt
 *.kpos
