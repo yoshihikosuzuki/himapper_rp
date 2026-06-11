@@ -949,6 +949,12 @@ void* Load_Kpos(const char* path, int comp, DAZZ_DB* block, int* len) {
 #endif
     }
   }
+  else {  // forward: minimaxmer stores the k-mer START position, but tuple_thread
+          // (read side) stores the last-base position; shift by K-1 so that the
+          // seed diagonals (apos - bpos) are consistent between reads and ref.
+    for (i = 0; i < n_entries; i++)
+      arr[i].rpos += (Kmer - 1);
+  }
 
   qsort(arr, (size_t)n_entries, sizeof(KmerPos), cmp_kmerpos);
 
