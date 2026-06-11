@@ -39,9 +39,9 @@
 #define DEBUG_CANDIDATE_STATS  //  Print per-strand seed-hit distribution over
                                //  reads
 
-#define HITMIN 1  //  minimum # of k-mers in a potential seed
+#define HITMIN 2  //  minimum # of k-mers in a potential seed
 
-#define MAX_GAP 30000  //  maximum separation between two k-mers in a chain
+#define MAX_GAP 50000  //  maximum separation between two k-mers in a chain
 #define MIN_PIECE \
   300  //  two seeds are distinct iff one covers uniquely >= MIN_PIECE bp's
 
