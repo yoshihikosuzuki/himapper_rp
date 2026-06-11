@@ -167,7 +167,10 @@ def evaluate(truth, preds, ctg_len=None, overlap_thr=OVERLAP_THRESHOLD):
             continue
         gt_ctg, gt_strand, gt_start, gt_end = gt
         clen = ctg_len.get(gt_ctg) if ctg_len else None
-        if gt_start < EDGE_MARGIN or (clen is not None and gt_end > clen - EDGE_MARGIN):
+        near_start = gt_start < EDGE_MARGIN
+        near_end = clen is not None and gt_end > clen - EDGE_MARGIN
+        crosses_boundary = gt_end < gt_start  # wrap read across a contig seam
+        if near_start or near_end or crosses_boundary:
             skipped_edge += 1
             continue
         total += 1
