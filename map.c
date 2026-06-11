@@ -2818,6 +2818,9 @@ static void* report_thread(void* arg) {
           best = 1;
           nparts += 1;
         } else {
+          //  Secondary: another (higher-scoring) chain already covers this
+          //  A-read region.
+          if (PRIMARY_ONLY) continue;  //  -1: keep only the primary per region
           if (linker[b].score < BEST_TIE * part[p].top) continue;
           best = (linker[b].score == part[p].top);
         }

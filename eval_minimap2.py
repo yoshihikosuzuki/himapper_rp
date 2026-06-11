@@ -22,7 +22,7 @@ from collections import Counter, defaultdict
 # Parameters
 # ---------------------------------------------------------------------------
 OVERLAP_THRESHOLD = 0.5
-EDGE_MARGIN = 10000
+EDGE_MARGIN = 10000  # exclude reads overlapping within N bp of either contig end
 
 
 # ---------------------------------------------------------------------------
@@ -71,6 +71,28 @@ def parse_ref_names(ref_fasta):
 
 
 # ---------------------------------------------------------------------------
+# Parse reference FASTA -> contig lengths (for end-edge exclusion)
+# ---------------------------------------------------------------------------
+def parse_ref_lengths(ref_fasta):
+    """Returns dict: 1-based ctg_id (order of appearance) -> contig length (bp)."""
+    lengths = {}
+    idx = 0
+    cur = 0
+    with open(ref_fasta) as f:
+        for line in f:
+            if line.startswith(">"):
+                if idx > 0:
+                    lengths[idx] = cur
+                idx += 1
+                cur = 0
+            else:
+                cur += len(line.strip())
+    if idx > 0:
+        lengths[idx] = cur
+    return lengths
+
+
+# ---------------------------------------------------------------------------
 # Parse PAF -> predictions
 # ---------------------------------------------------------------------------
 def parse_paf(paf_path, name_to_id):
@@ -113,7 +135,7 @@ def reciprocal_overlap(s1, e1, s2, e2):
 # ---------------------------------------------------------------------------
 # Comprehensive evaluate
 # ---------------------------------------------------------------------------
-def evaluate(truth, preds, overlap_thr=OVERLAP_THRESHOLD):
+def evaluate(truth, preds, ctg_len=None, overlap_thr=OVERLAP_THRESHOLD):
     pct = lambda n, d: f"{100*n/d:.1f}%" if d > 0 else "N/A"
     ratio = lambda n, d: f"{n/d:.4f}" if d > 0 else "N/A"
     skipped_edge = 0
@@ -144,7 +166,8 @@ def evaluate(truth, preds, overlap_thr=OVERLAP_THRESHOLD):
         if gt is None:
             continue
         gt_ctg, gt_strand, gt_start, gt_end = gt
-        if gt_start < EDGE_MARGIN:
+        clen = ctg_len.get(gt_ctg) if ctg_len else None
+        if gt_start < EDGE_MARGIN or (clen is not None and gt_end > clen - EDGE_MARGIN):
             skipped_edge += 1
             continue
         total += 1
@@ -223,6 +246,10 @@ def evaluate(truth, preds, overlap_thr=OVERLAP_THRESHOLD):
     # --- output ---
     print("=== Mapping Accuracy ===")
     print(f"  Number of reads     : {total}")
+    edge_where = "either end" if ctg_len else "start"
+    print(
+        f"  Edge-excluded reads : {skipped_edge}  (within {EDGE_MARGIN}bp of contig {edge_where})"
+    )
     print()
 
     print("  [Read-level best hit]")
@@ -283,6 +310,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     name_to_id = parse_ref_names(args.ref_fasta)
+    ctg_len = parse_ref_lengths(args.ref_fasta)
     truth = parse_fasta_headers(args.reads_fasta)
     preds = parse_paf(args.paf, name_to_id)
-    evaluate(truth, preds)
+    evaluate(truth, preds, ctg_len)

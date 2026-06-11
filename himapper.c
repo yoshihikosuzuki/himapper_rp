@@ -26,7 +26,7 @@
 #include "map.h"
 
 static char *Usage[] =
-  { "[-vpzCN] [-k<int(20)>] [-t<int>] [-M<int>] [-T<int(4)>] [-P<dir(/tmp)>]",
+  { "[-1vpzCN] [-k<int(20)>] [-t<int>] [-M<int>] [-T<int(4)>] [-P<dir(/tmp)>]",
     "         [-e<double(.85)] [-s<int(100)>] [-n<double(1.00)>]",
     "         [-m<track>]+  <reference:dam> <ref.kpos|all> <reads:db> <reads.kpos|all>",
   };
@@ -35,6 +35,7 @@ int     VERBOSE;   //   Globally visible to map.c
 int     PROFILE;
 int     SPACING;
 double  BEST_TIE;
+int     PRIMARY_ONLY;
 char   *SORT_PATH;
 
 uint64  MEM_LIMIT;
@@ -570,7 +571,11 @@ int main(int argc, char *argv[])
     MAX_REPS  = 0;
     AVE_ERROR = .97;
     SPACING   = 100;       //   Globally visible to map.c
-    BEST_TIE  = 1.0;   // TODO: なんのオプション？
+    BEST_TIE  = 1.0;   // -n: near-optimal threshold; report a same-region
+                       //     secondary only if its score >= BEST_TIE*best.
+                       //     1.0 => only co-optimal (exact-tie) secondaries.
+    PRIMARY_ONLY = 0;  // -1: report only the single best alignment per A-read
+                       //     region (suppress all same-region secondaries).
     NTHREADS  = 4;
     SORT_PATH = "/tmp";
 
@@ -593,7 +598,7 @@ int main(int argc, char *argv[])
       if (argv[i][0] == '-')
         switch (argv[i][1])
         { default:
-            ARG_FLAGS("vpzCN")
+            ARG_FLAGS("vpzCN1")
             break;
           case 'e':
             ARG_REAL(AVE_ERROR)
@@ -667,6 +672,7 @@ int main(int argc, char *argv[])
     COVER     = flags['C'];
     NOMAP     = flags['N'];
     MAP_ORDER = 1-flags['z'];
+    PRIMARY_ONLY = flags['1'];   //  -1: suppress same-region secondaries (cf. minimap2 --secondary=no)
 
     if (argc <= 4)
       { fprintf(stderr,"Usage: %s %s\n",Prog_Name,Usage[0]);
@@ -680,6 +686,8 @@ int main(int argc, char *argv[])
         fprintf(stderr,"      -e: Look for alignments with -e percent similarity.\n");
         fprintf(stderr,"      -s: Use -s as the trace point spacing for encoding alignments.\n");
         fprintf(stderr,"      -n: Output all matches within this %% of the best\n");
+        fprintf(stderr,"      -1: Report only the single best alignment per read region\n");
+        fprintf(stderr,"          (suppress same-region secondaries; cf. minimap2 --secondary=no)\n");
         fprintf(stderr,"\n");
         fprintf(stderr,"      -T: Use -T threads.\n");
         fprintf(stderr,"      -P: Do sorts and merges in directory -P.\n");

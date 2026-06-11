@@ -18,6 +18,7 @@ extern int    VERBOSE;
 extern int    PROFILE;
 extern int    SPACING;
 extern double BEST_TIE;
+extern int    PRIMARY_ONLY;
 extern char  *SORT_PATH;
 
 extern uint64 MEM_LIMIT;
