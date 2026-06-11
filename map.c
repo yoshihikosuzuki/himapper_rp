@@ -62,6 +62,17 @@
 #define TIE_GAP \
   500  //  Two chain edges are tied if the gap difference is less than this
 
+//  FASTGA-style diagonal-band Local_Alignment.  When BAND_ALIGN is defined,
+//  report_thread seeds each Local_Alignment with a diagonal band
+//  [dg-BAND_RADIUS, dg+BAND_RADIUS] instead of a single diagonal dg, so a
+//  correct-contig alignment can drift to the read ends from a sparse anchor
+//  (recovers reads that truncate with the original single-diagonal seeding).
+//  Compile with -DBAND_ALIGN to enable; leave undefined for the original mode.
+// #define BAND_ALIGN
+#ifndef BAND_RADIUS
+#define BAND_RADIUS 50
+#endif
+
 #undef TEST_LSORT
 #undef TEST_KSORT
 #undef TEST_PAIRS
@@ -2607,7 +2618,12 @@ static void* report_thread(void* arg) {
               dg = apos - bpos;
               ad = apos + bpos;
             }
+#ifdef BAND_ALIGN
+            bpath = Local_Alignment(align, work, MR_spec, dg - BAND_RADIUS,
+                                    dg + BAND_RADIUS, ad, -1, -1);
+#else
             bpath = Local_Alignment(align, work, MR_spec, dg, dg, ad, -1, -1);
+#endif
             if (apath->aepos - apath->abpos >= hithr) {
               alast = apath->abpos;
 #ifdef TEST_ALIGN
