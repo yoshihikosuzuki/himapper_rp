@@ -13,3 +13,4 @@ dump_kpos
 archive
 work*
 .vscode/
+__pycache__/
