@@ -330,6 +330,10 @@ def evaluate(truth, preds, ctg_len=None, overlap_thr=OVERLAP_THRESHOLD):
     )
     print(f"    Correct hit       : {fully_correct}  ({pct(fully_correct, total)})")
     print(f"    Wrong hit         : {len(wrong_ids)}  ({pct(len(wrong_ids), total)})")
+    import os as _os
+    if _os.getenv("DUMP_WRONG"):
+        with open(_os.getenv("DUMP_WRONG"), "w") as _f:
+            _f.write(" ".join(map(str, sorted(wrong_ids))))
     print(f"      (same contig, same strand, overlap >= {overlap_thr:.0%})")
     print()
 

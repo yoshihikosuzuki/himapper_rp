@@ -7,6 +7,7 @@
 #include "DB.h"
 #include "nthash.h"
 #include "libfastk.h"  // FASTK profile API (compile with -IFASTK)
+#include "copynum.h"   // pack genome copy-tier into the rid high bits
 
 // #define DEBUG_HASH
 // #define DEBUG_NW
@@ -245,7 +246,13 @@ int find_seeds(const char    *seq,
       for (int x = 0; x < K; x++)
         c = (c << 2) | base2bit[(unsigned char)kp[x]];
       c &= KMASK;
-      int32_t rpos = (int32_t)i, rid = read_id;
+      int32_t rpos = (int32_t)i;
+      // Pack the genome copy-tier into the rid's top 3 bits so himapper can weight
+      // distinguishing (low-copy) seeds downstream.  Contig ids are far below 2^29;
+      // if one ever isn't, fall back to a plain rid (tier 0 = unknown).
+      int32_t rid = (read_id < CN_MAXVAL)
+                  ? CN_PACK(read_id, cn_tier_of(prof_genome[i]))
+                  : read_id;
       fwrite(&c,    sizeof(uint64_t), 1, out);
       fwrite(&rpos, sizeof(int32_t),  1, out);
       fwrite(&rid,  sizeof(int32_t),  1, out);

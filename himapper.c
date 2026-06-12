@@ -36,6 +36,8 @@ int     PROFILE;
 int     SPACING;
 double  BEST_TIE;
 int     PRIMARY_ONLY;
+int     COPY_AWARE;
+int     JUNCTION_PEN;
 char   *SORT_PATH;
 
 uint64  MEM_LIMIT;
@@ -576,6 +578,9 @@ int main(int argc, char *argv[])
                        //     1.0 => only co-optimal (exact-tie) secondaries.
     PRIMARY_ONLY = 0;  // -1: report only the single best alignment per A-read
                        //     region (suppress all same-region secondaries).
+    COPY_AWARE = 0;    // -Q: copy-number-aware anchoring (weight low-copy seeds).
+    JUNCTION_PEN = 1;  // collinear-chain gap penalty ON by default; -G restores
+                       //     the legacy (no-penalty) damapper selection.
     NTHREADS  = 4;
     SORT_PATH = "/tmp";
 
@@ -598,7 +603,7 @@ int main(int argc, char *argv[])
       if (argv[i][0] == '-')
         switch (argv[i][1])
         { default:
-            ARG_FLAGS("vpzCN1")
+            ARG_FLAGS("vpzCN1QG")
             break;
           case 'e':
             ARG_REAL(AVE_ERROR)
@@ -673,6 +678,8 @@ int main(int argc, char *argv[])
     NOMAP     = flags['N'];
     MAP_ORDER = 1-flags['z'];
     PRIMARY_ONLY = flags['1'];   //  -1: suppress same-region secondaries (cf. minimap2 --secondary=no)
+    COPY_AWARE   = flags['Q'];   //  -Q: copy-number-aware anchoring (low-copy seed priority)
+    JUNCTION_PEN = 1 - flags['G'];  //  -G: disable collinear-chain gap penalty (legacy)
 
     if (argc <= 4)
       { fprintf(stderr,"Usage: %s %s\n",Prog_Name,Usage[0]);
