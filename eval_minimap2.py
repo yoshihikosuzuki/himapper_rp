@@ -117,7 +117,18 @@ def parse_paf(paf_path, name_to_id):
             if ctg_id is None:
                 print(f"WARNING: unknown target {tname}", file=sys.stderr)
                 continue
-            preds[read_id].append((ctg_id, strand, tstart, tend))
+            diffs = None
+            div = 0.0
+            for c in cols[12:]:
+                if c.startswith("NM:i:"):
+                    diffs = int(c[5:])
+                elif c.startswith(("de:f:", "dv:f:")):
+                    div = float(c[5:]) * 100.0
+            if diffs is None:  # no NM (run minimap2 with -c); approximate
+                matches = int(cols[9])
+                blocklen = int(cols[10])
+                diffs = blocklen - matches
+            preds[read_id].append((ctg_id, strand, tstart, tend, div, diffs))
     return preds
 
 
@@ -130,6 +141,29 @@ def reciprocal_overlap(s1, e1, s2, e2):
     if union <= 0:
         return 0.0
     return inter / union
+
+
+# ---------------------------------------------------------------------------
+# Distinct reference loci a read maps to (same contig + overlapping = one locus)
+# ---------------------------------------------------------------------------
+def distinct_loci(hits):
+    """Returns list of (ctg, min_diffs) for each distinct locus the read hits."""
+    by_ctg = defaultdict(list)
+    for ctg, strand, rs, re_, div, diffs in hits:
+        by_ctg[ctg].append((rs, re_, diffs))
+    loci = []
+    for ctg, lst in by_ctg.items():
+        lst.sort()
+        ce, cd = lst[0][1], lst[0][2]
+        for rs, re_, diffs in lst[1:]:
+            if rs <= ce:  # overlaps the current cluster -> same locus
+                ce = max(ce, re_)
+                cd = min(cd, diffs)
+            else:
+                loci.append((ctg, cd))
+                ce, cd = re_, diffs
+        loci.append((ctg, cd))
+    return loci
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +195,14 @@ def evaluate(truth, preds, ctg_len=None, overlap_thr=OVERLAP_THRESHOLD):
     wrong_detail = Counter()
     wrong_detail_ids = defaultdict(list)
 
+    # resolvability: identical-sequence ambiguity (excused) vs >=1 base difference
+    resolvable = 0
+    res_correct = 0
+    unresolvable = 0
+    unres_correct = 0
+    res_wrong = Counter()
+    res_wrong_ids = defaultdict(list)
+
     for read_id in sorted(truth.keys()):
         gt = truth[read_id]
         if gt is None:
@@ -188,12 +230,12 @@ def evaluate(truth, preds, ctg_len=None, overlap_thr=OVERLAP_THRESHOLD):
 
         # -- per-read best-hit --
         def score(h):
-            ctg, strand, rs, re = h
+            ctg, strand, rs, re, div, diffs = h
             ov = reciprocal_overlap(gt_start, gt_end, rs, re) if ctg == gt_ctg else 0.0
             return (strand == gt_strand, ov)
 
         best = max(hits, key=score)
-        b_ctg, b_strand, b_start, b_end = best
+        b_ctg, b_strand, b_start, b_end, b_div, b_diffs = best
         ov = (
             reciprocal_overlap(gt_start, gt_end, b_start, b_end)
             if b_ctg == gt_ctg
@@ -218,10 +260,43 @@ def evaluate(truth, preds, ctg_len=None, overlap_thr=OVERLAP_THRESHOLD):
             wrong_detail[category] += 1
             wrong_detail_ids[category].append(read_id)
 
+        # -- resolvability: identical-sequence tie vs >=1 base difference --
+        loci = distinct_loci(hits)
+        d_min = min(d for _, d in loci)
+        n_min = sum(1 for _, d in loci if d == d_min)
+        gt_diffs = min(
+            (
+                h[5]
+                for h in hits
+                if h[0] == gt_ctg
+                and reciprocal_overlap(gt_start, gt_end, h[2], h[3]) >= 0.3
+            ),
+            default=None,
+        )
+        is_correct = b_strand == gt_strand and ov >= overlap_thr
+        if n_min >= 2:  # >=2 distinct loci tie at min diffs => identical sequence
+            unresolvable += 1
+            if is_correct:
+                unres_correct += 1
+        else:  # unique min-diff locus => >=1 base distinguishes the true origin
+            resolvable += 1
+            if is_correct:
+                res_correct += 1
+            elif gt_diffs is None:
+                res_wrong["GT locus not found"] += 1
+                res_wrong_ids["GT locus not found"].append(read_id)
+            elif gt_diffs <= d_min:
+                key = "GT best by diffs but not chosen (selection)"
+                res_wrong[key] += 1
+                res_wrong_ids[key].append(read_id)
+            else:
+                res_wrong["read fits other locus better"] += 1
+                res_wrong_ids["read fits other locus better"].append(read_id)
+
         # -- per-mapping --
         any_correct = False
         for h in hits:
-            ctg, strand, rs, re = h
+            ctg, strand, rs, re, div, diffs = h
             total_mappings += 1
             ov_m = (
                 reciprocal_overlap(gt_start, gt_end, rs, re) if ctg == gt_ctg else 0.0
@@ -282,6 +357,27 @@ def evaluate(truth, preds, ctg_len=None, overlap_thr=OVERLAP_THRESHOLD):
     )
     print(
         f"    Cross-contig reads: {cross_contig_reads}  ({pct(cross_contig_reads, total)})"
+    )
+    print()
+
+    print("  [Resolvability]  (identical-sequence ambiguity excused; needs secondary alns: minimap2 -c -N -p)")
+    print(
+        f"    Unresolvable ties : {unresolvable}  ({pct(unresolvable, total)})"
+        f"   [>=2 loci equal at min diffs = identical sequence]"
+    )
+    print(f"      best=GT (tie-break): {unres_correct}")
+    print(
+        f"    Resolvable        : {resolvable}  ({pct(resolvable, total)})"
+        f"   [unique min-diff locus = >=1 base distinguishes truth]"
+    )
+    print(f"      Correct          : {res_correct}  ({pct(res_correct, resolvable)})")
+    print(f"      Wrong (fixable)  : {resolvable - res_correct}")
+    for cat, cnt in res_wrong.most_common():
+        print(f"        {cat:42s}: {cnt}")
+        print(f"          first IDs: {res_wrong_ids[cat][:10]}")
+    print(
+        f"    >> Resolvable accuracy: {ratio(res_correct, resolvable)}"
+        f"   (excludes {unresolvable} unresolvable ties)"
     )
     print()
 
