@@ -25,6 +25,7 @@ from collections import Counter, defaultdict
 # ---------------------------------------------------------------------------
 OVERLAP_THRESHOLD = 0.5  # minimum reciprocal overlap fraction to call a hit correct
 EDGE_MARGIN = 10000  # exclude reads overlapping within N bp of either contig end
+KMER = 32  # k-mer size (matches minimaxmer K and the FastK -k32 in 0-prep.sh)
 
 
 # ---------------------------------------------------------------------------
@@ -79,6 +80,100 @@ def parse_ref_lengths(ref_fasta):
 
 
 # ---------------------------------------------------------------------------
+# Truth-based resolvability: a read is "resolvable" iff its ground-truth origin
+# span contains a genome-UNIQUE (copy-1) k-mer, i.e. a position that distinguishes
+# the true locus from every homolog/repeat.  This is a property of the REFERENCE
+# (independent of the tool and of read errors), unlike the diffs-of-reported-hits
+# heuristic.  We read the per-position genome k-mer count straight from the FastK
+# profile that minimaxmer already uses (ref.prof), via Profex.  This is the
+# lightweight proxy: copy-1 presence is sufficient (not necessary) for resolvable,
+# so it slightly UNDER-counts resolvable reads.
+# ---------------------------------------------------------------------------
+def genome_unique_positions(ref_fasta, n_ctg, K=KMER):
+    """{1-based ctg_id: sorted list of positions p where ref[p:p+K] is genome-unique}.
+    Returns None if the FastK profile is unavailable (truth-based report skipped)."""
+    import os
+    import subprocess
+
+    prefix = os.path.splitext(ref_fasta)[0]  # ref.fasta -> ref  (FastK source root)
+    if not os.path.exists(prefix + ".prof"):
+        print(
+            f"WARNING: FastK profile '{prefix}.prof' not found; "
+            f"truth-based resolvability skipped (run FastK -k{K} -p {ref_fasta})",
+            file=sys.stderr,
+        )
+        return None
+    uniq = {}
+    for c in range(1, n_ctg + 1):
+        cache = f"{prefix}.uniqpos.k{K}.c{c}.txt"
+        if os.path.exists(cache) and os.path.getmtime(cache) >= os.path.getmtime(
+            prefix + ".prof"
+        ):
+            with open(cache) as fh:
+                uniq[c] = [int(x) for x in fh.read().split()]
+            continue
+        # Profex dumps "<pos>:  <count>" per position (in order); keep count==1.
+        awk = r"""$1 ~ /^[0-9]+:$/ && $2==1 {sub(/:/,"",$1); print $1}"""
+        proc = subprocess.run(
+            f"Profex {prefix} {c} | awk '{awk}'",
+            shell=True, capture_output=True, text=True,
+        )
+        pos = [int(x) for x in proc.stdout.split()]
+        uniq[c] = pos  # Profex emits positions in ascending order -> already sorted
+        with open(cache, "w") as fh:
+            fh.write("\n".join(map(str, pos)))
+    return uniq
+
+
+def span_has_unique(uniq_sorted, start, end, K=KMER):
+    """True iff some genome-unique position p satisfies start <= p <= end-K."""
+    import bisect
+
+    hi = end - K
+    if uniq_sorted is None or hi < start:
+        return False
+    i = bisect.bisect_left(uniq_sorted, start)
+    return i < len(uniq_sorted) and uniq_sorted[i] <= hi
+
+
+def load_strict_resolvable(ref_fasta, reads_fasta, K=KMER):
+    """{read_id: bool} STRICT truth-based resolvability (no exact-duplicate homolog
+    of the GT span).  Loads the strict_resolvable.py cache, auto-(re)generating it
+    when stale.  Returns None if unavailable."""
+    import os
+    import subprocess
+
+    prefix = os.path.splitext(ref_fasta)[0]
+    cache = f"{prefix}.strictres.k{K}.txt"
+    fresh = (
+        os.path.exists(cache)
+        and os.path.getmtime(cache) >= os.path.getmtime(ref_fasta)
+        and os.path.getmtime(cache) >= os.path.getmtime(reads_fasta)
+    )
+    if not fresh:
+        here = os.path.dirname(os.path.abspath(__file__))
+        try:
+            subprocess.run(
+                f"python3 {here}/strict_resolvable.py "
+                f"{ref_fasta} {reads_fasta} {K}",
+                shell=True, check=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"WARNING: strict resolvability precompute failed ({exc}); skipped",
+                file=sys.stderr,
+            )
+            return None
+    res = {}
+    if os.path.exists(cache):
+        with open(cache) as fh:
+            for line in fh:
+                a, b = line.split()
+                res[int(a)] = b == "1"
+    return res or None
+
+
+# ---------------------------------------------------------------------------
 # Parse LAshow output -> predictions
 # ---------------------------------------------------------------------------
 def parse_lashow(lashow_path_or_stream):
@@ -86,7 +181,8 @@ def parse_lashow(lashow_path_or_stream):
     preds = defaultdict(list)
     NUM = r"[\d,]+"
     line_re = re.compile(
-        r"^>\s+"
+        r"^[>+\- ]+"  # LAshow marks the best mapping '>' and secondary/chained ones '+';
+                       # parse them all (was '^>' only, which silently dropped secondaries)
         r"(" + NUM + r")\.(\d+)\s+"
         r"(" + NUM + r")\.(\d+)\s+"
         r"([nc])\s+"
@@ -162,7 +258,10 @@ def distinct_loci(hits):
 # ---------------------------------------------------------------------------
 # Comprehensive evaluate
 # ---------------------------------------------------------------------------
-def evaluate(truth, preds, ctg_len=None, overlap_thr=OVERLAP_THRESHOLD):
+def evaluate(
+    truth, preds, ctg_len=None, gt_uniq=None, gt_strict=None,
+    overlap_thr=OVERLAP_THRESHOLD,
+):
     pct = lambda n, d: f"{100*n/d:.1f}%" if d > 0 else "N/A"
     ratio = lambda n, d: f"{n/d:.4f}" if d > 0 else "N/A"
     skipped_edge = 0
@@ -195,6 +294,14 @@ def evaluate(truth, preds, ctg_len=None, overlap_thr=OVERLAP_THRESHOLD):
     unres_correct = 0
     res_wrong = Counter()
     res_wrong_ids = defaultdict(list)
+    # truth-based resolvability (genome-unique k-mer in the GT span; tool-independent)
+    t_res = 0
+    t_res_correct = 0
+    t_res_wrong_ids = []
+    # strict truth-based resolvability (no exact-duplicate homolog of the GT span)
+    s_res = 0
+    s_res_correct = 0
+    s_res_wrong_ids = []
 
     for read_id in sorted(truth.keys()):
         gt = truth[read_id]
@@ -267,6 +374,24 @@ def evaluate(truth, preds, ctg_len=None, overlap_thr=OVERLAP_THRESHOLD):
             default=None,
         )
         is_correct = b_strand == gt_strand and ov >= overlap_thr
+
+        # truth-based resolvability: is the GT origin span distinguishable at all?
+        if gt_uniq is not None and span_has_unique(
+            gt_uniq.get(gt_ctg), gt_start, gt_end
+        ):
+            t_res += 1
+            if is_correct:
+                t_res_correct += 1
+            else:
+                t_res_wrong_ids.append(read_id)
+
+        if gt_strict is not None and gt_strict.get(read_id):
+            s_res += 1
+            if is_correct:
+                s_res_correct += 1
+            else:
+                s_res_wrong_ids.append(read_id)
+
         if n_min >= 2:  # >=2 distinct loci tie at min diffs => identical sequence
             unresolvable += 1
             if is_correct:
@@ -378,6 +503,42 @@ def evaluate(truth, preds, ctg_len=None, overlap_thr=OVERLAP_THRESHOLD):
     )
     print()
 
+    if gt_uniq is not None:
+        print(
+            "  [Resolvability - truth-based]"
+            "  (GT span has a genome-unique k-mer; tool-independent)"
+        )
+        print(
+            f"    Resolvable (truth): {t_res}  ({pct(t_res, total)})"
+            f"   [>=1 copy-1 k-mer in the true origin span]"
+        )
+        print(f"      Correct          : {t_res_correct}  ({pct(t_res_correct, t_res)})")
+        print(f"      Wrong            : {t_res - t_res_correct}")
+        print(f"        first IDs: {sorted(t_res_wrong_ids)[:15]}")
+        print(
+            f"    >> Resolvable accuracy (truth): {ratio(t_res_correct, t_res)}"
+            f"   (lightweight copy-1 proxy; conservative)"
+        )
+        print()
+
+    if gt_strict is not None:
+        print(
+            "  [Resolvability - strict]"
+            "  (GT span has no exact-duplicate homolog; tool-independent)"
+        )
+        print(
+            f"    Resolvable (strict): {s_res}  ({pct(s_res, total)})"
+            f"   [no 0-diff full-length homolog of the true origin span]"
+        )
+        print(f"      Correct          : {s_res_correct}  ({pct(s_res_correct, s_res)})")
+        print(f"      Wrong            : {s_res - s_res_correct}")
+        print(f"        first IDs: {sorted(s_res_wrong_ids)[:15]}")
+        print(
+            f"    >> Resolvable accuracy (strict): {ratio(s_res_correct, s_res)}"
+            f"   (rigorous: self-aligned reference)"
+        )
+        print()
+
     if wrong_detail:
         print(f"  [Wrong reads breakdown ({len(wrong_ids)} reads)]")
         for cat, cnt in sorted(wrong_detail.items(), key=lambda x: -x[1]):
@@ -416,4 +577,8 @@ if __name__ == "__main__":
     truth = parse_fasta_headers(fasta_path)
     preds = parse_lashow(lashow_source)
     ctg_len = parse_ref_lengths(args.ref) if args.ref else None
-    evaluate(truth, preds, ctg_len)
+    gt_uniq = (
+        genome_unique_positions(args.ref, len(ctg_len)) if args.ref and ctg_len else None
+    )
+    gt_strict = load_strict_resolvable(args.ref, fasta_path) if args.ref else None
+    evaluate(truth, preds, ctg_len, gt_uniq, gt_strict)

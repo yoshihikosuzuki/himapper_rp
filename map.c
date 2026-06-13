@@ -37,6 +37,12 @@
 //  inert and himapper behaves exactly as before.
 static int CN_ON = 0;
 
+//  weight (x100) of the chain_thread diagonal-drift penalty: discourages a seed
+//  chain from wandering across repeat copies (B jumps while A barely moves), so
+//  the clean collinear chain at the true locus wins.  Used in chain_thread (which
+//  runs before report_thread), so it is declared up here and read in Match_Filter.
+static int CN_DRIFT_W = 0;
+
 //  Fixed-point (x100) rarity weight per copy tier (index = tier 0..7; 0 = unknown).
 //  Milder than 1/copy: copy-1 dominates but copy-2 / copy-3-4 still contribute.
 static const int cn_weight[8] = { 0, 100, 65, 40, 25, 15, 0, 0 };
@@ -1974,12 +1980,19 @@ static void* chain_thread(void* arg) {
             lcost = l->cost + Kmer;
           else
             lcost = l->cost + (apos - l->apos);
+          //  Diagonal-drift penalty: |Agap - Bgap| = the implied indel between
+          //  this hit and its predecessor.  Collinear hits (a real alignment)
+          //  drift ~0; chaining across a repeat copy jumps in B (large drift).
+          //  Charging it keeps a clean collinear chain from being out-scored by
+          //  one that wanders through duplicated copies (cf. report junction pen).
+          lcost -= (CN_DRIFT_W * abs(chain->diag - l->diag)) / 100;
         }
         if (r != NULL) {
           if (bpos >= r->bpos + Kmer)
             rcost = r->cost + Kmer;
           else
             rcost = r->cost + (bpos - r->bpos);
+          rcost -= (CN_DRIFT_W * abs(chain->diag - r->diag)) / 100;
         }
         if (lcost > rcost)
           rcost = 0;
@@ -3143,6 +3156,8 @@ void Match_Filter(DAZZ_DB* ablock, DAZZ_DB* bblock, void* vasort, int alen,
   if (COPY_AWARE && !CN_ON && VERBOSE)
     printf("   Copy-aware anchoring disabled: read maxlen %d >= %d\n",
            ablock->maxlen, CN_MAXLEN);
+  //  chain_thread runs here (before report_thread), so read its knob now.
+  { char* e = getenv("CN_DRIFT_W"); if (e != NULL) CN_DRIFT_W = atoi(e); }
 
   {
     int64 powr;
