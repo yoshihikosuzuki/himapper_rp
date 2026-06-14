@@ -19,8 +19,7 @@ extern int    PROFILE;
 extern int    SPACING;
 extern double BEST_TIE;
 extern int    PRIMARY_ONLY;
-extern int    COPY_AWARE;     //  -Q: copy-number-aware anchoring (see copynum.h)
-extern int    JUNCTION_PEN;   //  collinear-chain gap penalty (default on; -G disables)
+extern int    JUNCTION_PEN;   //  collinear-gap penalties (default on; -G disables)
 extern char  *SORT_PATH;
 
 extern uint64 MEM_LIMIT;

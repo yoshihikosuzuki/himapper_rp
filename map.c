@@ -28,28 +28,8 @@
 
 #include "DB.h"
 #include "align.h"
-#include "copynum.h"
 
 #define THREAD pthread_t
-
-//  Copy-number-aware anchoring.  Set once per Match_Filter call from the read
-//  length / contig count guards (see copynum.h).  When 0, the tier channel is
-//  inert and himapper behaves exactly as before.
-static int CN_ON = 0;
-
-//  weight (x100) of the chain_thread diagonal-drift penalty: discourages a seed
-//  chain from wandering across repeat copies (B jumps while A barely moves), so
-//  the clean collinear chain at the true locus wins.  Used in chain_thread (which
-//  runs before report_thread), so it is declared up here and read in Match_Filter.
-static int CN_DRIFT_W = 0;
-
-//  Fixed-point (x100) rarity weight per copy tier (index = tier 0..7; 0 = unknown).
-//  Milder than 1/copy: copy-1 dominates but copy-2 / copy-3-4 still contribute.
-static const int cn_weight[8] = { 0, 100, 65, 40, 25, 15, 0, 0 };
-
-//  Debug: if env CN_DBG is set to an A-read id, dump that read's candidate
-//  copy-evidence in report_thread.  -1 means "not set".
-static int CN_DBG = -1;
 
 #define MAXGRAM \
   10000  //  Cap on k-mer count histogram (in count_thread, merge_thread)
@@ -81,6 +61,13 @@ static int CN_DBG = -1;
 #define TIE_SCORE 50    //  Score is tied if less than this different
 #define TIE_GAP \
   500  //  Two chain edges are tied if the gap difference is less than this
+
+//  Collinear-gap penalties (x100), enabled by JUNCTION_PEN (default on; -G off).
+//  Both charge the implied indel |Agap-Bgap| between consecutive units so a clean
+//  collinear alignment is not out-scored by one that wanders across a repeat copy
+//  or stitches truncated pieces; mirrors minimap2's chn_pen_gap*|dr-dq| term.
+#define DRIFT_PEN_W 100  //  chain_thread: per seed-hit link, charge |Adiag change|
+#define GAP_PEN_W 100    //  report linker: per stitched piece, charge gap+overlap+indel
 
 //  FASTGA-style diagonal-band Local_Alignment.  When BAND_ALIGN is defined,
 //  report_thread seeds each Local_Alignment with a diagonal band
@@ -937,7 +924,7 @@ void* Load_Kpos(const char* path, int comp, DAZZ_DB* block, int* len) {
       uint64 c = arr[i].code, r = 0;
       int b;
       int orig_rpos = arr[i].rpos;
-      int rlen = block->reads[CN_VAL(arr[i].read)].rlen;  // strip copy-tier from rid
+      int rlen = block->reads[arr[i].read].rlen;
       for (b = 0; b < Kmer; b++) {
         r = (r << 2) | (3 - (c & 3));
         c >>= 2;
@@ -1155,13 +1142,9 @@ static void* merge_thread(void* arg) {
           ap = asort[a].rpos;
           kptr[ap & BMASK] += ct;
           for (b = jb; b < ib; b++) {
-            //  bsort is the reference seed list, so bsort[b].read carries the
-            //  genome copy-tier in its top bits.  Strip it for the contig id and
-            //  ferry it through the (otherwise spare) high bits of apos, which is a
-            //  read position (< CN_MAXLEN) and so always has room.
-            hits[nhits].bread = CN_VAL(bsort[b].read);
+            hits[nhits].bread = bsort[b].read;
             hits[nhits].aread = asort[a].read;
-            hits[nhits].apos = CN_ON ? CN_PACK(ap, CN_TIER(bsort[b].read)) : ap;
+            hits[nhits].apos = ap;
             hits[nhits].diag = ap - bsort[b].rpos;
 #ifdef DEBUG_SEED_HIT
             {
@@ -1221,8 +1204,6 @@ typedef struct _splay {
   struct _splay* from;
   struct _splay* orig;
   int cost;
-  int rare;   //  copy-aware: running rarity score along the chain (sum cn_weight[tier])
-  int nuniq;  //  copy-aware: running count of unique (copy-1) seeds along the chain
 } Splay;
 
 //  Add node o to tree x.  Upon return, o is always the root of subtree
@@ -1558,8 +1539,6 @@ typedef struct {
   int alast;
   int bfirst;
   int blast;
-  int rare;   //  copy-aware: chain rarity score (sum cn_weight[tier] of its seeds)
-  int nuniq;  //  copy-aware: number of unique (copy-1) seeds anchoring this chain
 } Candidate;
 
 void print_candidates(int aread, int cand, Candidate* cbase, Jump* jbase,
@@ -1894,8 +1873,6 @@ static void* chain_thread(void* arg) {
                 cbase[d].alast = ae;
                 cbase[d].bfirst = bb;
                 cbase[d].blast = be;
-                cbase[d].rare = h->rare;    //  copy-aware chain evidence
-                cbase[d].nuniq = h->nuniq;
 
                 cbase[d].length = len = chain_length(h);
 
@@ -1947,9 +1924,8 @@ static void* chain_thread(void* arg) {
       {
         Splay *l, *r;
         int lcost, rcost;
-        int htier = CN_TIER(hits[nidx].apos);  //  copy tier of this seed (0 if -Q off)
 
-        apos = CN_VAL(hits[nidx].apos) + 1;  //  strip copy-tier (see merge_thread)
+        apos = hits[nidx].apos + 1;
         bpos = apos - hits[nidx].diag;
 
         while (queue != NULL && queue->apos < apos - MAX_GAP) {
@@ -1985,14 +1961,14 @@ static void* chain_thread(void* arg) {
           //  drift ~0; chaining across a repeat copy jumps in B (large drift).
           //  Charging it keeps a clean collinear chain from being out-scored by
           //  one that wanders through duplicated copies (cf. report junction pen).
-          lcost -= (CN_DRIFT_W * abs(chain->diag - l->diag)) / 100;
+          if (JUNCTION_PEN) lcost -= (DRIFT_PEN_W * abs(chain->diag - l->diag)) / 100;
         }
         if (r != NULL) {
           if (bpos >= r->bpos + Kmer)
             rcost = r->cost + Kmer;
           else
             rcost = r->cost + (bpos - r->bpos);
-          rcost -= (CN_DRIFT_W * abs(chain->diag - r->diag)) / 100;
+          if (JUNCTION_PEN) rcost -= (DRIFT_PEN_W * abs(chain->diag - r->diag)) / 100;
         }
         if (lcost > rcost)
           rcost = 0;
@@ -2002,8 +1978,6 @@ static void* chain_thread(void* arg) {
         if (lcost > 0) {
           chain->from = l;
           chain->cost = lcost;
-          chain->rare = l->rare + cn_weight[htier];
-          chain->nuniq = l->nuniq + (htier == 1);
           if (l->from == NULL)
             chain->orig = l;
           else
@@ -2018,8 +1992,6 @@ static void* chain_thread(void* arg) {
         } else if (rcost > 0) {
           chain->from = r;
           chain->cost = rcost;
-          chain->rare = r->rare + cn_weight[htier];
-          chain->nuniq = r->nuniq + (htier == 1);
           if (r->from == NULL)
             chain->orig = r;
           else
@@ -2035,8 +2007,6 @@ static void* chain_thread(void* arg) {
           chain->from = NULL;
           chain->cost = Kmer;
           chain->orig = chain;
-          chain->rare = cn_weight[htier];
-          chain->nuniq = (htier == 1);
         }
 
         chain->nxt = NULL;
@@ -2497,43 +2467,15 @@ static int BC_MATCH_SORT(const void* l, const void* r) {
 }
 
 typedef struct {
-  int score;   //  alignment score: (aepos-abpos) - DIFF_SCORE*diffs (drives chaining)
+  int score;   //  alignment score: (aepos-abpos) - DIFF_SCORE*diffs (incl. junction pen)
   int link;
   int mark;
-  int sel;     //  copy-aware selection score = score + copy bonus (drives zone choice)
-  int nuniq;   //  unique (copy-1) seed support of this mapping
-  int rare;    //  graded rarity score of this mapping
 } Links;
-
-//  Copy-aware selection bonus.  Unique (copy-1) seeds strongly favour the locus
-//  they pin, so within a zone a mapping with more unique support wins even if its
-//  alignment is a little shorter/truncated.  Tunables (score units ~ bases):
-static int CN_UNIQ_W   = 0;    //  bonus per unique seed (copy bonus off by default:
-                               //  the junction penalty below resolves the residual better)
-static int CN_UNIQ_CAP = 8;    //  cap on unique seeds counted (avoid runaway)
-static int CN_RARE_DIV = 1000000000;  //  weak graded term (off by default)
-static int CN_CHAIN_PEN = 0;   //  (legacy) flat penalty for a multi-piece mapping
-static int CN_GAP_W = 100;     //  weight (x100) of the junction penalty when collinear
-                               //  pieces are stitched: a homolog that truncates at the
-                               //  distinguishing variant must pay for the gap/overlap +
-                               //  implied indel, so a clean single GT alignment wins.
-static int CN_SV_RELAX = 0;    //  with -Q: keep this % of the junction penalty when BOTH
-                               //  stitched pieces carry unique (copy-1) seeds.  Such a
-                               //  junction sits on a uniquely-anchored locus, so it is a
-                               //  real structural split (SV), not a repeat/homolog artifact,
-                               //  and must not be over-penalized.  Repeat-region stitches
-                               //  (no unique support) keep the full penalty.
-
-static int cn_bonus(int nuniq, int rare) {
-  int u = nuniq < CN_UNIQ_CAP ? nuniq : CN_UNIQ_CAP;
-  return CN_UNIQ_W * u + rare / CN_RARE_DIV;
-}
 
 static int LINK_SORT(const void* l, const void* r) {
   Links* x = *((Links**)l);
   Links* y = *((Links**)r);
 
-  if (y->sel != x->sel) return (y->sel - x->sel);
   return (y->score - x->score);
 }
 
@@ -2579,7 +2521,6 @@ static void* report_thread(void* arg) {
   int Omax;
   int novl, lovl;
   Overlap *amatch, *bmatch;
-  int *match_nuniq, *match_rare;   //  copy-aware: per-overlap candidate evidence
 
   int COmax;
   int nparts;
@@ -2592,15 +2533,6 @@ static void* report_thread(void* arg) {
   bhits = 0;
   align->path = apath;
   acomp = New_Read_Buffer(MR_ablock);
-
-  { char* e;
-    if ((e = getenv("CN_DBG")) != NULL) CN_DBG = atoi(e);
-    if ((e = getenv("CN_UNIQ_W")) != NULL) CN_UNIQ_W = atoi(e);
-    if ((e = getenv("CN_RARE_DIV")) != NULL) CN_RARE_DIV = atoi(e);
-    if ((e = getenv("CN_CHAIN_PEN")) != NULL) CN_CHAIN_PEN = atoi(e);
-    if ((e = getenv("CN_GAP_W")) != NULL) CN_GAP_W = atoi(e);
-    if ((e = getenv("CN_SV_RELAX")) != NULL) CN_SV_RELAX = atoi(e);
-  }
 
   if (SPACING <= TRACE_XOVR) {
     small = 1;
@@ -2629,15 +2561,12 @@ static void* report_thread(void* arg) {
   linker = Malloc(sizeof(Links) * COmax, "Allocating link vector");
   perm = Malloc(sizeof(Links*) * COmax, "Allocating permutation vector");
   part = Malloc(sizeof(Zones) * COmax, "Allocating zones vector");
-  match_nuniq = Malloc(sizeof(int) * Omax, "Allocating copy-evidence vector");
-  match_rare = Malloc(sizeof(int) * Omax, "Allocating copy-evidence vector");
 
   tbuf->max = 2 * TRACE_CHUNK;
   tbuf->trace = Malloc(sizeof(short) * tbuf->max, "Allocating trace vector");
 
   if (amatch == NULL || bmatch == NULL || linker == NULL || perm == NULL ||
-      part == NULL || tbuf->trace == NULL || match_nuniq == NULL ||
-      match_rare == NULL)
+      part == NULL || tbuf->trace == NULL)
     Clean_Exit(1);
 
   cnt = data->cover;
@@ -2726,11 +2655,6 @@ static void* report_thread(void* arg) {
                 amatch = Realloc(amatch, sizeof(Overlap) * Omax,
                                  "Reallocating match vector");
                 if (amatch == NULL) Clean_Exit(1);
-                match_nuniq = Realloc(match_nuniq, sizeof(int) * Omax,
-                                      "Reallocating copy-evidence vector");
-                match_rare = Realloc(match_rare, sizeof(int) * Omax,
-                                     "Reallocating copy-evidence vector");
-                if (match_nuniq == NULL || match_rare == NULL) Clean_Exit(1);
                 if (MR_doB) {
                   bmatch = Realloc(bmatch, sizeof(Overlap) * Omax,
                                    "Reallocating match vector");
@@ -2742,8 +2666,6 @@ static void* report_thread(void* arg) {
               amatch[novl].bread = br;
               amatch[novl].flags = (cm ? COMP_FLAG : 0);
               amatch[novl].path = *apath;
-              match_nuniq[novl] = cbase[c].nuniq;   //  copy-aware evidence
-              match_rare[novl] = cbase[c].rare;
 
               if (tbuf->top + apath->tlen > tbuf->max) {
                 tbuf->max = 1.2 * (tbuf->top + apath->tlen) + TRACE_CHUNK;
@@ -2838,8 +2760,6 @@ static void* report_thread(void* arg) {
     linker[0].score = (amatch[0].path.aepos - amatch[0].path.abpos) -
                       DIFF_SCORE * amatch[0].path.diffs;
     linker[0].mark = 1;
-    linker[0].nuniq = match_nuniq[0];
-    linker[0].rare = match_rare[0];
     perm[0] = linker;
     br = amatch[0].bread;
     for (c = 1; c < novl; c++) {
@@ -2852,8 +2772,6 @@ static void* report_thread(void* arg) {
       linker[c].score =
           (cpath->aepos - cpath->abpos) - DIFF_SCORE * cpath->diffs;
       linker[c].mark = 1;
-      linker[c].nuniq = match_nuniq[c];
-      linker[c].rare = match_rare[c];
       perm[c] = linker + c;
 
       if (amatch[c].bread != br) {
@@ -2899,16 +2817,9 @@ static void* report_thread(void* arg) {
             int disp = ag < 0 ? -ag : ag;
             int dispb = bg < 0 ? -bg : bg;
             int indel = ag - bg;
-            int pen;
             if (dispb > disp) disp = dispb;
             if (indel < 0) indel = -indel;
-            pen = (CN_GAP_W * (disp + indel)) / 100;
-            //  Copy-aware SV gate: if both stitched pieces are uniquely anchored,
-            //  this is a real split on a unique locus, not a repeat/homolog
-            //  artifact, so relax the penalty (keep CN_SV_RELAX%).
-            if (COPY_AWARE && match_nuniq[c] > 0 && match_nuniq[d] > 0)
-              pen = (pen * CN_SV_RELAX) / 100;
-            scr -= pen;
+            scr -= (GAP_PEN_W * (disp + indel)) / 100;
           }
           scr2 = linker[c].score;
           if (scr < scr2 - TIE_SCORE) continue;
@@ -2935,31 +2846,10 @@ static void* report_thread(void* arg) {
         }
     }
 
-    //  Copy-aware selection score: a small bonus for unique/rare-seed support so
-    //  that, among chains competing for the same A-read region, the one anchored
-    //  by distinguishing (low-copy) seeds wins.  cn_bonus()==0 when -Q is off, so
-    //  this is a no-op (LINK_SORT and the zone test then reduce to plain score).
-    for (c = 0; c < novl; c++)
-      linker[c].sel =
-          linker[c].score + cn_bonus(linker[c].nuniq, linker[c].rare) -
-          (linker[c].link >= 0 ? CN_CHAIN_PEN : 0);
-
-    if (CN_DBG >= 0 && ar + astart == CN_DBG)
-      for (c = 0; c < novl; c++)
-        fprintf(stderr,
-                "CNDBG read %d -> ctg %d%c [%d,%d] cov %d score %d nuniq %d "
-                "rare %d sel %d\n",
-                ar + astart, amatch[c].bread, COMP(amatch[c].flags) ? 'c' : 'n',
-                amatch[c].path.abpos, amatch[c].path.aepos,
-                amatch[c].path.aepos - amatch[c].path.abpos, linker[c].score,
-                linker[c].nuniq, linker[c].rare, linker[c].sel);
-
     qsort(perm, novl, sizeof(Links*), LINK_SORT);
 
     nparts = 0;
     for (c = 0; c < novl; c++)
-      //  score >= 0 keeps a valid-alignment floor: the copy bonus reorders
-      //  competitors (via sel) but can never promote a negative-score match.
       if (perm[c]->mark == 1 && perm[c]->score >= 0) {
         int p, b, e, q, n;
         int best;
@@ -2976,15 +2866,15 @@ static void* report_thread(void* arg) {
         if (p >= nparts) {
           part[p].beg = amatch[b].path.abpos;
           part[p].end = amatch[e].path.aepos;
-          part[p].top = linker[b].sel;
+          part[p].top = linker[b].score;
           best = 1;
           nparts += 1;
         } else {
           //  Secondary: another (higher-scoring) chain already covers this
           //  A-read region.
           if (PRIMARY_ONLY) continue;  //  -1: keep only the primary per region
-          if (linker[b].sel < BEST_TIE * part[p].top) continue;
-          best = (linker[b].sel == part[p].top);
+          if (linker[b].score < BEST_TIE * part[p].top) continue;
+          best = (linker[b].score == part[p].top);
         }
 
         q = -1;
@@ -3089,8 +2979,6 @@ static void* report_thread(void* arg) {
   free(part);
   free(perm);
   free(linker);
-  free(match_nuniq);
-  free(match_rare);
   if (MR_doB) free(bmatch);
   free(amatch);
   free(acomp - 1);
@@ -3148,16 +3036,6 @@ void Match_Filter(DAZZ_DB* ablock, DAZZ_DB* bblock, void* vasort, int alen,
 
   atot = ablock->totlen;
   btot = bblock->totlen;
-
-  //  Enable copy-number-aware anchoring only when the apos tier channel is safe:
-  //  inside Match_Filter, ablock is the READS, so apos (a read position) stays
-  //  below CN_MAXLEN and the tier bits never collide with the radix sort key.
-  CN_ON = COPY_AWARE && (ablock->maxlen < CN_MAXLEN);
-  if (COPY_AWARE && !CN_ON && VERBOSE)
-    printf("   Copy-aware anchoring disabled: read maxlen %d >= %d\n",
-           ablock->maxlen, CN_MAXLEN);
-  //  chain_thread runs here (before report_thread), so read its knob now.
-  { char* e = getenv("CN_DRIFT_W"); if (e != NULL) CN_DRIFT_W = atoi(e); }
 
   {
     int64 powr;
