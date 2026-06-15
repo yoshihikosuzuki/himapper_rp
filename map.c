@@ -69,6 +69,18 @@
 #define DRIFT_PEN_W 100  //  chain_thread: per seed-hit link, charge |Adiag change|
 #define GAP_PEN_W 100    //  report linker: per stitched piece, charge gap+overlap+indel
 
+//  Affine-gap tie-break (FINE_TIE, -F).  When two candidate placements score
+//  identically under the unit-cost edit distance (length - DIFF_SCORE*diffs),
+//  damapper's pick is the arbitrary qsort order (systematically the later contig).
+//  -F instead expands the exact trace of the tied candidates and re-ranks them by
+//  an affine-gap penalty (mismatch + gap-open + gap-extend), mirroring minimap2's
+//  base-level DP score: it consolidates indels into runs so a placement whose
+//  diffs are fewer, longer gaps (e.g. one true haplotype indel) is preferred over
+//  one with the same diff count scattered into many opens.
+#define AFF_MIS  4   //  per substitution
+#define AFF_OPEN 6   //  per gap run  (gap = AFF_OPEN + len*AFF_EXT)
+#define AFF_EXT  2   //  per indel base
+
 //  FASTGA-style diagonal-band Local_Alignment.  When BAND_ALIGN is defined,
 //  report_thread seeds each Local_Alignment with a diagonal band
 //  [dg-BAND_RADIUS, dg+BAND_RADIUS] instead of a single diagonal dg, so a
@@ -2468,6 +2480,7 @@ static int BC_MATCH_SORT(const void* l, const void* r) {
 
 typedef struct {
   int score;   //  alignment score: (aepos-abpos) - DIFF_SCORE*diffs (incl. junction pen)
+  int ascore;  //  affine-gap tie-break score (-F); 0 unless an equal-score peer exists
   int link;
   int mark;
 } Links;
@@ -2476,7 +2489,44 @@ static int LINK_SORT(const void* l, const void* r) {
   Links* x = *((Links**)l);
   Links* y = *((Links**)r);
 
+  //  Break exact score ties by the affine-gap score (-F).  ascore is 0 for all
+  //  candidates when -F is off, so this reduces to the original behavior.
+  if (y->score == x->score)
+    return (y->ascore - x->ascore);
   return (y->score - x->score);
+}
+
+//  Score a candidate under an affine-gap model, read straight off its compressed
+//  trace points (d_i = #diffs, b_i = #B-bases per trace_spacing A-segment) without
+//  re-aligning.  Per segment the net indel is |A_width - b_i|; the rest of d_i is
+//  treated as substitutions and a non-zero net opens one gap.  This consolidates
+//  indels into runs the way minimap2's base-level DP score does, so a placement
+//  whose diffs are fewer/longer gaps (e.g. one true haplotype indel) outscores one
+//  with the same diff count scattered into many opens.  Returns -penalty (higher
+//  is better).
+static int Affine_Score(Overlap* ov, uint16* tracepts) {
+  Path* p = &ov->path;
+  int n = p->tlen / 2;
+  int apos = p->abpos;
+  int i, pen;
+
+  if (p->aepos <= p->abpos || n <= 0) return 0;
+
+  pen = 0;
+  for (i = 0; i < n; i++) {
+    int d = tracepts[2 * i];
+    int b = tracepts[2 * i + 1];
+    int a_next = (i == n - 1) ? p->aepos : ((apos / SPACING) + 1) * SPACING;
+    int a = a_next - apos;
+    int net = a - b;
+    int subs;
+    if (net < 0) net = -net;
+    subs = d - net;
+    if (subs < 0) subs = 0;
+    pen += subs * AFF_MIS + (net > 0 ? AFF_OPEN : 0) + net * AFF_EXT;
+    apos = a_next;
+  }
+  return -pen;
 }
 
 typedef struct {
@@ -2759,6 +2809,7 @@ static void* report_thread(void* arg) {
     linker[0].link = -1;
     linker[0].score = (amatch[0].path.aepos - amatch[0].path.abpos) -
                       DIFF_SCORE * amatch[0].path.diffs;
+    linker[0].ascore = 0;
     linker[0].mark = 1;
     perm[0] = linker;
     br = amatch[0].bread;
@@ -2771,6 +2822,7 @@ static void* report_thread(void* arg) {
       linker[c].link = -1;
       linker[c].score =
           (cpath->aepos - cpath->abpos) - DIFF_SCORE * cpath->diffs;
+      linker[c].ascore = 0;
       linker[c].mark = 1;
       perm[c] = linker + c;
 
@@ -2844,6 +2896,25 @@ static void* report_thread(void* arg) {
           linker[c].score = scr;
           linker[d].mark = 0;
         }
+    }
+
+    //  Affine-gap tie-break (-F): for any candidate that shares an exact score
+    //  with another, expand its trace and score it under an affine-gap model so
+    //  LINK_SORT can break the tie by gap structure instead of arbitrary order.
+    //  Gated to tied candidates only (~5% of reads), so off the hot path.
+    if (FINE_TIE) {
+      for (c = 0; c < novl; c++) {
+        int e, tied = 0;
+        for (e = 0; e < novl; e++)
+          if (e != c && linker[e].score == linker[c].score) {
+            tied = 1;
+            break;
+          }
+        if (tied) {
+          uint16* tp = (uint16*)tbuf->trace + (uint64)amatch[c].path.trace;
+          linker[c].ascore = Affine_Score(amatch + c, tp);
+        }
+      }
     }
 
     qsort(perm, novl, sizeof(Links*), LINK_SORT);

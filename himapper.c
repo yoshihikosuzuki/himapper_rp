@@ -26,7 +26,7 @@
 #include "map.h"
 
 static char *Usage[] =
-  { "[-1vpzCN] [-k<int(20)>] [-t<int>] [-M<int>] [-T<int(4)>] [-P<dir(/tmp)>]",
+  { "[-1vpzCNGF] [-k<int(20)>] [-t<int>] [-M<int>] [-T<int(4)>] [-P<dir(/tmp)>]",
     "         [-e<double(.85)] [-s<int(100)>] [-n<double(1.00)>]",
     "         [-m<track>]+  <reference:dam> <ref.kpos|all> <reads:db> <reads.kpos|all>",
   };
@@ -37,6 +37,7 @@ int     SPACING;
 double  BEST_TIE;
 int     PRIMARY_ONLY;
 int     JUNCTION_PEN;
+int     FINE_TIE;
 char   *SORT_PATH;
 
 uint64  MEM_LIMIT;
@@ -602,7 +603,7 @@ int main(int argc, char *argv[])
       if (argv[i][0] == '-')
         switch (argv[i][1])
         { default:
-            ARG_FLAGS("vpzCN1G")
+            ARG_FLAGS("vpzCN1GF")
             break;
           case 'e':
             ARG_REAL(AVE_ERROR)
@@ -678,6 +679,7 @@ int main(int argc, char *argv[])
     MAP_ORDER = 1-flags['z'];
     PRIMARY_ONLY = flags['1'];   //  -1: suppress same-region secondaries (cf. minimap2 --secondary=no)
     JUNCTION_PEN = 1 - flags['G'];  //  -G: disable collinear-gap penalties (legacy damapper)
+  FINE_TIE = flags['F'];  //  -F: break exact score ties by an affine-gap rescore (experimental)
 
     if (argc <= 4)
       { fprintf(stderr,"Usage: %s %s\n",Prog_Name,Usage[0]);
