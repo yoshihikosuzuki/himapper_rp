@@ -14,3 +14,4 @@ archive
 work*
 .vscode/
 __pycache__/
+memory/

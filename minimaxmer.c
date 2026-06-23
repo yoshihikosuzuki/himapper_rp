@@ -6,7 +6,7 @@
 
 #include "DB.h"
 #include "nthash.h"
-#include "libfastk.h"  // FASTK profile API (compile with -IFASTK)
+#include "libfastk.h"  // FASTK profile API (vendored: libfastk.{c,h}, gene_core.h)
 
 // #define DEBUG_HASH
 // #define DEBUG_NW
