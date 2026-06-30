@@ -591,7 +591,11 @@ int main(int argc, char *argv[])
         fflush(stderr);
       }
 
-    // MTOP  = 0;
+    MTOP  = 0;        // mask-track feature disabled, but MTOP/MSTAT/MASK are still
+    MMAX  = 0;        // passed to read_DB (lines below): initialize them so the mask
+    MASK  = NULL;     // loop is a no-op.  Leaving them uninitialized is UB — benign on
+    MSTAT = NULL;     // Mac/clang (garbage~0) but nonzero garbage on Linux/gcc, which
+                      // makes read_DB walk a bad mask[] -> segfault/hang.
     // MMAX  = 10;
     // MASK  = (char **) Malloc(MMAX*sizeof(char *),"Allocating mask track array");
     // MSTAT = (int *) Malloc(MMAX*sizeof(int),"Allocating mask status array");
