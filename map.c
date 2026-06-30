@@ -41,6 +41,12 @@ static int CN_ON = 0;
 //  Requires -Q (which populates nuniq via the tier channel).  Off => no effect.
 static int CN_TIE_ONLY = 0;
 
+//  CN_UNIQ_W: selection bonus per unique (copy-1) seed.  sel = score + CN_UNIQ_W*nuniq.
+//  0 => sel==score (no override; exact ties still handled by CN_TIE_ONLY).  ~2.3 => one
+//  unique seed offsets ~1 diff (near-tie override).  Huge => nuniq dominates (unlimited).
+//  Requires -Q.  Experimental.
+static double CN_UNIQ_W = 0.0;
+
 #define MAXGRAM \
   10000  //  Cap on k-mer count histogram (in count_thread, merge_thread)
 
@@ -2500,6 +2506,7 @@ static int BC_MATCH_SORT(const void* l, const void* r) {
 
 typedef struct {
   int score;   //  alignment score: (aepos-abpos) - DIFF_SCORE*diffs (incl. junction pen)
+  int sel;     //  selection score = score + CN_UNIQ_W*nuniq (drives LINK_SORT + zones)
   int ascore;  //  affine-gap tie-break score (-F); 0 unless an equal-score peer exists
   int nuniq;   //  unique (copy-1) seed support (-Q); used for the CN_TIE_ONLY tiebreak
   int link;
@@ -2510,11 +2517,13 @@ static int LINK_SORT(const void* l, const void* r) {
   Links* x = *((Links**)l);
   Links* y = *((Links**)r);
 
-  if (y->score != x->score) return (y->score - x->score);
-  //  Exact score tie.  Prefer the candidate with more unique (copy-1) seed support
-  //  (CN_TIE_ONLY, -Q): a haplotype-distinguishing signal orthogonal to the affine
-  //  rescore.  Then fall back to the affine-gap score (-F).  Both are 0/no-op when
-  //  their flag is off, so this reduces to the original behavior.
+  //  Primary key = sel (score + nuniq bonus).  sel==score when CN_UNIQ_W==0, so this
+  //  reduces to plain score.  A large CN_UNIQ_W makes nuniq dominate (unlimited
+  //  copy-aware selection); a small one only overrides near-ties.
+  if (y->sel != x->sel) return (y->sel - x->sel);
+  //  sel tie.  Prefer more unique (copy-1) seed support (CN_TIE_ONLY, -Q): a
+  //  haplotype-distinguishing signal orthogonal to the affine rescore.  Then fall
+  //  back to the affine-gap score (-F).  Both are no-ops when their flag is off.
   if (CN_TIE_ONLY && y->nuniq != x->nuniq) return (y->nuniq - x->nuniq);
   return (y->ascore - x->ascore);
 }
@@ -2610,6 +2619,7 @@ static void* report_thread(void* arg) {
 
   { char* e;
     if ((e = getenv("CN_TIE_ONLY")) != NULL) CN_TIE_ONLY = atoi(e);
+    if ((e = getenv("CN_UNIQ_W")) != NULL) CN_UNIQ_W = atof(e);
   }
 
   if (SPACING <= TRACE_XOVR) {
@@ -2933,6 +2943,11 @@ static void* report_thread(void* arg) {
         }
     }
 
+    //  Selection score = alignment score + copy-aware unique-seed bonus.  CN_UNIQ_W==0
+    //  => sel==score (no-op).  Computed after stitching finalizes linker[].score.
+    for (c = 0; c < novl; c++)
+      linker[c].sel = linker[c].score + (int)(CN_UNIQ_W * linker[c].nuniq);
+
     //  Affine-gap tie-break (-F): for any candidate that shares an exact score
     //  with another, expand its trace and score it under an affine-gap model so
     //  LINK_SORT can break the tie by gap structure instead of arbitrary order.
@@ -2984,15 +2999,15 @@ static void* report_thread(void* arg) {
         if (p >= nparts) {
           part[p].beg = amatch[b].path.abpos;
           part[p].end = amatch[e].path.aepos;
-          part[p].top = linker[b].score;
+          part[p].top = linker[b].sel;
           best = 1;
           nparts += 1;
         } else {
           //  Secondary: another (higher-scoring) chain already covers this
           //  A-read region.
           if (PRIMARY_ONLY) continue;  //  -1: keep only the primary per region
-          if (linker[b].score < BEST_TIE * part[p].top) continue;
-          best = (linker[b].score == part[p].top);
+          if (linker[b].sel < BEST_TIE * part[p].top) continue;
+          best = (linker[b].sel == part[p].top);
         }
 
         q = -1;
