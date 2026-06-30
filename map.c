@@ -2952,6 +2952,18 @@ static void* report_thread(void* arg) {
       }
     }
 
+    //  Debug: dump every candidate of this A-read (CN_DUMP=1) as
+    //  "CAND  aread  bread  n/c  score  diffs  nuniq" for offline tie analysis.
+    { static int CN_DUMP = -2;
+      if (CN_DUMP == -2) { char* e = getenv("CN_DUMP"); CN_DUMP = e ? atoi(e) : 0; }
+      if (CN_DUMP)
+        for (c = 0; c < novl; c++)
+          fprintf(stderr, "CAND\t%d\t%d\t%c\t%d\t%d\t%d\n",
+                  amatch[c].aread, amatch[c].bread,
+                  COMP(amatch[c].flags) ? 'c' : 'n',
+                  linker[c].score, amatch[c].path.diffs, linker[c].nuniq);
+    }
+
     qsort(perm, novl, sizeof(Links*), LINK_SORT);
 
     nparts = 0;
