@@ -28,8 +28,18 @@
 
 #include "DB.h"
 #include "align.h"
+#include "copynum.h"
 
 #define THREAD pthread_t
+
+//  Copy-number-aware anchoring (-Q).  Set once per Match_Filter call from the read
+//  length guard (see copynum.h).  When 0 the tier channel is inert and himapper
+//  behaves exactly as before.  Only the nuniq exact-tie break uses it (no bonus).
+static int CN_ON = 0;
+
+//  CN_TIE_ONLY: break exact alignment-score ties by unique (copy-1) seed support.
+//  Requires -Q (which populates nuniq via the tier channel).  Off => no effect.
+static int CN_TIE_ONLY = 0;
 
 #define MAXGRAM \
   10000  //  Cap on k-mer count histogram (in count_thread, merge_thread)
@@ -936,7 +946,7 @@ void* Load_Kpos(const char* path, int comp, DAZZ_DB* block, int* len) {
       uint64 c = arr[i].code, r = 0;
       int b;
       int orig_rpos = arr[i].rpos;
-      int rlen = block->reads[arr[i].read].rlen;
+      int rlen = block->reads[CN_VAL(arr[i].read)].rlen;  // strip copy-tier from rid
       for (b = 0; b < Kmer; b++) {
         r = (r << 2) | (3 - (c & 3));
         c >>= 2;
@@ -1154,9 +1164,12 @@ static void* merge_thread(void* arg) {
           ap = asort[a].rpos;
           kptr[ap & BMASK] += ct;
           for (b = jb; b < ib; b++) {
-            hits[nhits].bread = bsort[b].read;
+            //  bsort is the reference seed list, so bsort[b].read carries the genome
+            //  copy-tier in its top bits.  Strip it for the contig id and ferry it
+            //  through the spare high bits of apos (a read position < CN_MAXLEN).
+            hits[nhits].bread = CN_VAL(bsort[b].read);
             hits[nhits].aread = asort[a].read;
-            hits[nhits].apos = ap;
+            hits[nhits].apos = CN_ON ? CN_PACK(ap, CN_TIER(bsort[b].read)) : ap;
             hits[nhits].diag = ap - bsort[b].rpos;
 #ifdef DEBUG_SEED_HIT
             {
@@ -1216,6 +1229,7 @@ typedef struct _splay {
   struct _splay* from;
   struct _splay* orig;
   int cost;
+  int nuniq;  //  copy-aware: running count of unique (copy-1) seeds along the chain
 } Splay;
 
 //  Add node o to tree x.  Upon return, o is always the root of subtree
@@ -1551,6 +1565,7 @@ typedef struct {
   int alast;
   int bfirst;
   int blast;
+  int nuniq;  //  copy-aware: number of unique (copy-1) seeds anchoring this chain
 } Candidate;
 
 void print_candidates(int aread, int cand, Candidate* cbase, Jump* jbase,
@@ -1885,6 +1900,7 @@ static void* chain_thread(void* arg) {
                 cbase[d].alast = ae;
                 cbase[d].bfirst = bb;
                 cbase[d].blast = be;
+                cbase[d].nuniq = h->nuniq;    //  copy-aware chain evidence
 
                 cbase[d].length = len = chain_length(h);
 
@@ -1936,8 +1952,9 @@ static void* chain_thread(void* arg) {
       {
         Splay *l, *r;
         int lcost, rcost;
+        int htier = CN_TIER(hits[nidx].apos);  //  copy tier of this seed (0 if -Q off)
 
-        apos = hits[nidx].apos + 1;
+        apos = CN_VAL(hits[nidx].apos) + 1;  //  strip copy-tier (see merge_thread)
         bpos = apos - hits[nidx].diag;
 
         while (queue != NULL && queue->apos < apos - MAX_GAP) {
@@ -1990,6 +2007,7 @@ static void* chain_thread(void* arg) {
         if (lcost > 0) {
           chain->from = l;
           chain->cost = lcost;
+          chain->nuniq = l->nuniq + (htier == 1);
           if (l->from == NULL)
             chain->orig = l;
           else
@@ -2004,6 +2022,7 @@ static void* chain_thread(void* arg) {
         } else if (rcost > 0) {
           chain->from = r;
           chain->cost = rcost;
+          chain->nuniq = r->nuniq + (htier == 1);
           if (r->from == NULL)
             chain->orig = r;
           else
@@ -2019,6 +2038,7 @@ static void* chain_thread(void* arg) {
           chain->from = NULL;
           chain->cost = Kmer;
           chain->orig = chain;
+          chain->nuniq = (htier == 1);
         }
 
         chain->nxt = NULL;
@@ -2481,6 +2501,7 @@ static int BC_MATCH_SORT(const void* l, const void* r) {
 typedef struct {
   int score;   //  alignment score: (aepos-abpos) - DIFF_SCORE*diffs (incl. junction pen)
   int ascore;  //  affine-gap tie-break score (-F); 0 unless an equal-score peer exists
+  int nuniq;   //  unique (copy-1) seed support (-Q); used for the CN_TIE_ONLY tiebreak
   int link;
   int mark;
 } Links;
@@ -2489,11 +2510,13 @@ static int LINK_SORT(const void* l, const void* r) {
   Links* x = *((Links**)l);
   Links* y = *((Links**)r);
 
-  //  Break exact score ties by the affine-gap score (-F).  ascore is 0 for all
-  //  candidates when -F is off, so this reduces to the original behavior.
-  if (y->score == x->score)
-    return (y->ascore - x->ascore);
-  return (y->score - x->score);
+  if (y->score != x->score) return (y->score - x->score);
+  //  Exact score tie.  Prefer the candidate with more unique (copy-1) seed support
+  //  (CN_TIE_ONLY, -Q): a haplotype-distinguishing signal orthogonal to the affine
+  //  rescore.  Then fall back to the affine-gap score (-F).  Both are 0/no-op when
+  //  their flag is off, so this reduces to the original behavior.
+  if (CN_TIE_ONLY && y->nuniq != x->nuniq) return (y->nuniq - x->nuniq);
+  return (y->ascore - x->ascore);
 }
 
 //  Score a candidate under an affine-gap model, read straight off its compressed
@@ -2571,6 +2594,7 @@ static void* report_thread(void* arg) {
   int Omax;
   int novl, lovl;
   Overlap *amatch, *bmatch;
+  int *match_nuniq;   //  copy-aware: per-overlap unique-seed evidence (-Q)
 
   int COmax;
   int nparts;
@@ -2583,6 +2607,10 @@ static void* report_thread(void* arg) {
   bhits = 0;
   align->path = apath;
   acomp = New_Read_Buffer(MR_ablock);
+
+  { char* e;
+    if ((e = getenv("CN_TIE_ONLY")) != NULL) CN_TIE_ONLY = atoi(e);
+  }
 
   if (SPACING <= TRACE_XOVR) {
     small = 1;
@@ -2611,12 +2639,13 @@ static void* report_thread(void* arg) {
   linker = Malloc(sizeof(Links) * COmax, "Allocating link vector");
   perm = Malloc(sizeof(Links*) * COmax, "Allocating permutation vector");
   part = Malloc(sizeof(Zones) * COmax, "Allocating zones vector");
+  match_nuniq = Malloc(sizeof(int) * Omax, "Allocating copy-evidence vector");
 
   tbuf->max = 2 * TRACE_CHUNK;
   tbuf->trace = Malloc(sizeof(short) * tbuf->max, "Allocating trace vector");
 
   if (amatch == NULL || bmatch == NULL || linker == NULL || perm == NULL ||
-      part == NULL || tbuf->trace == NULL)
+      part == NULL || tbuf->trace == NULL || match_nuniq == NULL)
     Clean_Exit(1);
 
   cnt = data->cover;
@@ -2705,6 +2734,9 @@ static void* report_thread(void* arg) {
                 amatch = Realloc(amatch, sizeof(Overlap) * Omax,
                                  "Reallocating match vector");
                 if (amatch == NULL) Clean_Exit(1);
+                match_nuniq = Realloc(match_nuniq, sizeof(int) * Omax,
+                                      "Reallocating copy-evidence vector");
+                if (match_nuniq == NULL) Clean_Exit(1);
                 if (MR_doB) {
                   bmatch = Realloc(bmatch, sizeof(Overlap) * Omax,
                                    "Reallocating match vector");
@@ -2716,6 +2748,7 @@ static void* report_thread(void* arg) {
               amatch[novl].bread = br;
               amatch[novl].flags = (cm ? COMP_FLAG : 0);
               amatch[novl].path = *apath;
+              match_nuniq[novl] = cbase[c].nuniq;   //  copy-aware evidence
 
               if (tbuf->top + apath->tlen > tbuf->max) {
                 tbuf->max = 1.2 * (tbuf->top + apath->tlen) + TRACE_CHUNK;
@@ -2810,6 +2843,7 @@ static void* report_thread(void* arg) {
     linker[0].score = (amatch[0].path.aepos - amatch[0].path.abpos) -
                       DIFF_SCORE * amatch[0].path.diffs;
     linker[0].ascore = 0;
+    linker[0].nuniq = match_nuniq[0];
     linker[0].mark = 1;
     perm[0] = linker;
     br = amatch[0].bread;
@@ -2823,6 +2857,7 @@ static void* report_thread(void* arg) {
       linker[c].score =
           (cpath->aepos - cpath->abpos) - DIFF_SCORE * cpath->diffs;
       linker[c].ascore = 0;
+      linker[c].nuniq = match_nuniq[c];
       linker[c].mark = 1;
       perm[c] = linker + c;
 
@@ -3050,6 +3085,7 @@ static void* report_thread(void* arg) {
   free(part);
   free(perm);
   free(linker);
+  free(match_nuniq);
   if (MR_doB) free(bmatch);
   free(amatch);
   free(acomp - 1);
@@ -3107,6 +3143,14 @@ void Match_Filter(DAZZ_DB* ablock, DAZZ_DB* bblock, void* vasort, int alen,
 
   atot = ablock->totlen;
   btot = bblock->totlen;
+
+  //  Enable copy-number-aware anchoring (-Q) only when the apos tier channel is safe:
+  //  inside Match_Filter ablock is the READS, so apos (a read position) stays below
+  //  CN_MAXLEN and the tier bits never collide with the radix sort key.
+  CN_ON = COPY_AWARE && (ablock->maxlen < CN_MAXLEN);
+  if (COPY_AWARE && !CN_ON && VERBOSE)
+    printf("   Copy-aware anchoring disabled: read maxlen %d >= %d\n",
+           ablock->maxlen, CN_MAXLEN);
 
   {
     int64 powr;
