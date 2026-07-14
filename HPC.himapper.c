@@ -23,8 +23,8 @@
 #undef  SLURM  //  define if want a directly executable SLURM script
 
 static char *Usage[] =
-  { "[-vpzCN] [-k<int(20)>] [-t<int>] [-M<int>] [-e<double(.85)] [-s<int(100)]",
-    "         [-n<double(1.)] [-m<track>]+ [-B<int( 4)>] [-T<int(4)>] [-f<name>]",
+  { "[-vpzCN1QGF] [-k<int(20)>] [-t<int>] [-M<int>] [-e<double(.85)] [-s<int(100)]",
+    "         [-n<double(1.)] [-m<track>]+ [-T<int(4)>] [-f<name>] [-K<ref.kpos|all(all)>] [-R<reads.kpos|all(all)>]",
     "         <ref:db|dam> <reads:db|dam> [<first:int>[-<last:int>]]"
   };
 
@@ -68,12 +68,14 @@ int main(int argc, char *argv[])
   int    MMAX, MTOP;
   char **MASK;
   char  *ONAME;
+  int    ONE, QON, GON, FON;       //  himapper-specific flags: -1 -Q -G -F
+  char  *REFKPOS, *READSKPOS;      //  himapper seed files (-K / -R); "all" => compute on the fly
 
   { int    i, j, k;         //  Process options
     int    flags[128];
     char  *eptr;
 
-    ARG_INIT("HPC.damapper")
+    ARG_INIT("HPC.himapper")
 
     BUNIT    = 4;
     KINT     = 20;
@@ -83,6 +85,8 @@ int main(int argc, char *argv[])
     MINT     = -1;
     NEIGHBOR = 1.;
     NTHREADS = 4;
+    REFKPOS   = "all";
+    READSKPOS = "all";
 
     MTOP = 0;
     MMAX = 10;
@@ -97,7 +101,13 @@ int main(int argc, char *argv[])
       if (argv[i][0] == '-')
         switch (argv[i][1])
         { default:
-            ARG_FLAGS("vbpzCN");
+            ARG_FLAGS("vbpzCN1QGF");
+            break;
+          case 'K':
+            REFKPOS = argv[i]+2;
+            break;
+          case 'R':
+            READSKPOS = argv[i]+2;
             break;
           case 'e':
             ARG_REAL(EREL)
@@ -154,13 +164,22 @@ int main(int argc, char *argv[])
     ZON = flags['z'];
     CON = flags['C'];
     NON = flags['N'];
+    ONE = flags['1'];
+    QON = flags['Q'];
+    GON = flags['G'];
+    FON = flags['F'];
 
     if (argc < 3 || argc > 4)
       { fprintf(stderr,"Usage: %s %s\n",Prog_Name,Usage[0]);
         fprintf(stderr,"       %*s %s\n",(int) strlen(Prog_Name),"",Usage[1]);
         fprintf(stderr,"       %*s %s\n",(int) strlen(Prog_Name),"",Usage[2]);
         fprintf(stderr,"\n");
-        fprintf(stderr,"     Passed through to damapper.\n");
+        fprintf(stderr,"     himapper seeds (one himapper call per reads block):\n");
+        fprintf(stderr,"      -K: ref   seed file <ref.kpos|all>   (default all).\n");
+        fprintf(stderr,"      -R: reads seed file <reads.kpos|all> (default all).\n");
+        fprintf(stderr,"      -1: primary-only.  -Q: copy-aware.  -G/-F: himapper tie-break flags.\n");
+        fprintf(stderr,"\n");
+        fprintf(stderr,"     Passed through to himapper.\n");
         fprintf(stderr,"      -k: k-mer size (must be <= 32).\n");
         fprintf(stderr,"      -t: Ignore k-mers that occur >= -t times in a block.\n");
         fprintf(stderr,"      -M: Use only -M GB of memory by ignoring most frequent k-mers.\n");
@@ -210,6 +229,8 @@ int main(int argc, char *argv[])
     for (j = 1; 2*j <= NTHREADS; j *= 2)
       ;
     NTHREADS = j;
+
+    BUNIT = 1;   //  himapper takes exactly ONE reads block (+ its kpos) per invocation
   }
 
   //  Make sure DAM and DB exist and the DB is partitioned, get number of blocks in partition
@@ -368,7 +389,7 @@ int main(int argc, char *argv[])
 
     njobs = (lblock-fblock)/BUNIT + 1;
 
-    fprintf(out,"# Damapper jobs (%d)\n",njobs);
+    fprintf(out,"# himapper jobs (%d)\n",njobs);
 
 #ifdef HPC
     jobid = 1;
@@ -391,7 +412,15 @@ int main(int argc, char *argv[])
             fprintf(out,HPC_ALIGN,NTHREADS,(16*1024)/NTHREADS,jobid++);
           fprintf(out," \"");
 #endif
-          fprintf(out,"damapper");
+          fprintf(out,"himapper");
+          if (ONE)
+            fprintf(out," -1");
+          if (QON)
+            fprintf(out," -Q");
+          if (GON)
+            fprintf(out," -G");
+          if (FON)
+            fprintf(out," -F");
           if (VON)
             fprintf(out," -v");
           if (PON)
@@ -422,18 +451,21 @@ int main(int argc, char *argv[])
             fprintf(out," %s/%s",pwd1,root1);
           else
             fprintf(out," %s",root1);
+          fprintf(out," %s",REFKPOS);                //  himapper: <ref.kpos|all> after the ref
 	  hgh = fblock + (((lblock-fblock)+1)*j)/bits;
           for (k = low; k < hgh; k++)
-            if (useblock2)
-              if (usepath2)
-                fprintf(out," %s/%s.%d",pwd2,root2,k);
+            { if (useblock2)
+                if (usepath2)
+                  fprintf(out," %s/%s.%d",pwd2,root2,k);
+                else
+                  fprintf(out," %s.%d",root2,k);
               else
-                fprintf(out," %s.%d",root2,k);
-            else
-              if (usepath2)
-                fprintf(out," %s/%s",pwd2,root2);
-              else
-                fprintf(out," %s",root2);
+                if (usepath2)
+                  fprintf(out," %s/%s",pwd2,root2);
+                else
+                  fprintf(out," %s",root2);
+              fprintf(out," %s",READSKPOS);          //  himapper: <reads.kpos|all> after each reads block
+            }
 #ifdef HPC
           fprintf(out,"\"");
 #endif

@@ -9,9 +9,12 @@ modimizer
 copy_minimizer
 minimaxmer
 dump_kpos
+himapper_hn
+minimaxmer_ca
 
 archive
 work*
 .vscode/
 __pycache__/
 memory/
+bin/

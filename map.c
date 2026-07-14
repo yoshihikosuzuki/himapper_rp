@@ -37,6 +37,13 @@
 //  behaves exactly as before.  Only the nuniq exact-tie break uses it (no bonus).
 static int CN_ON = 0;
 
+//  CN_TIER_SRC: which side supplies the copy-number tier that feeds nuniq.
+//  0 = REFERENCE seed (bsort; the ref .ca.kpos rid) — default, original behavior.
+//  1 = READ seed (asort; a read .ca.kpos rid) — lets ref=all/read=seed be copy-aware.
+//  Both sides tag the SAME matched k-mer with the SAME genome copy tier, so the two
+//  are equivalent when both are tagged; pick whichever side actually carries tiers.
+static int CN_TIER_SRC = 0;
+
 //  CN_TIE_ONLY: break exact alignment-score ties by unique (copy-1) seed support.
 //  Requires -Q (which populates nuniq via the tier channel).  Off => no effect.
 static int CN_TIE_ONLY = 0;
@@ -47,8 +54,20 @@ static int CN_TIE_ONLY = 0;
 //  Requires -Q.  Experimental.
 static double CN_UNIQ_W = 0.0;
 
+//  HASH_TIE: break EXACT ties (identical sel/nuniq/ascore — e.g. a read matching two
+//  identical satellite/homolog copies) by a per-read pseudo-random hash of the candidate,
+//  instead of the deterministic AMATCH_SORT order.  The deterministic order funnels every
+//  ambiguous repeat read onto the SAME copy (centromere coverage spikes + dropouts on the
+//  other copy); the hash distributes them uniformly across the tied copies like minimap2.
+//  No effect on resolvable reads (their candidates are not exact ties).  Default ON; set
+//  CN_HASH_TIE=0 to restore the old deterministic tie-break.
+static int HASH_TIE = 1;
+
 #define MAXGRAM \
-  10000  //  Cap on k-mer count histogram (in count_thread, merge_thread)
+  10000  //  Cap on k-mer count histogram (in count_thread, merge_thread).  (Tried 1e5 to keep
+         //  dense-satellite anchors -> made centromere funnel WORSE: more anchors => the top-
+         //  scoring consensus copy wins more decisively => a BIGGER pile, not distribution.
+         //  Root cause is the -1 consensus selection, not the cap; reverted.)
 
 // #define DEBUG_SEED_HIT      //  Print every seed hit: ref_id/pos,
 // read_id/pos, kmer string
@@ -1174,8 +1193,10 @@ static void* merge_thread(void* arg) {
             //  copy-tier in its top bits.  Strip it for the contig id and ferry it
             //  through the spare high bits of apos (a read position < CN_MAXLEN).
             hits[nhits].bread = CN_VAL(bsort[b].read);
-            hits[nhits].aread = asort[a].read;
-            hits[nhits].apos = CN_ON ? CN_PACK(ap, CN_TIER(bsort[b].read)) : ap;
+            hits[nhits].aread = CN_VAL(asort[a].read);  // strip any read-side tier (no-op if untagged)
+            hits[nhits].apos = CN_ON
+                ? CN_PACK(ap, CN_TIER_SRC ? CN_TIER(asort[a].read) : CN_TIER(bsort[b].read))
+                : ap;
             hits[nhits].diag = ap - bsort[b].rpos;
 #ifdef DEBUG_SEED_HIT
             {
@@ -2509,6 +2530,7 @@ typedef struct {
   int sel;     //  selection score = score + CN_UNIQ_W*nuniq (drives LINK_SORT + zones)
   int ascore;  //  affine-gap tie-break score (-F); 0 unless an equal-score peer exists
   int nuniq;   //  unique (copy-1) seed support (-Q); used for the CN_TIE_ONLY tiebreak
+  unsigned int hkey;  //  per-read pseudo-random tie-break key (HASH_TIE); distributes exact ties
   int link;
   int mark;
 } Links;
@@ -2525,7 +2547,12 @@ static int LINK_SORT(const void* l, const void* r) {
   //  haplotype-distinguishing signal orthogonal to the affine rescore.  Then fall
   //  back to the affine-gap score (-F).  Both are no-ops when their flag is off.
   if (CN_TIE_ONLY && y->nuniq != x->nuniq) return (y->nuniq - x->nuniq);
-  return (y->ascore - x->ascore);
+  if (y->ascore != x->ascore) return (y->ascore - x->ascore);
+  //  Exact tie (identical repeat/homolog copies): pick the smaller per-read hash so the
+  //  winning copy varies pseudo-randomly across reads (uniform coverage), rather than
+  //  always the same copy (deterministic AMATCH_SORT order => spikes/dropouts).
+  if (HASH_TIE && x->hkey != y->hkey) return (x->hkey < y->hkey) ? -1 : 1;
+  return 0;
 }
 
 //  Score a candidate under an affine-gap model, read straight off its compressed
@@ -2620,6 +2647,7 @@ static void* report_thread(void* arg) {
   { char* e;
     if ((e = getenv("CN_TIE_ONLY")) != NULL) CN_TIE_ONLY = atoi(e);
     if ((e = getenv("CN_UNIQ_W")) != NULL) CN_UNIQ_W = atof(e);
+    if ((e = getenv("CN_HASH_TIE")) != NULL) HASH_TIE = atoi(e);
   }
 
   if (SPACING <= TRACE_XOVR) {
@@ -2945,8 +2973,18 @@ static void* report_thread(void* arg) {
 
     //  Selection score = alignment score + copy-aware unique-seed bonus.  CN_UNIQ_W==0
     //  => sel==score (no-op).  Computed after stitching finalizes linker[].score.
-    for (c = 0; c < novl; c++)
+    for (c = 0; c < novl; c++) {
       linker[c].sel = linker[c].score + (int)(CN_UNIQ_W * linker[c].nuniq);
+      //  Per-read pseudo-random tie-break key (splitmix64-style mix of read id, ref
+      //  contig, ref start).  aread makes it vary per read; (bread,bbpos) distinguishes
+      //  the tied copies.  Used only when sel/nuniq/ascore are all exactly equal.
+      { uint64_t h = (uint64_t)(amatch[c].aread) * 0x9E3779B97F4A7C15ULL;
+        h ^= ((uint64_t)(amatch[c].bread) + 0x100) * 0xC2B2AE3D27D4EB4FULL;
+        h ^= (uint64_t)(amatch[c].path.bbpos) * 0x165667B19E3779F9ULL;
+        h ^= h >> 29; h *= 0xBF58476D1CE4E5B9ULL; h ^= h >> 32;
+        linker[c].hkey = (unsigned int)h;
+      }
+    }
 
     //  Affine-gap tie-break (-F): for any candidate that shares an exact score
     //  with another, expand its trace and score it under an affine-gap model so
@@ -3175,9 +3213,14 @@ void Match_Filter(DAZZ_DB* ablock, DAZZ_DB* bblock, void* vasort, int alen,
   //  inside Match_Filter ablock is the READS, so apos (a read position) stays below
   //  CN_MAXLEN and the tier bits never collide with the radix sort key.
   CN_ON = COPY_AWARE && (ablock->maxlen < CN_MAXLEN);
+  { char* e;  //  read here (runs before the count threads that consume CN_TIER_SRC at seed-hit gen)
+    if ((e = getenv("CN_TIER_SRC")) != NULL) CN_TIER_SRC = atoi(e);
+  }
   if (COPY_AWARE && !CN_ON && VERBOSE)
     printf("   Copy-aware anchoring disabled: read maxlen %d >= %d\n",
            ablock->maxlen, CN_MAXLEN);
+  if (CN_ON && VERBOSE)
+    printf("   Copy-tier source: %s seed\n", CN_TIER_SRC ? "READ (asort)" : "REF (bsort)");
 
   {
     int64 powr;

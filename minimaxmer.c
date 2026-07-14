@@ -13,9 +13,12 @@
 
 const int K = 32;
 const int Km1 = K - 1;
-#define WSIZE  100   // sliding window width for (count, hash) minimizer
+int WSIZE  = 100;    // sliding window width for (count, hash) minimizer   [-w]
 #define MOD    2003   // hash modulus for tiebreaking (prime > WSIZE recommended)
-#define RSPACE  100   // minimum spacing between uniformly sparse seeds
+int RSPACE = 100;    // minimum spacing between uniformly sparse seeds     [-s]
+// WSIZE/RSPACE are the seed-DENSITY knobs (larger => sparser seeds); overridable via
+// -w<N>/-s<N> so a density sweep uses REAL minimax selection at each density (not
+// post-hoc subsampling, which would break the minimax property).
 
 // ASCII base → 2-bit value  (A=0, C=1, G=2, T=3), matching the DAZZ_DB
 // numeric encoding used by himapper's tuple_thread.
@@ -261,14 +264,33 @@ int find_seeds(const char    *seq,
 
 int main(int argc, char *argv[]) {
   DAZZ_DB _db, *db = &_db;
-  if (argc < 5) {
-    fprintf(stderr, "Usage: %s <db> <ref.prof> <ref.reads.prof> <out.kpos>\n", argv[0]);
+  // Optional density flags (-w<WSIZE> -s<RSPACE>) precede the 4 positional args.
+  { int i, j = 1;
+    for (i = 1; i < argc; i++) {
+      if (argv[i][0] == '-') {
+        switch (argv[i][1]) {
+          case 'w': WSIZE  = atoi(argv[i]+2); break;
+          case 's': RSPACE = atoi(argv[i]+2); break;
+          default:
+            fprintf(stderr, "%s: unknown option '%s'\n", argv[0], argv[i]);
+            return 1;
+        }
+      } else
+        argv[j++] = argv[i];
+    }
+    argc = j;
+  }
+  if (argc < 5 || WSIZE < 1 || RSPACE < 0) {
+    fprintf(stderr, "Usage: %s [-w<WSIZE=100>] [-s<RSPACE=100>] <db> <ref.prof> <ref.reads.prof> <out.kpos>\n", argv[0]);
+    fprintf(stderr, "  -w<N>           : minimizer window width  (larger => sparser seeds)\n");
+    fprintf(stderr, "  -s<N>           : min spacing of uniform sparse seeds (larger => sparser)\n");
     fprintf(stderr, "  <db>            : DAZZ reference dam/db\n");
     fprintf(stderr, "  <ref.prof>      : FastK genome k-mer count profile\n");
     fprintf(stderr, "  <ref.reads.prof>: FastK reads  k-mer count profile\n");
     fprintf(stderr, "  <out.kpos>      : output k-mer position file\n");
     return 1;
   }
+  fprintf(stderr, "minimaxmer: WSIZE=%d RSPACE=%d\n", WSIZE, RSPACE);
   Open_DB(argv[1], db);
 
   // Open genome profile (argv[2]).
