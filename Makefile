@@ -1,6 +1,6 @@
 CFLAGS = -O3 -Wall -Wextra -Wno-unused-result -fno-strict-aliasing
 
-ALL = modimizer himapper HPC.himapper copy_minimizer minimaxmer dump_kpos
+ALL = modimizer himapper HPC.himapper copy_minimizer minimaxmer minimaxmer_ca dump_kpos
 
 all: $(ALL)
 
@@ -10,8 +10,12 @@ modimizer: modimizer.c DB.c DB.h QV.c QV.h
 copy_minimizer: copy_minimizer.c DB.c DB.h QV.c QV.h libfastk.c libfastk.h gene_core.h
 	gcc $(CFLAGS) -DSKIP_GENE_CORE -o copy_minimizer copy_minimizer.c DB.c QV.c libfastk.c -lpthread -lm
 
-minimaxmer: minimaxmer.c DB.c DB.h QV.c QV.h libfastk.c libfastk.h gene_core.h
+minimaxmer: minimaxmer.c DB.c DB.h QV.c QV.h libfastk.c libfastk.h gene_core.h copynum.h
 	gcc $(CFLAGS) -DSKIP_GENE_CORE -o minimaxmer minimaxmer.c DB.c QV.c libfastk.c -lpthread -lm
+
+# copy-aware variant: same source, genome copy-tier packed into the rid by default (-DCOPY_AWARE_DEFAULT)
+minimaxmer_ca: minimaxmer.c DB.c DB.h QV.c QV.h libfastk.c libfastk.h gene_core.h copynum.h
+	gcc $(CFLAGS) -DSKIP_GENE_CORE -DCOPY_AWARE_DEFAULT -o minimaxmer_ca minimaxmer.c DB.c QV.c libfastk.c -lpthread -lm
 
 himapper: himapper.c map.c map.h align.c align.h DB.c DB.h QV.c QV.h
 	gcc $(CFLAGS) -o himapper himapper.c map.c align.c DB.c QV.c -lpthread -lm

@@ -7,9 +7,21 @@
 #include "DB.h"
 #include "nthash.h"
 #include "libfastk.h"  // FASTK profile API (vendored: libfastk.{c,h}, gene_core.h)
+#include "copynum.h"   // copy-aware seeds: pack the genome copy-tier into the rid high bits
 
 // #define DEBUG_HASH
 // #define DEBUG_NW
+
+// Copy-aware output (-C): pack each seed's genome copy-number tier into the top 3 bits
+// of the rid so himapper (-Q) can weight distinguishing (low-copy) seeds.  Off => a
+// plain .kpos byte-identical to the original minimaxmer.  Build minimaxmer_ca with
+// -DCOPY_AWARE_DEFAULT so it defaults on (backward-compatible binary); plain minimaxmer
+// defaults off and can still opt in with -C.
+#ifdef COPY_AWARE_DEFAULT
+static int COPY_AWARE = 1;
+#else
+static int COPY_AWARE = 0;
+#endif
 
 const int K = 32;
 const int Km1 = K - 1;
@@ -248,7 +260,13 @@ int find_seeds(const char    *seq,
       for (int x = 0; x < K; x++)
         c = (c << 2) | base2bit[(unsigned char)kp[x]];
       c &= KMASK;
-      int32_t rpos = (int32_t)i, rid = read_id;
+      int32_t rpos = (int32_t)i;
+      // Copy-aware (-C): pack the genome copy-tier into the rid's top 3 bits so himapper
+      // can down-weight high-copy seeds.  rids (contig/read ids) are far below 2^29; if
+      // one ever isn't, fall back to a plain rid (tier 0 = unknown).
+      int32_t rid = (COPY_AWARE && read_id < CN_MAXVAL)
+                  ? CN_PACK(read_id, cn_tier_of(prof_genome[i]))
+                  : read_id;
       fwrite(&c,    sizeof(uint64_t), 1, out);
       fwrite(&rpos, sizeof(int32_t),  1, out);
       fwrite(&rid,  sizeof(int32_t),  1, out);
@@ -271,6 +289,8 @@ int main(int argc, char *argv[]) {
         switch (argv[i][1]) {
           case 'w': WSIZE  = atoi(argv[i]+2); break;
           case 's': RSPACE = atoi(argv[i]+2); break;
+          case 'C': COPY_AWARE = 1; break;   // pack genome copy-tier into rid (copy-aware .kpos)
+          case 'P': COPY_AWARE = 0; break;   // plain rid (force off even if built _ca)
           default:
             fprintf(stderr, "%s: unknown option '%s'\n", argv[0], argv[i]);
             return 1;
@@ -281,16 +301,18 @@ int main(int argc, char *argv[]) {
     argc = j;
   }
   if (argc < 5 || WSIZE < 1 || RSPACE < 0) {
-    fprintf(stderr, "Usage: %s [-w<WSIZE=100>] [-s<RSPACE=100>] <db> <ref.prof> <ref.reads.prof> <out.kpos>\n", argv[0]);
+    fprintf(stderr, "Usage: %s [-w<WSIZE=100>] [-s<RSPACE=100>] [-C] <db> <ref.prof> <ref.reads.prof> <out.kpos>\n", argv[0]);
     fprintf(stderr, "  -w<N>           : minimizer window width  (larger => sparser seeds)\n");
     fprintf(stderr, "  -s<N>           : min spacing of uniform sparse seeds (larger => sparser)\n");
+    fprintf(stderr, "  -C / -P         : copy-aware (pack genome copy-tier into rid) / plain (default %s)\n",
+            COPY_AWARE ? "-C" : "-P");
     fprintf(stderr, "  <db>            : DAZZ reference dam/db\n");
     fprintf(stderr, "  <ref.prof>      : FastK genome k-mer count profile\n");
     fprintf(stderr, "  <ref.reads.prof>: FastK reads  k-mer count profile\n");
     fprintf(stderr, "  <out.kpos>      : output k-mer position file\n");
     return 1;
   }
-  fprintf(stderr, "minimaxmer: WSIZE=%d RSPACE=%d\n", WSIZE, RSPACE);
+  fprintf(stderr, "minimaxmer: WSIZE=%d RSPACE=%d copy_aware=%d\n", WSIZE, RSPACE, COPY_AWARE);
   Open_DB(argv[1], db);
 
   // Open genome profile (argv[2]).
