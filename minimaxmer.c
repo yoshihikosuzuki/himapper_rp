@@ -6,31 +6,16 @@
 
 #include "DB.h"
 #include "nthash.h"
-#include "libfastk.h"  // FASTK profile API (vendored: libfastk.{c,h}, gene_core.h)
-#include "copynum.h"   // copy-aware seeds: pack the genome copy-tier into the rid high bits
+#include "libfastk.h"
+#include "copynum.h"
 
 // #define DEBUG_HASH
 // #define DEBUG_NW
 
-// Copy-aware output (-C): pack each seed's genome copy-number tier into the top 3 bits
-// of the rid so himapper (-Q) can weight distinguishing (low-copy) seeds.  Off => a
-// plain .kpos byte-identical to the original minimaxmer.  Build minimaxmer_ca with
-// -DCOPY_AWARE_DEFAULT so it defaults on (backward-compatible binary); plain minimaxmer
-// defaults off and can still opt in with -C.
-#ifdef COPY_AWARE_DEFAULT
-static int COPY_AWARE = 1;
-#else
-static int COPY_AWARE = 0;
-#endif
-
-const int K = 32;
-const int Km1 = K - 1;
+int K = 32;          // k-mer length; maximum 32   [-k]
 int WSIZE  = 100;    // sliding window width for (count, hash) minimizer   [-w]
-#define MOD    2003   // hash modulus for tiebreaking (prime > WSIZE recommended)
 int RSPACE = 100;    // minimum spacing between uniformly sparse seeds     [-s]
-// WSIZE/RSPACE are the seed-DENSITY knobs (larger => sparser seeds); overridable via
-// -w<N>/-s<N> so a density sweep uses REAL minimax selection at each density (not
-// post-hoc subsampling, which would break the minimax property).
+static const int MOD = 2003;   // hash modulus for tiebreaking (prime > WSIZE recommended)
 
 // ASCII base → 2-bit value  (A=0, C=1, G=2, T=3), matching the DAZZ_DB
 // numeric encoding used by himapper's tuple_thread.
@@ -39,11 +24,9 @@ static const uint8_t base2bit[128] = {
     ['a'] = 0, ['c'] = 1, ['g'] = 2, ['t'] = 3,
 };
 
-// Bitmask covering 2*K bits.  For K >= 32 the full k-mer string does not fit
-// in a uint64_t; we keep only the lower 64 bits (last 32 bases), consistent
-// with how himapper handles K > 32.
-static const uint64_t KMASK =
-    (K >= 32) ? UINT64_MAX : ((UINT64_C(1) << (2 * K)) - 1);
+// Bitmask covering the low 2*K bits of a k-mer's 2-bit code; set in main() once K is
+// known (K is capped at 32, so K==32 gives the full uint64 mask).
+static uint64_t KMASK;
 
 // Compare (ca_g, ca_r, ha) < (cb_g, cb_r, hb):
 //   primary:   lower genome count  → more unique in genome   → better seed
@@ -118,7 +101,7 @@ int find_seeds(const char    *seq,
     for (int i = 1; i < plen; i++)
       hvals[i] = NTC64_c((unsigned char)seq[i - K], (unsigned char)seq[i],
                          K, &fhVal, &rhVal);
-    // Reduce to [0, 1000] so that hash ties are common — enables robust winnowing
+    // Reduce to [0, MOD) so that hash ties are common — enables robust winnowing
     // to reliably favour the leftmost (earliest) occurrence within a window.
     for (int i = 0; i < plen; i++)
       hvals[i] %= MOD;
@@ -139,24 +122,28 @@ int find_seeds(const char    *seq,
     { // Robust winnowing: evict back elements whose tuple is STRICTLY GREATER
       // than the current tuple.  On a tie we keep the existing (leftmost) entry,
       // so ties are broken in favour of the element already inside the window.
-      while (dq_head < dq_tail &&
-             tuple_lt(prof_genome[i],             prof_reads[i],             hvals[i],
-                      prof_genome[dq[dq_tail-1]], prof_reads[dq[dq_tail-1]], hvals[dq[dq_tail-1]]))
-        dq_tail--;
-      dq[dq_tail++] = i;
+      if (prof_genome[i] != 0)
+        { while (dq_head < dq_tail &&
+                 tuple_lt(prof_genome[i],             prof_reads[i],             hvals[i],
+                          prof_genome[dq[dq_tail-1]], prof_reads[dq[dq_tail-1]], hvals[dq[dq_tail-1]]))
+            dq_tail--;
+          dq[dq_tail++] = i;
+        }
 
-      // Evict front elements that have slid out of the window.
-      while (dq[dq_head] < i - WSIZE + 1)
+      // Evict front elements that have slid out of the window.  With g==0 positions
+      // skipped the deque can be empty, so guard against dq_head == dq_tail.
+      while (dq_head < dq_tail && dq[dq_head] < i - WSIZE + 1)
         dq_head++;
 
-      // Only consider complete windows of exactly WSIZE k-mers (standard minimizer definition).
-      // Window j = [j, j+WSIZE-1]; the first complete window ends at i = WSIZE-1.
-      if (i >= WSIZE - 1)
+      // Only consider complete windows of exactly WSIZE k-mers (standard minimizer
+      // definition).  Emit only if the window holds a g>=1 candidate (deque non-empty);
+      // an all-g==0 window produces no seed.
+      if (i >= WSIZE - 1 && dq_head < dq_tail)
         { is_seed[dq[dq_head]] = true;
           nw[dq[dq_head]]++;
         }
 #ifdef DEBUG_HASH
-      if (i >= WSIZE - 1)
+      if (i >= WSIZE - 1 && dq_head < dq_tail)
       { int win_start = i - WSIZE + 1;
         int min_pos   = dq[dq_head];
         fprintf(stderr, "WINDOW read=%d [%d..%d]  minimizer=@%d g=%u r=%u h=%lu\n",
@@ -177,7 +164,7 @@ int find_seeds(const char    *seq,
 #endif
     }
 
-  // Step 2.5: Uniformly sparse thinning.
+  // Step 3: Uniformly sparse thinning.
   // Sort candidates by descending h_nw = (NW, -h_minimax) priority, then
   // greedily accept only those whose position is ≥ RSPACE from every
   // already-accepted seed.
@@ -251,7 +238,7 @@ int find_seeds(const char    *seq,
     }
 #endif
 
-  // Step 3: write selected seeds.
+  // Step 4: write selected seeds.
   int written = 0;
   for (int i = 0; i < plen; i++)
     { if (!is_seed[i]) continue;
@@ -261,15 +248,13 @@ int find_seeds(const char    *seq,
         c = (c << 2) | base2bit[(unsigned char)kp[x]];
       c &= KMASK;
       int32_t rpos = (int32_t)i;
-      // Copy-aware (-C): pack the genome copy-tier into the rid's top 3 bits so himapper
-      // can down-weight high-copy seeds.  rids (contig/read ids) are far below 2^29; if
-      // one ever isn't, fall back to a plain rid (tier 0 = unknown).
-      int32_t rid = (COPY_AWARE && read_id < CN_MAXVAL)
-                  ? CN_PACK(read_id, cn_tier_of(prof_genome[i]))
-                  : read_id;
+      // Every seed's rid carries the genome copy-tier in its top 3 bits (see copynum.h):
+      // the low 29 bits stay ref/read id. Strip the tier with CN_VAL wherever it needs the id.
+      // read_id < CN_MAXVAL (2^29) is enforced in main(), so we pack unconditionally.
+      uint32_t rid = CN_PACK(read_id, cn_tier_of(prof_genome[i]));
       fwrite(&c,    sizeof(uint64_t), 1, out);
       fwrite(&rpos, sizeof(int32_t),  1, out);
-      fwrite(&rid,  sizeof(int32_t),  1, out);
+      fwrite(&rid,  sizeof(uint32_t), 1, out);
       written++;
     }
 
@@ -287,10 +272,9 @@ int main(int argc, char *argv[]) {
     for (i = 1; i < argc; i++) {
       if (argv[i][0] == '-') {
         switch (argv[i][1]) {
+          case 'k': K      = atoi(argv[i]+2); break;
           case 'w': WSIZE  = atoi(argv[i]+2); break;
           case 's': RSPACE = atoi(argv[i]+2); break;
-          case 'C': COPY_AWARE = 1; break;   // pack genome copy-tier into rid (copy-aware .kpos)
-          case 'P': COPY_AWARE = 0; break;   // plain rid (force off even if built _ca)
           default:
             fprintf(stderr, "%s: unknown option '%s'\n", argv[0], argv[i]);
             return 1;
@@ -301,19 +285,33 @@ int main(int argc, char *argv[]) {
     argc = j;
   }
   if (argc < 5 || WSIZE < 1 || RSPACE < 0) {
-    fprintf(stderr, "Usage: %s [-w<WSIZE=100>] [-s<RSPACE=100>] [-C] <db> <ref.prof> <ref.reads.prof> <out.kpos>\n", argv[0]);
+    fprintf(stderr, "Usage: %s [-k<32>] [-w<100>] [-s<100>] <db> <ref.prof> <ref.reads.prof> <out.kpos>\n", argv[0]);
+    fprintf(stderr, "  -k<N>           : k-mer length (<= 32)\n");
     fprintf(stderr, "  -w<N>           : minimizer window width  (larger => sparser seeds)\n");
     fprintf(stderr, "  -s<N>           : min spacing of uniform sparse seeds (larger => sparser)\n");
-    fprintf(stderr, "  -C / -P         : copy-aware (pack genome copy-tier into rid) / plain (default %s)\n",
-            COPY_AWARE ? "-C" : "-P");
     fprintf(stderr, "  <db>            : DAZZ reference dam/db\n");
     fprintf(stderr, "  <ref.prof>      : FastK genome k-mer count profile\n");
     fprintf(stderr, "  <ref.reads.prof>: FastK reads  k-mer count profile\n");
     fprintf(stderr, "  <out.kpos>      : output k-mer position file\n");
     return 1;
   }
-  fprintf(stderr, "minimaxmer: WSIZE=%d RSPACE=%d copy_aware=%d\n", WSIZE, RSPACE, COPY_AWARE);
+  if (K > 32) {
+    fprintf(stderr, "%s: K=%d out of range; K must <= 32\n", argv[0], K);
+    return 1;
+  }
+  int Km1 = K - 1;
+  KMASK = (K >= 32) ? UINT64_MAX : ((UINT64_C(1) << (2 * K)) - 1);
+  fprintf(stderr, "K=%d WSIZE=%d RSPACE=%d\n", K, WSIZE, RSPACE);
   Open_DB(argv[1], db);
+  // The copy-tier occupies the rid's top 3 bits (bits 29..31), so the contig/read id must
+  // fit in the low 29 bits.  A larger DB would overflow the id into the tier bits and make
+  // himapper mis-identify reads — fail loudly rather than emit a corrupt .kpos.
+  if (db->nreads > (int) CN_MAXVAL) {
+    fprintf(stderr, "%s: %d reads/contigs exceeds the copy-tier rid limit %d (2^29); "
+                    "the id would collide with the tier bits\n",
+            argv[0], db->nreads, (int) CN_MAXVAL);
+    return 1;
+  }
 
   // Open genome profile (argv[2]).
   Profile_Index *Pg = Open_Profiles(argv[2]);
@@ -366,7 +364,7 @@ int main(int argc, char *argv[]) {
   fwrite(&reserved, 1, 1, out);
   int32_t Kval = K;
   fwrite(&Kval, sizeof(int32_t), 1, out);
-  int32_t entry_size = (int32_t)(sizeof(uint64_t) + sizeof(int32_t) + sizeof(int32_t));
+  int32_t entry_size = (int32_t)(sizeof(uint64_t) + sizeof(int32_t) + sizeof(uint32_t));
   fwrite(&entry_size, sizeof(int32_t), 1, out);
   uint64_t n_entries = 0;
   fwrite(&n_entries, sizeof(uint64_t), 1, out);

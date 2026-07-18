@@ -38,8 +38,8 @@
 static int CN_ON = 0;
 
 //  CN_TIER_SRC: which side supplies the copy-number tier that feeds nuniq.
-//  0 = REFERENCE seed (bsort; the ref .ca.kpos rid) — default, original behavior.
-//  1 = READ seed (asort; a read .ca.kpos rid) — lets ref=all/read=seed be copy-aware.
+//  0 = REFERENCE seed (bsort; the ref .kpos rid) — default, original behavior.
+//  1 = READ seed (asort; a read .kpos rid) — lets ref=all/read=seed be copy-aware.
 //  Both sides tag the SAME matched k-mer with the SAME genome copy tier, so the two
 //  are equivalent when both are tagged; pick whichever side actually carries tiers.
 static int CN_TIER_SRC = 0;
@@ -158,7 +158,7 @@ typedef struct {
 typedef struct {
   uint64 code;
   int rpos;
-  int read;
+  uint32 read;   //  contig/read id (rid); copy-tier packed in bits 29..31 (see copynum.h)
 } KmerPos;
 
 typedef struct {
@@ -172,7 +172,7 @@ typedef struct {
 
 typedef struct {
   uint64 code;
-  int read;
+  uint32 read;   //  contig/read id (rid); copy-tier packed in bits 29..31 (see copynum.h)
   int rpos;
 } KmerPos;
 
@@ -836,7 +836,7 @@ void* Sort_Kmers(DAZZ_DB* block, int* len) {
     printf("\nKMER SORT:\n");
     for (i = 0; i < HOW_MANY && i < kmers; i++) {
       KmerPos* c = rez + i;
-      printf(" %5d / %5d / %10lld\n", c->read, c->rpos, c->code);
+      printf(" %5u / %5d / %10lld\n", c->read, c->rpos, c->code);
     }
     fflush(stdout);
   }
@@ -1005,7 +1005,7 @@ void* Load_Kpos(const char* path, int comp, DAZZ_DB* block, int* len) {
         }
         fstr[Kmer] = '\0';
         fprintf(stderr,
-                "[RC_CHECK] entry %llu: read=%d rlen=%d"
+                "[RC_CHECK] entry %llu: read=%u rlen=%d"
                 " fwd_rpos=%d -> rc_rpos=%d"
                 " fwd=%s  rc=%s\n",
                 (unsigned long long)i, arr[i].read, rlen, orig_rpos,
@@ -1195,7 +1195,7 @@ static void* merge_thread(void* arg) {
             hits[nhits].bread = CN_VAL(bsort[b].read);
             hits[nhits].aread = CN_VAL(asort[a].read);  // strip any read-side tier (no-op if untagged)
             hits[nhits].apos = CN_ON
-                ? CN_PACK(ap, CN_TIER_SRC ? CN_TIER(asort[a].read) : CN_TIER(bsort[b].read))
+                ? (int) CN_PACK(ap, CN_TIER_SRC ? CN_TIER(asort[a].read) : CN_TIER(bsort[b].read))
                 : ap;
             hits[nhits].diag = ap - bsort[b].rpos;
 #ifdef DEBUG_SEED_HIT
@@ -1208,7 +1208,7 @@ static void* merge_thread(void* arg) {
                 tmp >>= 2;
               }
               kstr[Kmer] = '\0';
-              fprintf(stderr, "  hit: read=%d rpos=%d ref=%d rpos=%d kmer=%s\n",
+              fprintf(stderr, "  hit: read=%u rpos=%d ref=%u rpos=%d kmer=%s\n",
                       asort[a].read, ap, bsort[b].read, bsort[b].rpos, kstr);
             }
 #endif

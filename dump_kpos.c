@@ -15,13 +15,17 @@
  *  Each entry (16 bytes):
  *    code   uint64   – 2-bit encoded k-mer (lower 2*K bits)
  *    rpos   int32    – position within the read/contig
- *    rid    int32    – read/contig id (0-based)
+ *    rid    uint32   – read/contig id (0-based) with the genome copy-tier packed
+ *                      into the top 3 bits (see copynum.h)
+ *
+ *  Output columns:  contig_id(1-based)  rpos  kmer  tier
  */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include "copynum.h"   // CN_VAL / CN_TIER: split the rid into id + copy-tier
 
 int main(int argc, char *argv[])
 {
@@ -61,10 +65,11 @@ int main(int argc, char *argv[])
   uint64_t count = 0;
   for (uint64_t e = 0; e < n_entries; e++) {
     uint64_t code;
-    int32_t  rpos, rid;
+    int32_t  rpos;
+    uint32_t rid;
     if (fread(&code, sizeof(uint64_t), 1, fp) != 1 ||
         fread(&rpos, sizeof(int32_t),  1, fp) != 1 ||
-        fread(&rid,  sizeof(int32_t),  1, fp) != 1)
+        fread(&rid,  sizeof(uint32_t), 1, fp) != 1)
       { fprintf(stderr, "Error: truncated entry at %llu\n", (unsigned long long)e);
         break;
       }
@@ -78,8 +83,8 @@ int main(int argc, char *argv[])
     }
     kmer[Kd] = '\0';
 
-    printf("%d\t%d\t%s\n",
-           rid + 1, rpos, kmer);
+    printf("%d\t%d\t%s\t%u\n",
+           CN_VAL(rid) + 1, rpos, kmer, CN_TIER(rid));
     count++;
   }
 
