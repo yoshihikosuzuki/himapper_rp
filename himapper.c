@@ -687,7 +687,7 @@ int main(int argc, char *argv[])
     PRIMARY_ONLY = flags['1'];   //  -1: suppress same-region secondaries (cf. minimap2 --secondary=no)
     JUNCTION_PEN = 1 - flags['G'];  //  -G: disable collinear-gap penalties (legacy damapper)
     FINE_TIE = flags['F'];  //  -F: break exact score ties by an affine-gap rescore (experimental)
-    COPY_AWARE = flags['Q'];  //  -Q: copy-number-aware anchoring (enables nuniq tiebreak via CN_TIE_ONLY)
+    COPY_AWARE = flags['Q'];  //  -Q: copy-number-aware anchoring (enables the nuniq selection bonus)
 
     if (argc <= 4)
       { fprintf(stderr,"Usage: %s %s\n",Prog_Name,Usage[0]);

@@ -44,12 +44,8 @@ static int CN_ON = 0;
 //  are equivalent when both are tagged; pick whichever side actually carries tiers.
 static int CN_TIER_SRC = 0;
 
-//  CN_TIE_ONLY: break exact alignment-score ties by unique (copy-1) seed support.
-//  Requires -Q (which populates nuniq via the tier channel).  Off => no effect.
-static int CN_TIE_ONLY = 0;
-
 //  CN_UNIQ_W: selection bonus per unique (copy-1) seed.  sel = score + CN_UNIQ_W*nuniq.
-//  0 => sel==score (no override; exact ties still handled by CN_TIE_ONLY).  ~2.3 => one
+//  0 => sel==score (no nuniq override; exact ties fall through to HASH_TIE).  ~2.3 => one
 //  unique seed offsets ~1 diff (near-tie override).  Huge => nuniq dominates (unlimited).
 //  Requires -Q.  Experimental.
 static double CN_UNIQ_W = 0.0;
@@ -2529,7 +2525,7 @@ typedef struct {
   int score;   //  alignment score: (aepos-abpos) - DIFF_SCORE*diffs (incl. junction pen)
   int sel;     //  selection score = score + CN_UNIQ_W*nuniq (drives LINK_SORT + zones)
   int ascore;  //  affine-gap tie-break score (-F); 0 unless an equal-score peer exists
-  int nuniq;   //  unique (copy-1) seed support (-Q); used for the CN_TIE_ONLY tiebreak
+  int nuniq;   //  unique (copy-1) seed support (-Q); feeds the CN_UNIQ_W selection bonus (sel)
   unsigned int hkey;  //  per-read pseudo-random tie-break key (HASH_TIE); distributes exact ties
   int link;
   int mark;
@@ -2543,10 +2539,7 @@ static int LINK_SORT(const void* l, const void* r) {
   //  reduces to plain score.  A large CN_UNIQ_W makes nuniq dominate (unlimited
   //  copy-aware selection); a small one only overrides near-ties.
   if (y->sel != x->sel) return (y->sel - x->sel);
-  //  sel tie.  Prefer more unique (copy-1) seed support (CN_TIE_ONLY, -Q): a
-  //  haplotype-distinguishing signal orthogonal to the affine rescore.  Then fall
-  //  back to the affine-gap score (-F).  Both are no-ops when their flag is off.
-  if (CN_TIE_ONLY && y->nuniq != x->nuniq) return (y->nuniq - x->nuniq);
+  //  sel tie.  Fall back to the affine-gap score (-F); a no-op when -F is off.
   if (y->ascore != x->ascore) return (y->ascore - x->ascore);
   //  Exact tie (identical repeat/homolog copies): pick the smaller per-read hash so the
   //  winning copy varies pseudo-randomly across reads (uniform coverage), rather than
@@ -2645,7 +2638,6 @@ static void* report_thread(void* arg) {
   acomp = New_Read_Buffer(MR_ablock);
 
   { char* e;
-    if ((e = getenv("CN_TIE_ONLY")) != NULL) CN_TIE_ONLY = atoi(e);
     if ((e = getenv("CN_UNIQ_W")) != NULL) CN_UNIQ_W = atof(e);
     if ((e = getenv("CN_HASH_TIE")) != NULL) HASH_TIE = atoi(e);
   }
