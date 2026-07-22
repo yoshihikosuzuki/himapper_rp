@@ -23,7 +23,7 @@
 #undef  SLURM  //  define if want a directly executable SLURM script
 
 static char *Usage[] =
-  { "[-vpzCN1QGF] [-k<int(20)>] [-t<int>] [-M<int>] [-e<double(.85)] [-s<int(100)]",
+  { "[-vpzCN1GF] [-k<int(32)>] [-t<int>] [-M<int>] [-e<double(.85)] [-s<int(100)]",
     "         [-n<double(1.)] [-m<track>]+ [-T<int(4)>] [-f<name>] [-K<ref.kpos|all(all)>] [-R<reads.kpos|all(all)>]",
     "         <ref:db|dam> <reads:db|dam> [<first:int>[-<last:int>]]"
   };
@@ -68,7 +68,7 @@ int main(int argc, char *argv[])
   int    MMAX, MTOP;
   char **MASK;
   char  *ONAME;
-  int    ONE, QON, GON, FON;       //  himapper-specific flags: -1 -Q -G -F
+  int    ONE, GON, FON;            //  himapper-specific flags: -1 -G -F
   char  *REFKPOS, *READSKPOS;      //  himapper seed files (-K / -R); "all" => compute on the fly
 
   { int    i, j, k;         //  Process options
@@ -78,7 +78,7 @@ int main(int argc, char *argv[])
     ARG_INIT("HPC.himapper")
 
     BUNIT    = 4;
-    KINT     = 20;
+    KINT     = 32;
     TINT     = 0;
     EREL     = 0.;
     SINT     = 100;
@@ -101,7 +101,7 @@ int main(int argc, char *argv[])
       if (argv[i][0] == '-')
         switch (argv[i][1])
         { default:
-            ARG_FLAGS("vbpzCN1QGF");
+            ARG_FLAGS("vbpzCN1GF");
             break;
           case 'K':
             REFKPOS = argv[i]+2;
@@ -165,7 +165,6 @@ int main(int argc, char *argv[])
     CON = flags['C'];
     NON = flags['N'];
     ONE = flags['1'];
-    QON = flags['Q'];
     GON = flags['G'];
     FON = flags['F'];
 
@@ -177,7 +176,7 @@ int main(int argc, char *argv[])
         fprintf(stderr,"     himapper seeds (one himapper call per reads block):\n");
         fprintf(stderr,"      -K: ref   seed file <ref.kpos|all>   (default all).\n");
         fprintf(stderr,"      -R: reads seed file <reads.kpos|all> (default all).\n");
-        fprintf(stderr,"      -1: primary-only.  -Q: copy-aware.  -G/-F: himapper tie-break flags.\n");
+        fprintf(stderr,"      -1: primary-only.  -G/-F: himapper tie-break flags.\n");
         fprintf(stderr,"\n");
         fprintf(stderr,"     Passed through to himapper.\n");
         fprintf(stderr,"      -k: k-mer size (must be <= 32).\n");
@@ -415,8 +414,6 @@ int main(int argc, char *argv[])
           fprintf(out,"himapper");
           if (ONE)
             fprintf(out," -1");
-          if (QON)
-            fprintf(out," -Q");
           if (GON)
             fprintf(out," -G");
           if (FON)
@@ -431,7 +428,7 @@ int main(int argc, char *argv[])
             fprintf(out," -C");
           if (NON)
             fprintf(out," -N");
-          if (KINT != 20)
+          if (KINT != 32)
             fprintf(out," -k%d",KINT);
           if (TINT > 0)
             fprintf(out," -t%d",TINT);

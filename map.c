@@ -32,9 +32,8 @@
 
 #define THREAD pthread_t
 
-//  Copy-number-aware anchoring (-Q).  Set once per Match_Filter call from the read
-//  length guard (see copynum.h).  When 0 the tier channel is inert and himapper
-//  behaves exactly as before.  Only the nuniq exact-tie break uses it (no bonus).
+//  Copy-number-aware anchoring.  Set once per Match_Filter call from the read
+//  length guard (see copynum.h).  When 0 the tier channel is inert.
 static int CN_ON = 0;
 
 //  CN_TIER_SRC: which side supplies the copy-number tier that feeds nuniq.
@@ -47,7 +46,7 @@ static int CN_TIER_SRC = 0;
 //  CN_UNIQ_W: selection bonus per unique (copy-1) seed.  sel = score + CN_UNIQ_W*nuniq.
 //  0 => sel==score (no nuniq override; exact ties fall through to HASH_TIE).  ~2.3 => one
 //  unique seed offsets ~1 diff (near-tie override).  Huge => nuniq dominates (unlimited).
-//  Requires -Q.  Experimental.
+//  Experimental.
 static double CN_UNIQ_W = 0.0;
 
 //  HASH_TIE: break EXACT ties (identical sel/nuniq/ascore — e.g. a read matching two
@@ -1975,7 +1974,7 @@ static void* chain_thread(void* arg) {
       {
         Splay *l, *r;
         int lcost, rcost;
-        int htier = CN_TIER(hits[nidx].apos);  //  copy tier of this seed (0 if -Q off)
+        int htier = CN_TIER(hits[nidx].apos);  //  copy tier of this seed (0 if channel disabled)
 
         apos = CN_VAL(hits[nidx].apos) + 1;  //  strip copy-tier (see merge_thread)
         bpos = apos - hits[nidx].diag;
@@ -2525,7 +2524,7 @@ typedef struct {
   int score;   //  alignment score: (aepos-abpos) - DIFF_SCORE*diffs (incl. junction pen)
   int sel;     //  selection score = score + CN_UNIQ_W*nuniq (drives LINK_SORT + zones)
   int ascore;  //  affine-gap tie-break score (-F); 0 unless an equal-score peer exists
-  int nuniq;   //  unique (copy-1) seed support (-Q); feeds the CN_UNIQ_W selection bonus (sel)
+  int nuniq;   //  unique (copy-1) seed support; feeds the CN_UNIQ_W selection bonus (sel)
   unsigned int hkey;  //  per-read pseudo-random tie-break key (HASH_TIE); distributes exact ties
   int link;
   int mark;
@@ -2623,7 +2622,7 @@ static void* report_thread(void* arg) {
   int Omax;
   int novl, lovl;
   Overlap *amatch, *bmatch;
-  int *match_nuniq;   //  copy-aware: per-overlap unique-seed evidence (-Q)
+  int *match_nuniq;   //  copy-aware: per-overlap unique-seed evidence
 
   int COmax;
   int nparts;
@@ -3201,14 +3200,14 @@ void Match_Filter(DAZZ_DB* ablock, DAZZ_DB* bblock, void* vasort, int alen,
   atot = ablock->totlen;
   btot = bblock->totlen;
 
-  //  Enable copy-number-aware anchoring (-Q) only when the apos tier channel is safe:
+  //  Enable copy-number-aware anchoring when the apos tier channel is safe:
   //  inside Match_Filter ablock is the READS, so apos (a read position) stays below
   //  CN_MAXLEN and the tier bits never collide with the radix sort key.
-  CN_ON = COPY_AWARE && (ablock->maxlen < CN_MAXLEN);
+  CN_ON = (ablock->maxlen < CN_MAXLEN);
   { char* e;  //  read here (runs before the count threads that consume CN_TIER_SRC at seed-hit gen)
     if ((e = getenv("CN_TIER_SRC")) != NULL) CN_TIER_SRC = atoi(e);
   }
-  if (COPY_AWARE && !CN_ON && VERBOSE)
+  if (!CN_ON && VERBOSE)
     printf("   Copy-aware anchoring disabled: read maxlen %d >= %d\n",
            ablock->maxlen, CN_MAXLEN);
   if (CN_ON && VERBOSE)

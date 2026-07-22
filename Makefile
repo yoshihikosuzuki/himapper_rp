@@ -13,7 +13,7 @@ copy_minimizer: copy_minimizer.c DB.c DB.h QV.c QV.h libfastk.c libfastk.h gene_
 minimaxmer: minimaxmer.c DB.c DB.h QV.c QV.h libfastk.c libfastk.h gene_core.h copynum.h
 	gcc $(CFLAGS) -DSKIP_GENE_CORE -o minimaxmer minimaxmer.c DB.c QV.c libfastk.c -lpthread -lm
 
-himapper: himapper.c map.c map.h align.c align.h DB.c DB.h QV.c QV.h
+himapper: himapper.c map.c map.h align.c align.h DB.c DB.h QV.c QV.h copynum.h
 	gcc $(CFLAGS) -o himapper himapper.c map.c align.c DB.c QV.c -lpthread -lm
 
 HPC.himapper: HPC.himapper.c DB.c DB.h QV.c QV.h
