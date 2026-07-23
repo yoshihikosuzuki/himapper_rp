@@ -12,5 +12,6 @@ copy_minimizer
 minimaxmer
 dump_kpos
 
-work*
 memory/
+work*/*
+!work*/*.sh

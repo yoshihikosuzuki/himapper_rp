@@ -32,10 +32,6 @@
 
 #define THREAD pthread_t
 
-//  Copy-number-aware anchoring.  Set once per Match_Filter call from the read
-//  length guard (see copynum.h).  When 0 the tier channel is inert.
-static int CN_ON = 0;
-
 //  CN_TIER_SRC: which side supplies the copy-number tier that feeds nuniq.
 //  0 = REFERENCE seed (bsort; the ref .kpos rid) — default, original behavior.
 //  1 = READ seed (asort; a read .kpos rid) — lets ref=all/read=seed be copy-aware.
@@ -1189,9 +1185,8 @@ static void* merge_thread(void* arg) {
             //  through the spare high bits of apos (a read position < CN_MAXLEN).
             hits[nhits].bread = CN_VAL(bsort[b].read);
             hits[nhits].aread = CN_VAL(asort[a].read);  // strip any read-side tier (no-op if untagged)
-            hits[nhits].apos = CN_ON
-                ? (int) CN_PACK(ap, CN_TIER_SRC ? CN_TIER(asort[a].read) : CN_TIER(bsort[b].read))
-                : ap;
+            hits[nhits].apos =
+                (int) CN_PACK(ap, CN_TIER_SRC ? CN_TIER(asort[a].read) : CN_TIER(bsort[b].read));
             hits[nhits].diag = ap - bsort[b].rpos;
 #ifdef DEBUG_SEED_HIT
             {
@@ -1974,7 +1969,7 @@ static void* chain_thread(void* arg) {
       {
         Splay *l, *r;
         int lcost, rcost;
-        int htier = CN_TIER(hits[nidx].apos);  //  copy tier of this seed (0 if channel disabled)
+        int htier = CN_TIER(hits[nidx].apos);  //  copy tier of this seed
 
         apos = CN_VAL(hits[nidx].apos) + 1;  //  strip copy-tier (see merge_thread)
         bpos = apos - hits[nidx].diag;
@@ -2980,7 +2975,6 @@ static void* report_thread(void* arg) {
     //  Affine-gap tie-break (-F): for any candidate that shares an exact score
     //  with another, expand its trace and score it under an affine-gap model so
     //  LINK_SORT can break the tie by gap structure instead of arbitrary order.
-    //  Gated to tied candidates only (~5% of reads), so off the hot path.
     if (FINE_TIE) {
       for (c = 0; c < novl; c++) {
         int e, tied = 0;
@@ -3200,17 +3194,19 @@ void Match_Filter(DAZZ_DB* ablock, DAZZ_DB* bblock, void* vasort, int alen,
   atot = ablock->totlen;
   btot = bblock->totlen;
 
-  //  Enable copy-number-aware anchoring when the apos tier channel is safe:
-  //  inside Match_Filter ablock is the READS, so apos (a read position) stays below
-  //  CN_MAXLEN and the tier bits never collide with the radix sort key.
-  CN_ON = (ablock->maxlen < CN_MAXLEN);
+  //  Inside Match_Filter ablock is the READS.  apos must stay below CN_MAXLEN so
+  //  its copy-tier bits never enter the radix sort key.
+  if (ablock->maxlen >= CN_MAXLEN)
+    { fprintf(stderr,
+              "%s: Read maxlen %d exceeds the maximum length %d; "
+              "copy-aware anchoring requires shorter reads\n",
+              Prog_Name, ablock->maxlen, CN_MAXLEN-1);
+      Clean_Exit(1);
+    }
   { char* e;  //  read here (runs before the count threads that consume CN_TIER_SRC at seed-hit gen)
     if ((e = getenv("CN_TIER_SRC")) != NULL) CN_TIER_SRC = atoi(e);
   }
-  if (!CN_ON && VERBOSE)
-    printf("   Copy-aware anchoring disabled: read maxlen %d >= %d\n",
-           ablock->maxlen, CN_MAXLEN);
-  if (CN_ON && VERBOSE)
+  if (VERBOSE)
     printf("   Copy-tier source: %s seed\n", CN_TIER_SRC ? "READ (asort)" : "REF (bsort)");
 
   {

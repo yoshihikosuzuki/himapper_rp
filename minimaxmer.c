@@ -301,15 +301,13 @@ int main(int argc, char *argv[]) {
   }
   int Km1 = K - 1;
   KMASK = (K >= 32) ? UINT64_MAX : ((UINT64_C(1) << (2 * K)) - 1);
-  fprintf(stderr, "K=%d WSIZE=%d RSPACE=%d\n", K, WSIZE, RSPACE);
   Open_DB(argv[1], db);
   // The copy-tier occupies the rid's top 3 bits (bits 29..31), so the contig/read id must
   // fit in the low 29 bits.  A larger DB would overflow the id into the tier bits and make
   // himapper mis-identify reads — fail loudly rather than emit a corrupt .kpos.
   if (db->nreads > (int) CN_MAXVAL) {
-    fprintf(stderr, "%s: %d reads/contigs exceeds the copy-tier rid limit %d (2^29); "
-                    "the id would collide with the tier bits\n",
-            argv[0], db->nreads, (int) CN_MAXVAL);
+    fprintf(stderr, "%s: %d reads/contigs exceeds the copy-tier rid limit (2^29)\n",
+            argv[0], db->nreads);
     return 1;
   }
 
@@ -324,8 +322,6 @@ int main(int argc, char *argv[]) {
       Free_Profiles(Pg);
       return 1;
     }
-  fprintf(stderr, "Genome profile:  K=%d  nreads=%lld\n",
-          Pg->kmer, (long long)Pg->nbase[Pg->nparts-1]);
 
   // Open reads profile (argv[3]).
   Profile_Index *Pr = Open_Profiles(argv[3]);
@@ -339,8 +335,6 @@ int main(int argc, char *argv[]) {
       Free_Profiles(Pg); Free_Profiles(Pr);
       return 1;
     }
-  fprintf(stderr, "Reads  profile:  K=%d  nreads=%lld\n",
-          Pr->kmer, (long long)Pr->nbase[Pr->nparts-1]);
 
   int     pmax       = 20000;
   uint16 *prof_genome = (uint16 *) malloc((size_t)pmax * sizeof(uint16));
