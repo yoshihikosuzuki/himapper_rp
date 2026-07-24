@@ -21,7 +21,7 @@ run_timed "$D_HIMAPPER/ref-profile.time" \
 fasta2DAM reads "$READS"
 DBsplit -s200 -f reads.dam
 
-cp "$READ_NAMES" reads.names
+ln -sf "$READ_NAMES" reads.names
 cut -f1 "${REF}.fai" > ref.names
 
 run_timed "$D_HIMAPPER/reads-profile.time" \
@@ -33,6 +33,8 @@ run_timed "$D_HIMAPPER/ref-vs-reads-profile.time" \
 
 # Generate seeds
 run_timed "$D_HIMAPPER/ref-seeds.time" \
-  "$REPO/minimaxmer" ref.dam ref.prof ref.reads.prof "$D_HIMAPPER/ref.minimax.kpos"
+  "$REPO/minimaxmer" ref.dam ref.prof ref.reads.prof \
+  "$D_HIMAPPER/.ref.#.minimax.kpos"
 run_timed "$D_HIMAPPER/read-seeds.time" \
-  "$REPO/minimaxmer" reads.dam reads.ref.prof reads.prof "$D_HIMAPPER/reads.minimax.kpos"
+  "$REPO/minimaxmer" reads.dam reads.ref.prof reads.prof \
+  "$D_HIMAPPER/.reads.#.minimax.kpos"

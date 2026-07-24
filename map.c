@@ -45,7 +45,7 @@ static int CN_TIER_SRC = 0;
 //  Experimental.
 static double CN_UNIQ_W = 0.0;
 
-//  HASH_TIE: break EXACT ties (identical sel/nuniq/ascore — e.g. a read matching two
+//  HASH_TIE: break EXACT ties (identical sel/nuniq — e.g. a read matching two
 //  identical satellite/homolog copies) by a per-read pseudo-random hash of the candidate,
 //  instead of the deterministic AMATCH_SORT order.  The deterministic order funnels every
 //  ambiguous repeat read onto the SAME copy (centromere coverage spikes + dropouts on the
@@ -94,18 +94,6 @@ static int HASH_TIE = 1;
 //  or stitches truncated pieces; mirrors minimap2's chn_pen_gap*|dr-dq| term.
 #define DRIFT_PEN_W 100  //  chain_thread: per seed-hit link, charge |Adiag change|
 #define GAP_PEN_W 100    //  report linker: per stitched piece, charge gap+overlap+indel
-
-//  Affine-gap tie-break (FINE_TIE, -F).  When two candidate placements score
-//  identically under the unit-cost edit distance (length - DIFF_SCORE*diffs),
-//  damapper's pick is the arbitrary qsort order (systematically the later contig).
-//  -F instead expands the exact trace of the tied candidates and re-ranks them by
-//  an affine-gap penalty (mismatch + gap-open + gap-extend), mirroring minimap2's
-//  base-level DP score: it consolidates indels into runs so a placement whose
-//  diffs are fewer, longer gaps (e.g. one true haplotype indel) is preferred over
-//  one with the same diff count scattered into many opens.
-#define AFF_MIS  4   //  per substitution
-#define AFF_OPEN 6   //  per gap run  (gap = AFF_OPEN + len*AFF_EXT)
-#define AFF_EXT  2   //  per indel base
 
 //  FASTGA-style diagonal-band Local_Alignment.  When BAND_ALIGN is defined,
 //  report_thread seeds each Local_Alignment with a diagonal band
@@ -2518,7 +2506,6 @@ static int BC_MATCH_SORT(const void* l, const void* r) {
 typedef struct {
   int score;   //  alignment score: (aepos-abpos) - DIFF_SCORE*diffs (incl. junction pen)
   int sel;     //  selection score = score + CN_UNIQ_W*nuniq (drives LINK_SORT + zones)
-  int ascore;  //  affine-gap tie-break score (-F); 0 unless an equal-score peer exists
   int nuniq;   //  unique (copy-1) seed support; feeds the CN_UNIQ_W selection bonus (sel)
   unsigned int hkey;  //  per-read pseudo-random tie-break key (HASH_TIE); distributes exact ties
   int link;
@@ -2533,46 +2520,11 @@ static int LINK_SORT(const void* l, const void* r) {
   //  reduces to plain score.  A large CN_UNIQ_W makes nuniq dominate (unlimited
   //  copy-aware selection); a small one only overrides near-ties.
   if (y->sel != x->sel) return (y->sel - x->sel);
-  //  sel tie.  Fall back to the affine-gap score (-F); a no-op when -F is off.
-  if (y->ascore != x->ascore) return (y->ascore - x->ascore);
   //  Exact tie (identical repeat/homolog copies): pick the smaller per-read hash so the
   //  winning copy varies pseudo-randomly across reads (uniform coverage), rather than
   //  always the same copy (deterministic AMATCH_SORT order => spikes/dropouts).
   if (HASH_TIE && x->hkey != y->hkey) return (x->hkey < y->hkey) ? -1 : 1;
   return 0;
-}
-
-//  Score a candidate under an affine-gap model, read straight off its compressed
-//  trace points (d_i = #diffs, b_i = #B-bases per trace_spacing A-segment) without
-//  re-aligning.  Per segment the net indel is |A_width - b_i|; the rest of d_i is
-//  treated as substitutions and a non-zero net opens one gap.  This consolidates
-//  indels into runs the way minimap2's base-level DP score does, so a placement
-//  whose diffs are fewer/longer gaps (e.g. one true haplotype indel) outscores one
-//  with the same diff count scattered into many opens.  Returns -penalty (higher
-//  is better).
-static int Affine_Score(Overlap* ov, uint16* tracepts) {
-  Path* p = &ov->path;
-  int n = p->tlen / 2;
-  int apos = p->abpos;
-  int i, pen;
-
-  if (p->aepos <= p->abpos || n <= 0) return 0;
-
-  pen = 0;
-  for (i = 0; i < n; i++) {
-    int d = tracepts[2 * i];
-    int b = tracepts[2 * i + 1];
-    int a_next = (i == n - 1) ? p->aepos : ((apos / SPACING) + 1) * SPACING;
-    int a = a_next - apos;
-    int net = a - b;
-    int subs;
-    if (net < 0) net = -net;
-    subs = d - net;
-    if (subs < 0) subs = 0;
-    pen += subs * AFF_MIS + (net > 0 ? AFF_OPEN : 0) + net * AFF_EXT;
-    apos = a_next;
-  }
-  return -pen;
 }
 
 typedef struct {
@@ -2866,7 +2818,6 @@ static void* report_thread(void* arg) {
     linker[0].link = -1;
     linker[0].score = (amatch[0].path.aepos - amatch[0].path.abpos) -
                       DIFF_SCORE * amatch[0].path.diffs;
-    linker[0].ascore = 0;
     linker[0].nuniq = match_nuniq[0];
     linker[0].mark = 1;
     perm[0] = linker;
@@ -2880,7 +2831,6 @@ static void* report_thread(void* arg) {
       linker[c].link = -1;
       linker[c].score =
           (cpath->aepos - cpath->abpos) - DIFF_SCORE * cpath->diffs;
-      linker[c].ascore = 0;
       linker[c].nuniq = match_nuniq[c];
       linker[c].mark = 1;
       perm[c] = linker + c;
@@ -2963,30 +2913,12 @@ static void* report_thread(void* arg) {
       linker[c].sel = linker[c].score + (int)(CN_UNIQ_W * linker[c].nuniq);
       //  Per-read pseudo-random tie-break key (splitmix64-style mix of read id, ref
       //  contig, ref start).  aread makes it vary per read; (bread,bbpos) distinguishes
-      //  the tied copies.  Used only when sel/nuniq/ascore are all exactly equal.
+      //  the tied copies.  Used only when sel/nuniq are exactly equal.
       { uint64_t h = (uint64_t)(amatch[c].aread) * 0x9E3779B97F4A7C15ULL;
         h ^= ((uint64_t)(amatch[c].bread) + 0x100) * 0xC2B2AE3D27D4EB4FULL;
         h ^= (uint64_t)(amatch[c].path.bbpos) * 0x165667B19E3779F9ULL;
         h ^= h >> 29; h *= 0xBF58476D1CE4E5B9ULL; h ^= h >> 32;
         linker[c].hkey = (unsigned int)h;
-      }
-    }
-
-    //  Affine-gap tie-break (-F): for any candidate that shares an exact score
-    //  with another, expand its trace and score it under an affine-gap model so
-    //  LINK_SORT can break the tie by gap structure instead of arbitrary order.
-    if (FINE_TIE) {
-      for (c = 0; c < novl; c++) {
-        int e, tied = 0;
-        for (e = 0; e < novl; e++)
-          if (e != c && linker[e].score == linker[c].score) {
-            tied = 1;
-            break;
-          }
-        if (tied) {
-          uint16* tp = (uint16*)tbuf->trace + (uint64)amatch[c].path.trace;
-          linker[c].ascore = Affine_Score(amatch + c, tp);
-        }
       }
     }
 

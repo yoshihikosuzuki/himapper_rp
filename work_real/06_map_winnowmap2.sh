@@ -23,7 +23,8 @@ run_timed "$D_WM2/repetitive-kmers.time" meryl print greater-than distinct=0.999
 run_timed "$D_WM2/map.time" \
   winnowmap -W "$D_WM2/chr6.repetitive.txt" -x map-pb -t"$THREADS" --secondary=no -c \
   "$REF" "$READS" > "$D_WM2/map.paf"
-awk -f "$SCRIPTS/paf_to_placement.awk" "$D_WM2/map.paf" > "$D_WM2/placement.tsv"
+awk -f "$SCRIPTS/paf_to_placement.awk" "$D_WM2/map.paf" \
+  > "$D_WM2/mapping.tsv"
 
 run_timed "$D_WM2/bam.time" \
   bash -o pipefail -c '

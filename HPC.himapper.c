@@ -23,10 +23,28 @@
 #undef  SLURM  //  define if want a directly executable SLURM script
 
 static char *Usage[] =
-  { "[-vpzCN1GF] [-k<int(32)>] [-t<int>] [-M<int>] [-e<double(.85)] [-s<int(100)]",
-    "         [-n<double(1.)] [-m<track>]+ [-T<int(4)>] [-f<name>] [-K<ref.kpos|all(all)>] [-R<reads.kpos|all(all)>]",
+  { "[-vpzCN1G] [-k<int(32)>] [-t<int>] [-M<int>] [-e<double(.85)] [-s<int(100)]",
+    "         [-n<double(1.)] [-m<track>]+ [-T<int(4)>] [-f<name>] [-K<ref.#.kpos|all(all)>] [-R<reads.#.kpos|all(all)>]",
     "         <ref:db|dam> <reads:db|dam> [<first:int>[-<last:int>]]"
   };
+
+static int block_marks(const char *path)
+{ int count = 0;
+
+  while ((path = strchr(path,'#')) != NULL)
+    { count += 1;
+      path += 1;
+    }
+  return (count);
+}
+
+static void print_block_path(FILE *out, const char *path, int block)
+{ const char *at;
+
+  at = strchr(path,'#');
+  fwrite(path,1,(size_t)(at-path),out);
+  fprintf(out,"%d%s",block,at+1);
+}
 
 #ifdef LSF
 
@@ -68,8 +86,8 @@ int main(int argc, char *argv[])
   int    MMAX, MTOP;
   char **MASK;
   char  *ONAME;
-  int    ONE, GON, FON;            //  himapper-specific flags: -1 -G -F
-  char  *REFKPOS, *READSKPOS;      //  himapper seed files (-K / -R); "all" => compute on the fly
+  int    ONE, GON;                 //  himapper-specific flags: -1 -G
+  char  *REFKPOS, *READSKPOS;      //  block kpos templates (-K / -R); "all" => compute on the fly
 
   { int    i, j, k;         //  Process options
     int    flags[128];
@@ -101,7 +119,7 @@ int main(int argc, char *argv[])
       if (argv[i][0] == '-')
         switch (argv[i][1])
         { default:
-            ARG_FLAGS("vbpzCN1GF");
+            ARG_FLAGS("vbpzCN1G");
             break;
           case 'K':
             REFKPOS = argv[i]+2;
@@ -166,7 +184,6 @@ int main(int argc, char *argv[])
     NON = flags['N'];
     ONE = flags['1'];
     GON = flags['G'];
-    FON = flags['F'];
 
     if (argc < 3 || argc > 4)
       { fprintf(stderr,"Usage: %s %s\n",Prog_Name,Usage[0]);
@@ -174,9 +191,10 @@ int main(int argc, char *argv[])
         fprintf(stderr,"       %*s %s\n",(int) strlen(Prog_Name),"",Usage[2]);
         fprintf(stderr,"\n");
         fprintf(stderr,"     himapper seeds (one himapper call per reads block):\n");
-        fprintf(stderr,"      -K: ref   seed file <ref.kpos|all>   (default all).\n");
-        fprintf(stderr,"      -R: reads seed file <reads.kpos|all> (default all).\n");
-        fprintf(stderr,"      -1: primary-only.  -G/-F: himapper tie-break flags.\n");
+        fprintf(stderr,"      -K: ref   seed template <ref.#.kpos|all>   (default all).\n");
+        fprintf(stderr,"      -R: reads seed template <reads.#.kpos|all> (default all).\n");
+        fprintf(stderr,"          # denotes the 1-based DAZZLER DB block number.\n");
+        fprintf(stderr,"      -1: primary-only.  -G: disable collinear-gap penalties.\n");
         fprintf(stderr,"\n");
         fprintf(stderr,"     Passed through to himapper.\n");
         fprintf(stderr,"      -k: k-mer size (must be <= 32).\n");
@@ -203,6 +221,17 @@ int main(int argc, char *argv[])
         fprintf(stderr,"      -v: Verbose mode, output statistics as proceed.\n");
         fprintf(stderr,"      -B: # of block compares per daligner job\n");
         fprintf(stderr,"      -f: Place script bundles in separate files with prefix <name>\n");
+        exit (1);
+      }
+
+    if (strcmp(REFKPOS,"all") != 0 && block_marks(REFKPOS) != 1)
+      { fprintf(stderr,"%s: -K template '%s' must contain exactly one '#'\n",
+                       Prog_Name,REFKPOS);
+        exit (1);
+      }
+    if (strcmp(READSKPOS,"all") != 0 && block_marks(READSKPOS) != 1)
+      { fprintf(stderr,"%s: -R template '%s' must contain exactly one '#'\n",
+                       Prog_Name,READSKPOS);
         exit (1);
       }
 
@@ -416,8 +445,6 @@ int main(int argc, char *argv[])
             fprintf(out," -1");
           if (GON)
             fprintf(out," -G");
-          if (FON)
-            fprintf(out," -F");
           if (VON)
             fprintf(out," -v");
           if (PON)
@@ -448,7 +475,7 @@ int main(int argc, char *argv[])
             fprintf(out," %s/%s",pwd1,root1);
           else
             fprintf(out," %s",root1);
-          fprintf(out," %s",REFKPOS);                //  himapper: <ref.kpos|all> after the ref
+          fprintf(out," %s",REFKPOS);                //  himapper expands # for each ref block
 	  hgh = fblock + (((lblock-fblock)+1)*j)/bits;
           for (k = low; k < hgh; k++)
             { if (useblock2)
@@ -461,7 +488,11 @@ int main(int argc, char *argv[])
                   fprintf(out," %s/%s",pwd2,root2);
                 else
                   fprintf(out," %s",root2);
-              fprintf(out," %s",READSKPOS);          //  himapper: <reads.kpos|all> after each reads block
+              fprintf(out," ");
+              if (strcmp(READSKPOS,"all") == 0)
+                fputs("all",out);
+              else
+                print_block_path(out,READSKPOS,k);    //  block-local reads kpos
             }
 #ifdef HPC
           fprintf(out,"\"");

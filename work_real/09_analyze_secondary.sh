@@ -29,7 +29,7 @@ COMMANDS="$RUN_DIR/commands.sh"
 {
   echo '#!/usr/bin/env bash'
   echo 'set -euo pipefail'
-  "$HPC" -n0.7 -T"$THREADS" -K"$D_HIMAPPER/ref.minimax.kpos" ref.dam reads 2>/dev/null \
+  "$HPC" -n0.7 -T"$THREADS" -K"$D_HIMAPPER/.ref.#.minimax.kpos" ref.dam reads 2>/dev/null \
     | grep '^himapper' | sed "s|^himapper|$HIM|"
 } > "$COMMANDS"
 [[ $(tail -n +3 "$COMMANDS" | wc -l) -eq "$NB" ]] || {
@@ -38,12 +38,13 @@ COMMANDS="$RUN_DIR/commands.sh"
 }
 rm -f reads.*.ref.las
 bash "$COMMANDS"
-: > "$RUN_DIR/placement.all-candidates.tsv"
+: > "$RUN_DIR/mapping.all-candidates.tsv"
 for k in $(seq 1 "$NB"); do
   LAshow reads ref.dam "reads.$k.ref.las" 2>/dev/null \
     | python3 "$SCRIPTS/lashow_to_placement.py" --all "$D_HIMAPPER/reads.names" \
-        "$D_HIMAPPER/ref.names" >> "$RUN_DIR/placement.all-candidates.tsv"
+        "$D_HIMAPPER/ref.names" >> "$RUN_DIR/mapping.all-candidates.tsv"
 done
-rm -f reads.*.ref.las
+# Keep the LAS files: unlike mapping.all-candidates.tsv, they retain the
+# chain flags needed to distinguish candidates from split alignment pieces.
 awk -F'\t' '{c[$1]++} END{for(r in c)d[c[r]]++; for(n=1;n<=5;n++)printf "  %d cand: %d reads\n",n,d[n]+0; s=0;for(n=6;n<=999;n++)s+=d[n];printf "  6+ cand: %d reads\n",s}' \
-  "$RUN_DIR/placement.all-candidates.tsv" >&2
+  "$RUN_DIR/mapping.all-candidates.tsv" >&2

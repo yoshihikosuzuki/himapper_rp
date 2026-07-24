@@ -26,9 +26,9 @@
 #include "map.h"
 
 static char *Usage[] =
-  { "[-1vpzCNGF] [-k<int(20)>] [-t<int>] [-M<int>] [-T<int(4)>] [-P<dir(/tmp)>]",
+  { "[-1vpzCNG] [-k<int(20)>] [-t<int>] [-M<int>] [-T<int(4)>] [-P<dir(/tmp)>]",
     "         [-e<double(.85)] [-s<int(100)>] [-n<double(1.00)>]",
-    "         [-m<track>]+  <reference:dam> <ref.kpos|all> <reads:db> <reads.kpos|all>",
+    "         [-m<track>]+  <reference:dam> <ref.#.kpos|all> <reads:db> <reads.kpos|all>",
   };
 
 int     VERBOSE;   //   Globally visible to map.c
@@ -37,11 +37,41 @@ int     SPACING;
 double  BEST_TIE;
 int     PRIMARY_ONLY;
 int     JUNCTION_PEN;
-int     FINE_TIE;
 char   *SORT_PATH;
 
 uint64  MEM_LIMIT;
 uint64  MEM_PHYSICAL;
+
+static int block_marks(const char *path)
+{ int count = 0;
+
+  while ((path = strchr(path,'#')) != NULL)
+    { count += 1;
+      path += 1;
+    }
+  return (count);
+}
+
+static char *block_kpos_path(const char *template, int block)
+{ const char *mark;
+  char        number[32];
+  char       *path;
+  size_t      prefix, suffix;
+  int         n;
+
+  mark   = strchr(template,'#');
+  prefix = (size_t) (mark-template);
+  suffix = strlen(mark+1);
+  n      = snprintf(number,sizeof(number),"%d",block);
+
+  path = (char *) Malloc(prefix+(size_t)n+suffix+1,"Allocating block kpos path");
+  if (path == NULL)
+    exit (1);
+  memcpy(path,template,prefix);
+  memcpy(path+prefix,number,(size_t)n);
+  memcpy(path+prefix+(size_t)n,mark+1,suffix+1);
+  return (path);
+}
 
 /*  Adapted from code by David Robert Nadeau (http://NadeauSoftware.com) licensed under
  *     "Creative Commons Attribution 3.0 Unported License"
@@ -607,7 +637,7 @@ int main(int argc, char *argv[])
       if (argv[i][0] == '-')
         switch (argv[i][1])
         { default:
-            ARG_FLAGS("vpzCN1GF")
+            ARG_FLAGS("vpzCN1G")
             break;
           case 'e':
             ARG_REAL(AVE_ERROR)
@@ -683,7 +713,6 @@ int main(int argc, char *argv[])
     MAP_ORDER = 1-flags['z'];
     PRIMARY_ONLY = flags['1'];   //  -1: suppress same-region secondaries (cf. minimap2 --secondary=no)
     JUNCTION_PEN = 1 - flags['G'];  //  -G: disable collinear-gap penalties (legacy damapper)
-    FINE_TIE = flags['F'];  //  -F: break exact score ties by an affine-gap rescore (experimental)
 
     if (argc <= 4)
       { fprintf(stderr,"Usage: %s %s\n",Prog_Name,Usage[0]);
@@ -712,16 +741,22 @@ int main(int argc, char *argv[])
         fprintf(stderr,"      -C: Output reference vs reads .las.\n");
         fprintf(stderr,"      -N: Do not output reads vs reference .las.\n");
         fprintf(stderr,"\n");
-        fprintf(stderr,"      For <ref.kpos|all> and <reads.kpos|all>:\n");
-        fprintf(stderr,"        Specify a .kpos file to use precomputed seeds,\n");
+        fprintf(stderr,"      For <ref.#.kpos|all> and <reads.kpos|all>:\n");
+        fprintf(stderr,"        Specify block-local .kpos files to use precomputed seeds,\n");
+        fprintf(stderr,"        where # denotes the 1-based reference DB block number,\n");
         fprintf(stderr,"        or 'all' to use all k-mers as seeds.\n");
         exit (1);
       }
 
-    // Extract the ref.kpos and reads.kpos paths, then adjust argv.
-    // argv[1]=ref.dam  argv[2]=ref.kpos|all  argv[3]=reads.db  argv[4]=reads.kpos|all
+    // Extract the reference kpos template and the block-local reads kpos path, then adjust argv.
+    // argv[1]=ref.dam  argv[2]=ref.#.kpos|all  argv[3]=reads.db  argv[4]=reads.kpos|all
     kpos_path  = argv[2];
     bkpos_path = argv[4];
+    if (strcmp(kpos_path,"all") != 0 && block_marks(kpos_path) != 1)
+      { fprintf(stderr,"%s: reference kpos template '%s' must contain exactly one '#'\n",
+                       Prog_Name,kpos_path);
+        exit (1);
+      }
     // Shift: argv[3] (reads.db) becomes argv[2]
     argv[2] = argv[3];
     argc -= 2;   // now argc counts: prog ref.dam reads.db
@@ -860,7 +895,9 @@ int main(int argc, char *argv[])
 
         // TODO: hl,dlだとAdvance_Block_Arg(parse)としている。aとb逆だからだめ？
         for (k = 1; k <= nblocks; k++)
-          { if (isdam)
+          { char *akpos_path = NULL;
+
+            if (isdam)
               afile = Strdup(Catenate(apwd,"/",aroot,Numbered_Suffix(".",k,".dam")),
                              "Allocating name");
             else
@@ -874,7 +911,9 @@ int main(int argc, char *argv[])
             if (strcmp(kpos_path, "all") == 0)
               aindex = Sort_Kmers(ablock, &alen);
             else
-              aindex = Load_Kpos(kpos_path, 0, ablock, &alen);
+              { akpos_path = block_kpos_path(kpos_path,k);
+                aindex = Load_Kpos(akpos_path, 0, ablock, &alen);
+              }
 
             if (VERBOSE)
               printf("\nComparing %s to %s.%d\n",broot,aroot,k);
@@ -888,13 +927,14 @@ int main(int argc, char *argv[])
               { aindex = Sort_Kmers(ablock, &alen);
               }
             else
-              aindex = Load_Kpos(kpos_path, 1, ablock, &alen);
+              aindex = Load_Kpos(akpos_path, 1, ablock, &alen);
 
             if (VERBOSE)
               printf("\nComparing %s to c(%s.%d)\n",broot,aroot,k);
             Match_Filter(bblock,ablock,bindex,blen,aindex,alen,1,0);
 
             Close_DB(ablock);
+            free(akpos_path);
           }   // for (k = 1; k <= nblocks; k++)
 
         if (isdam)

@@ -11,9 +11,10 @@ module load ${_MINIMAP2}
 set -x
 THREADS=${SLURM_CPUS_PER_TASK:-64}
 
-# Resolvability
-python3 "$SCRIPTS/resolvable.py" --threads "$THREADS" --near 2 --med 10 \
-  "$REF" "$READS_CONFIDENT_LOCUS" "$D_EVAL/resolvability_strata.tsv"
+# Reference-span self-map difficulty proxy
+python3 "$SCRIPTS/alignment_strata.py" --threads "$THREADS" --near 2 --med 10 \
+  "$REF" "$READS_CONFIDENT_MAPPING_TRUTH" \
+  "$D_EVAL/alignment_strata.tsv"
 
 # Hapmer strata
 awk 'BEGIN{OFS="\t"}
@@ -24,8 +25,10 @@ awk 'BEGIN{OFS="\t"}
   else if($2!="p" && $2!="m") s="ambiguous"
   else if(($2=="p"?"pat":"mat")!=map_hap[$1]) s="disagree"
   else s=(h<=40?"vhard":(h<=100?"hard":(h<=350?"med":"easy")))
-  print $1,s}' "$READS_CONFIDENT_LOCUS" "$D_TRIO/$READS_BASE.triobin.tsv" > "$D_EVAL/hapmer_strata.tsv"
+  print $1,s}' "$READS_CONFIDENT_MAPPING_TRUTH" \
+  "$D_TRIO/$READS_BASE.triobin.tsv" > "$D_EVAL/hapmer_strata.tsv"
 
 # Variant strata
 python3 "$SCRIPTS/variant_strata.py" \
-  "$D_REF/variants.tsv" "$READS_CONFIDENT_LOCUS" "$D_EVAL/variant_strata.tsv"
+  "$D_REF/variants.tsv" "$READS_CONFIDENT_MAPPING_TRUTH" \
+  "$D_EVAL/variant_strata.tsv"

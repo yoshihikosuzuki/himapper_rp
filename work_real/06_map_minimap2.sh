@@ -22,7 +22,8 @@ run_timed "$D_MM2/index.time" minimap2 -x map-hifi -t"$THREADS" -d "$D_MM2/chr6.
 run_timed "$D_MM2/map.time" \
   minimap2 -x map-hifi -t"$THREADS" --secondary=no -c "$D_MM2/chr6.mmi" "$READS" \
   > "$D_MM2/map.paf"
-awk -f "$SCRIPTS/paf_to_placement.awk" "$D_MM2/map.paf" > "$D_MM2/placement.tsv"
+awk -f "$SCRIPTS/paf_to_placement.awk" "$D_MM2/map.paf" \
+  > "$D_MM2/mapping.tsv"
 
 run_timed "$D_MM2/bam.time" \
   bash -o pipefail -c '

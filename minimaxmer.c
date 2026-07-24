@@ -28,6 +28,62 @@ static const uint8_t base2bit[128] = {
 // known (K is capped at 32, so K==32 gives the full uint64 mask).
 static uint64_t KMASK;
 
+static int write_kpos_header(FILE *out)
+{
+  char magic[4] = {'K', 'P', 'O', 'S'};
+  uint8_t ver = 1, flags = 0, idx_bytes = 0, reserved = 0;
+  int32_t Kval = K;
+  int32_t entry_size =
+      (int32_t)(sizeof(uint64_t) + sizeof(int32_t) + sizeof(uint32_t));
+  uint64_t n_entries = 0;
+
+  if (fwrite(magic, 4, 1, out) != 1 ||
+      fwrite(&ver, 1, 1, out) != 1 ||
+      fwrite(&flags, 1, 1, out) != 1 ||
+      fwrite(&idx_bytes, 1, 1, out) != 1 ||
+      fwrite(&reserved, 1, 1, out) != 1 ||
+      fwrite(&Kval, sizeof(int32_t), 1, out) != 1 ||
+      fwrite(&entry_size, sizeof(int32_t), 1, out) != 1 ||
+      fwrite(&n_entries, sizeof(uint64_t), 1, out) != 1)
+    return -1;
+
+  return 0;
+}
+
+static int finish_kpos(FILE *out, uint64_t n_entries)
+{
+  if (fseek(out, 16, SEEK_SET) != 0 ||
+      fwrite(&n_entries, sizeof(uint64_t), 1, out) != 1)
+    return -1;
+
+  return 0;
+}
+
+static char *block_output_path(const char *template, int block)
+{
+  const char *at = strchr(template, '#');
+  char block_buf[32];
+  size_t prefix_len, suffix_len, path_len;
+  char *path;
+
+  if (at == NULL || strchr(at + 1, '#') != NULL)
+    return NULL;
+
+  snprintf(block_buf, sizeof(block_buf), "%d", block);
+  prefix_len = (size_t)(at - template);
+  suffix_len = strlen(at + 1);
+  path_len = prefix_len + strlen(block_buf) + suffix_len;
+  path = (char *)malloc(path_len + 1);
+  if (path == NULL)
+    return NULL;
+
+  memcpy(path, template, prefix_len);
+  memcpy(path + prefix_len, block_buf, strlen(block_buf));
+  memcpy(path + prefix_len + strlen(block_buf),
+         at + 1, suffix_len + 1);
+  return path;
+}
+
 // Compare (ca_g, ca_r, ha) < (cb_g, cb_r, hb):
 //   primary:   lower genome count  → more unique in genome   → better seed
 //   secondary: higher reads count  → better covered in reads → better seed
@@ -267,7 +323,7 @@ int find_seeds(const char    *seq,
 
 int main(int argc, char *argv[]) {
   DAZZ_DB _db, *db = &_db;
-  // Optional density flags (-w<WSIZE> -s<RSPACE>) precede the 4 positional args.
+  // Optional flags precede the 4 positional args.
   { int i, j = 1;
     for (i = 1; i < argc; i++) {
       if (argv[i][0] == '-') {
@@ -284,15 +340,16 @@ int main(int argc, char *argv[]) {
     }
     argc = j;
   }
-  if (argc < 5 || WSIZE < 1 || RSPACE < 0) {
-    fprintf(stderr, "Usage: %s [-k<32>] [-w<100>] [-s<100>] <db> <ref.prof> <ref.reads.prof> <out.kpos>\n", argv[0]);
+  if (argc != 5 || WSIZE < 1 || RSPACE < 0) {
+    fprintf(stderr, "Usage: %s [-k<32>] [-w<100>] [-s<100>] <db> <ref.prof> <ref.reads.prof> <output-template>\n", argv[0]);
     fprintf(stderr, "  -k<N>           : k-mer length (<= 32)\n");
     fprintf(stderr, "  -w<N>           : minimizer window width  (larger => sparser seeds)\n");
     fprintf(stderr, "  -s<N>           : min spacing of uniform sparse seeds (larger => sparser)\n");
-    fprintf(stderr, "  <db>            : DAZZ reference dam/db\n");
+    fprintf(stderr, "  <db>            : whole, partitioned DAZZ reference dam/db\n");
     fprintf(stderr, "  <ref.prof>      : FastK genome k-mer count profile\n");
     fprintf(stderr, "  <ref.reads.prof>: FastK reads  k-mer count profile\n");
-    fprintf(stderr, "  <out.kpos>      : output k-mer position file\n");
+    fprintf(stderr, "  <output-template>: block-local KPOS paths; must contain exactly one '#'\n");
+    fprintf(stderr, "                     (for example .reads.#.minimax.kpos)\n");
     return 1;
   }
   if (K > 32) {
@@ -301,7 +358,9 @@ int main(int argc, char *argv[]) {
   }
   int Km1 = K - 1;
   KMASK = (K >= 32) ? UINT64_MAX : ((UINT64_C(1) << (2 * K)) - 1);
-  Open_DB(argv[1], db);
+  int db_type = Open_DB(argv[1], db);
+  if (db_type < 0)
+    return 1;
   // The copy-tier occupies the rid's top 3 bits (bits 29..31), so the contig/read id must
   // fit in the low 29 bits.  A larger DB would overflow the id into the tier bits and make
   // himapper mis-identify reads — fail loudly rather than emit a corrupt .kpos.
@@ -335,66 +394,158 @@ int main(int argc, char *argv[]) {
       Free_Profiles(Pg); Free_Profiles(Pr);
       return 1;
     }
+  if (Pg->nreads != db->nreads || Pr->nreads != db->nreads)
+    { fprintf(stderr,
+              "%s: profile/DB read-count mismatch: DB=%d genome-profile=%d reads-profile=%d\n",
+              argv[0], db->nreads, Pg->nreads, Pr->nreads);
+      Free_Profiles(Pg); Free_Profiles(Pr);
+      return 1;
+    }
+
+  DAZZ_STUB *stub = NULL;
+  { char *stub_path;
+    const char *stub_suffix = db_type > 0 ? ".dam" : ".db";
+    size_t stub_path_len;
+    size_t db_arg_len;
+    size_t stub_suffix_len;
+    int has_stub_suffix;
+    int b;
+    const char *output_token = strchr(argv[4], '#');
+
+    if (db->part != 0)
+      { fprintf(stderr, "%s: requires a whole DB, not block %d\n",
+                argv[0], db->part);
+        Free_Profiles(Pg); Free_Profiles(Pr);
+        return 1;
+      }
+    if (output_token == NULL || strchr(output_token + 1, '#') != NULL)
+      { fprintf(stderr,
+                "%s: output template must contain exactly one '#': %s\n",
+                argv[0], argv[4]);
+        Free_Profiles(Pg); Free_Profiles(Pr);
+        return 1;
+      }
+
+    // db->path names the auxiliary-file root and can include a hidden-file
+    // component (for example "./.reads").  The DB stub is the user-visible
+    // argv[1] path instead, with its .db/.dam suffix added when omitted.
+    db_arg_len = strlen(argv[1]);
+    stub_suffix_len = strlen(stub_suffix);
+    has_stub_suffix =
+        db_arg_len >= stub_suffix_len &&
+        strcmp(argv[1] + db_arg_len - stub_suffix_len, stub_suffix) == 0;
+    stub_path_len =
+        db_arg_len + (has_stub_suffix ? 0 : stub_suffix_len) + 1;
+    stub_path = (char *)malloc(stub_path_len);
+    if (stub_path == NULL)
+      { perror("malloc DB stub path");
+        Free_Profiles(Pg); Free_Profiles(Pr);
+        return 1;
+      }
+    snprintf(stub_path, stub_path_len, "%s%s", argv[1],
+             has_stub_suffix ? "" : stub_suffix);
+    stub = Read_DB_Stub(stub_path, DB_STUB_BLOCKS);
+    free(stub_path);
+    if (stub == NULL || stub->nblocks < 1)
+      { fprintf(stderr, "%s: requires a partitioned DB\n", argv[0]);
+        if (stub != NULL) Free_DB_Stub(stub);
+        Free_Profiles(Pg); Free_Profiles(Pr);
+        return 1;
+      }
+    if (stub->ublocks[0] != 0 ||
+        stub->ublocks[stub->nblocks] != db->nreads)
+      { fprintf(stderr,
+                "%s: DB block boundaries do not span all %d input reads\n",
+                argv[0], db->nreads);
+        Free_DB_Stub(stub);
+        Free_Profiles(Pg); Free_Profiles(Pr);
+        return 1;
+      }
+    for (b = 0; b <= stub->nblocks; b++)
+      if (stub->ublocks[b] != stub->tblocks[b])
+        { fprintf(stderr,
+                  "%s: does not support differing trimmed/untrimmed block boundaries\n",
+                  argv[0]);
+          Free_DB_Stub(stub);
+          Free_Profiles(Pg); Free_Profiles(Pr);
+          return 1;
+        }
+  }
 
   int     pmax       = 20000;
   uint16 *prof_genome = (uint16 *) malloc((size_t)pmax * sizeof(uint16));
   uint16 *prof_reads  = (uint16 *) malloc((size_t)pmax * sizeof(uint16));
   if (!prof_genome || !prof_reads) { perror("malloc profile"); return 1; }
 
-  FILE *out = fopen(argv[4], "wb");
-  if (!out) {
-    perror("fopen");
-    return 1;
-  }
-
-  // Write simple header placeholder (24 bytes):
-  // magic(4) ver(1) flags(1) idx_bytes(1) reserved(1) K(int32) entry_size(int32) n_entries(uint64)
-  char magic[4] = {'K', 'P', 'O', 'S'};
-  fwrite(magic, 4, 1, out);
-  uint8_t ver = 1, flags = 0, idx_bytes = 0, reserved = 0;
-  fwrite(&ver, 1, 1, out);
-  fwrite(&flags, 1, 1, out);
-  fwrite(&idx_bytes, 1, 1, out);
-  fwrite(&reserved, 1, 1, out);
-  int32_t Kval = K;
-  fwrite(&Kval, sizeof(int32_t), 1, out);
-  int32_t entry_size = (int32_t)(sizeof(uint64_t) + sizeof(int32_t) + sizeof(uint32_t));
-  fwrite(&entry_size, sizeof(int32_t), 1, out);
-  uint64_t n_entries = 0;
-  fwrite(&n_entries, sizeof(uint64_t), 1, out);
-
   {
     char *seq = New_Read_Buffer(db);
-
     uint64_t total_written = 0;
-    for (int id = 0; id < db->nreads; id++) {
-      DAZZ_READ *r = db->reads + id;
-      int rlen = r->rlen;
-      int plen = rlen - Km1;
+    int noutputs = stub->nblocks;
+    int output;
 
-      Load_Read(db, id, seq, 2);
+    for (output = 0; output < noutputs; output++)
+      { int first = stub->ublocks[output];
+        int last = stub->ublocks[output + 1];
+        char *generated_path = block_output_path(argv[4], output + 1);
+        const char *output_path = generated_path;
+        uint64_t output_written = 0;
+        FILE *out;
+        int id;
 
-      // Fetch genome k-mer counts for this contig/read (0-based id).
-      int fetched = Fetch_Profile(Pg, (int64)id, pmax, prof_genome);
-      if (fetched > pmax)
-        { pmax       = (int)(1.2 * fetched) + 1000;
-          prof_genome = (uint16 *) realloc(prof_genome, (size_t)pmax * sizeof(uint16));
-          prof_reads  = (uint16 *) realloc(prof_reads,  (size_t)pmax * sizeof(uint16));
-          if (!prof_genome || !prof_reads) { perror("realloc profile"); exit(1); }
-          Fetch_Profile(Pg, (int64)id, pmax, prof_genome);
-        }
+        if (output_path == NULL)
+          { fprintf(stderr, "%s: cannot construct block output path\n", argv[0]);
+            exit(1);
+          }
+        out = fopen(output_path, "wb");
+        if (out == NULL)
+          { perror(output_path);
+            free(generated_path);
+            exit(1);
+          }
+        if (write_kpos_header(out) != 0)
+          { fprintf(stderr, "%s: failed to write KPOS header to %s\n",
+                    argv[0], output_path);
+            fclose(out);
+            free(generated_path);
+            exit(1);
+          }
 
-      // Fetch reads k-mer counts for the same position range.
-      Fetch_Profile(Pr, (int64)id, pmax, prof_reads);
+        for (id = first; id < last; id++)
+          { DAZZ_READ *r = db->reads + id;
+            int rlen = r->rlen;
+            int plen = rlen - Km1;
+            int output_read_id = id - first;
 
-      int written = find_seeds(seq + Km1, plen, K, prof_genome, prof_reads, id, out);
-      total_written += (uint64_t)written;
-    }
+            Load_Read(db, id, seq, 2);
 
-    // Seek back and write the total entry count into header (offset 16)
-    if (fseek(out, 16, SEEK_SET) == 0) {
-      fwrite(&total_written, sizeof(uint64_t), 1, out);
-    }
+            // Profiles are indexed by the whole-DB read id; KPOS ids are block-local.
+            int fetched = Fetch_Profile(Pg, (int64)id, pmax, prof_genome);
+            if (fetched > pmax)
+              { pmax       = (int)(1.2 * fetched) + 1000;
+                prof_genome = (uint16 *) realloc(prof_genome, (size_t)pmax * sizeof(uint16));
+                prof_reads  = (uint16 *) realloc(prof_reads,  (size_t)pmax * sizeof(uint16));
+                if (!prof_genome || !prof_reads) { perror("realloc profile"); exit(1); }
+                Fetch_Profile(Pg, (int64)id, pmax, prof_genome);
+              }
+
+            Fetch_Profile(Pr, (int64)id, pmax, prof_reads);
+
+            int written = find_seeds(seq + Km1, plen, K, prof_genome,
+                                     prof_reads, output_read_id, out);
+            output_written += (uint64_t)written;
+          }
+
+        if (finish_kpos(out, output_written) != 0 || fclose(out) != 0)
+          { fprintf(stderr, "%s: failed to finalize %s\n", argv[0], output_path);
+            free(generated_path);
+            exit(1);
+          }
+        fprintf(stderr, "Block %d seeds written: %llu (%s)\n",
+                output + 1, (unsigned long long)output_written, output_path);
+        total_written += output_written;
+        free(generated_path);
+      }
+
     fprintf(stderr, "Seeds written: %llu\n", (unsigned long long)total_written);
 
     free(seq-1);
@@ -404,8 +555,7 @@ int main(int argc, char *argv[]) {
   free(prof_reads);
   Free_Profiles(Pg);
   Free_Profiles(Pr);
-
-  fclose(out);
+  Free_DB_Stub(stub);
 
   return 0;
 }
