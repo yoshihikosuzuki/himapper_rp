@@ -56,10 +56,17 @@ static double CN_UNIQ_W = 0.0;
 static int HASH_TIE = 1;
 
 #define MAXGRAM \
-  10000  //  Cap on k-mer count histogram (in count_thread, merge_thread).  (Tried 1e5 to keep
-         //  dense-satellite anchors -> made centromere funnel WORSE: more anchors => the top-
-         //  scoring consensus copy wins more decisively => a BIGGER pile, not distribution.
-         //  Root cause is the -1 consensus selection, not the cap; reverted.)
+  50000  //  Cap on k-mer count histogram (in count_thread, merge_thread)
+
+//  Number of distinct-diagonal predecessor candidates considered per side
+//  while chaining.  P=1 is the original recurrence; P=2 also tests the closest
+//  feasible endpoint on the next distinct diagonal.  Set this to 1 or 2 before
+//  rebuilding himapper.
+#define CHAIN_PRED_WIDTH 2
+#if CHAIN_PRED_WIDTH != 1 && CHAIN_PRED_WIDTH != 2
+#error "CHAIN_PRED_WIDTH must be 1 or 2"
+#endif
+#define CHAIN_PRED_MAX 2
 
 // #define DEBUG_SEED_HIT      //  Print every seed hit: ref_id/pos,
 // read_id/pos, kmer string
@@ -1598,6 +1605,116 @@ static Splay* succOf(Splay* x, int thresh) {
   }
 }
 
+#if CHAIN_PRED_WIDTH > 1
+typedef struct {
+  Splay* node[CHAIN_PRED_MAX];
+  int n;
+} Chain_Pred_List;
+
+static int chain_pred_cost(Splay* current, Splay* prior, int side) {
+  int cost;
+
+  if (side == 0) {
+    if (current->apos >= prior->apos + Kmer)
+      cost = prior->cost + Kmer;
+    else
+      cost = prior->cost + (current->apos - prior->apos);
+  } else {
+    if (current->bpos >= prior->bpos + Kmer)
+      cost = prior->cost + Kmer;
+    else
+      cost = prior->cost + (current->bpos - prior->bpos);
+  }
+  if (JUNCTION_PEN)
+    cost -= (DRIFT_PEN_W * abs(current->diag - prior->diag)) / 100;
+  return (cost);
+}
+
+//  Return the closest feasible endpoint in a subtree known to be above the
+//  diagonal boundary.  This is predOf's bmax-pruned one-path traversal.
+static Splay* chain_pred_any_above(Splay* x, int thresh) {
+  if (x == NULL || x->bmax < thresh) return (NULL);
+  while (1) {
+    if (x->rgt != NULL && x->rgt->bmax >= thresh)
+      x = x->rgt;
+    else if (x->bpos >= thresh)
+      return (x);
+    else {
+      x = x->lft;
+      if (x == NULL) return (NULL);
+    }
+  }
+}
+
+//  Return the closest feasible endpoint whose diagonal is strictly above
+//  bound.  The boundary descent plus at most one unrestricted subtree descent
+//  visits O(tree height) nodes.
+static Splay* chain_pred_above(Splay* x, int bound, int thresh) {
+  Splay* near;
+
+  if (x == NULL || x->bmax < thresh) return (NULL);
+  if (x->diag <= bound) return (chain_pred_above(x->lft, bound, thresh));
+
+  near = chain_pred_above(x->rgt, bound, thresh);
+  if (near != NULL) return (near);
+  if (x->bpos >= thresh) return (x);
+  return (chain_pred_any_above(x->lft, thresh));
+}
+
+//  succOf's bmin-pruned counterpart for a subtree known to be below the
+//  diagonal boundary.
+static Splay* chain_pred_any_below(Splay* x, int thresh) {
+  if (x == NULL || x->bmin > thresh) return (NULL);
+  while (1) {
+    if (x->lft != NULL && x->lft->bmin <= thresh)
+      x = x->lft;
+    else if (x->bpos <= thresh)
+      return (x);
+    else {
+      x = x->rgt;
+      if (x == NULL) return (NULL);
+    }
+  }
+}
+
+//  Return the closest feasible endpoint whose diagonal is strictly below
+//  bound, symmetrically to chain_pred_above.
+static Splay* chain_pred_below(Splay* x, int bound, int thresh) {
+  Splay* near;
+
+  if (x == NULL || x->bmin > thresh) return (NULL);
+  if (x->diag >= bound) return (chain_pred_below(x->rgt, bound, thresh));
+
+  near = chain_pred_below(x->lft, bound, thresh);
+  if (near != NULL) return (near);
+  if (x->bpos <= thresh) return (x);
+  return (chain_pred_any_below(x->rgt, thresh));
+}
+
+static void chain_pred_list(Splay* current, Splay* primary, int side,
+                            int thresh, int width, Chain_Pred_List* list) {
+  Splay* next;
+  int bound;
+
+  list->n = 0;
+  bound = current->diag;
+  if (primary != NULL) {
+    list->node[list->n++] = primary;
+    bound = primary->diag;
+  }
+
+  while (list->n < width) {
+    if (side == 0)
+      next = chain_pred_above(current, bound, thresh);
+    else
+      next = chain_pred_below(current, bound, thresh);
+    if (next == NULL) break;
+    list->node[list->n++] = next;
+    bound = next->diag;
+  }
+}
+#endif
+
 //  Print contents of splay tree h in decreasing order, suppressing any
 //  successors
 //    that have the same orig(in).  Ignore all entries with cost < hithr.  From
@@ -2083,6 +2200,7 @@ static void* chain_thread(void* arg) {
         chain = sfree++;
         update(chain);
 
+#if CHAIN_PRED_WIDTH == 1
         l = predOf(chain, bpos - MAX_GAP);
         if (l != NULL) l = leftmost(chain, l->diag, bpos - MAX_GAP);
         r = succOf(chain, bpos);
@@ -2147,6 +2265,72 @@ static void* chain_thread(void* arg) {
           chain->orig = chain;
           chain->nuniq = (htier == 1);
         }
+#else
+        {
+          Chain_Pred_List left, right;
+          Splay* best;
+          int bestcost, i;
+
+          l = predOf(chain, bpos - MAX_GAP);
+          if (l != NULL) l = leftmost(chain, l->diag, bpos - MAX_GAP);
+          r = succOf(chain, bpos);
+          chain_pred_list(chain, l, 0, bpos - MAX_GAP, CHAIN_PRED_WIDTH,
+                          &left);
+          chain_pred_list(chain, r, 1, bpos, CHAIN_PRED_WIDTH, &right);
+
+          lcost = (l == NULL ? 0 : chain_pred_cost(chain, l, 0));
+          rcost = (r == NULL ? 0 : chain_pred_cost(chain, r, 1));
+          if (lcost > rcost) {
+            best = l;
+            bestcost = lcost;
+          } else {
+            best = r;
+            bestcost = rcost;
+          }
+          if (bestcost <= 0) {
+            best = NULL;
+            bestcost = 0;
+          }
+
+          for (i = (l == NULL ? 0 : 1); i < left.n; i++) {
+            int cost = chain_pred_cost(chain, left.node[i], 0);
+            if (cost > bestcost) {
+              best = left.node[i];
+              bestcost = cost;
+            }
+          }
+          for (i = (r == NULL ? 0 : 1); i < right.n; i++) {
+            int cost = chain_pred_cost(chain, right.node[i], 1);
+            if (cost > bestcost) {
+              best = right.node[i];
+              bestcost = cost;
+            }
+          }
+
+          if (best != NULL) {
+            chain->from = best;
+            chain->cost = bestcost;
+            chain->nuniq = best->nuniq + (htier == 1);
+            if (best->from == NULL)
+              chain->orig = best;
+            else
+              chain->orig = best->orig;
+            if (bestcost >= chain->orig->orig->cost) {
+              chain->orig->orig = chain;
+              if (abs(best->diag - chain->diag) <=
+                  .2 * (chain->apos - best->apos)) {
+                del(chain, best);
+                best->bmin = -1;
+              }
+            }
+          } else {
+            chain->from = NULL;
+            chain->cost = Kmer;
+            chain->orig = chain;
+            chain->nuniq = (htier == 1);
+          }
+        }
+#endif
 
         chain->nxt = NULL;
         if (queue != NULL)
@@ -2391,7 +2575,7 @@ static void Fusion(Path* path1, int ap, Path* path2, Trace_Buffer* tbuf) {
 //    of alignment remaining.
 
 static int Handle_Redundancies(Overlap* amatch, int novls, Overlap* bmatch,
-                               Trace_Buffer* tbuf, int cm) {
+                               int* nuniq, Trace_Buffer* tbuf, int cm) {
   Path *jpath, *kpath;
   Path *jmath, *kmath;
   int j, k, no;
@@ -2448,6 +2632,10 @@ static int Handle_Redundancies(Overlap* amatch, int novls, Overlap* bmatch,
                 printf("  Really 3");
 #endif
               }
+              // Candidate-level nuniq can be repeated on local alignments from
+              // the same Candidate, so preserve the stronger value rather than
+              // summing and double-counting it.
+              if (nuniq[k] > nuniq[j]) nuniq[j] = nuniq[k];
               k = j;
             }
             kpath->abpos = -1;
@@ -2469,6 +2657,7 @@ static int Handle_Redundancies(Overlap* amatch, int novls, Overlap* bmatch,
               if (kpath->aepos > jpath->aepos) {
                 *jpath = *kpath;
                 if (hasB) *jmath = *kmath;
+                nuniq[j] = nuniq[k];
                 ;
               }
             } else if (jpath->aepos > kpath->aepos) {
@@ -2500,10 +2689,14 @@ static int Handle_Redundancies(Overlap* amatch, int novls, Overlap* bmatch,
                 printf("  Really 6");
 #endif
               }
+              // As above, a fused path keeps the stronger Candidate-level
+              // evidence without counting the same Candidate twice.
+              if (nuniq[k] > nuniq[j]) nuniq[j] = nuniq[k];
               k = j;
             } else {
               *jpath = *kpath;
               if (hasB) *jmath = *kmath;
+              nuniq[j] = nuniq[k];
             }
             kpath->abpos = -1;
 #ifdef TEST_CONTAIN
@@ -2520,7 +2713,9 @@ static int Handle_Redundancies(Overlap* amatch, int novls, Overlap* bmatch,
   for (j = 0; j < novls; j++)
     if (amatch[j].path.abpos >= 0) {
       if (hasB) bmatch[no] = bmatch[j];
-      amatch[no++] = amatch[j];
+      amatch[no] = amatch[j];
+      nuniq[no] = nuniq[j];
+      no += 1;
     }
   novls = no;
 
@@ -2672,6 +2867,7 @@ static void* report_thread(void* arg) {
   int novl, lovl;
   Overlap *amatch, *bmatch;
   int *match_nuniq;   //  copy-aware: per-overlap unique-seed evidence
+  int *sort_nuniq;    //  scratch used to keep nuniq paired through AMATCH_SORT
 
   int COmax;
   int nparts;
@@ -2718,12 +2914,14 @@ static void* report_thread(void* arg) {
   perm = Malloc(sizeof(Links*) * COmax, "Allocating permutation vector");
   part = Malloc(sizeof(Zones) * COmax, "Allocating zones vector");
   match_nuniq = Malloc(sizeof(int) * Omax, "Allocating copy-evidence vector");
+  sort_nuniq = Malloc(sizeof(int) * Omax, "Allocating copy-evidence sort scratch");
 
   tbuf->max = 2 * TRACE_CHUNK;
   tbuf->trace = Malloc(sizeof(short) * tbuf->max, "Allocating trace vector");
 
   if (amatch == NULL || bmatch == NULL || linker == NULL || perm == NULL ||
-      part == NULL || tbuf->trace == NULL || match_nuniq == NULL)
+      part == NULL || tbuf->trace == NULL || match_nuniq == NULL ||
+      sort_nuniq == NULL)
     Clean_Exit(1);
 
   cnt = data->cover;
@@ -2815,6 +3013,9 @@ static void* report_thread(void* arg) {
                 match_nuniq = Realloc(match_nuniq, sizeof(int) * Omax,
                                       "Reallocating copy-evidence vector");
                 if (match_nuniq == NULL) Clean_Exit(1);
+                sort_nuniq = Realloc(sort_nuniq, sizeof(int) * Omax,
+                                     "Reallocating copy-evidence sort scratch");
+                if (sort_nuniq == NULL) Clean_Exit(1);
                 if (MR_doB) {
                   bmatch = Realloc(bmatch, sizeof(Overlap) * Omax,
                                    "Reallocating match vector");
@@ -2875,14 +3076,38 @@ static void* report_thread(void* arg) {
         if (novl - lovl > 1) {
           if (MR_doB)
             novl = lovl + Handle_Redundancies(amatch + lovl, novl - lovl,
-                                              bmatch + lovl, tbuf, cm);
+                                              bmatch + lovl,
+                                              match_nuniq + lovl, tbuf, cm);
           else
             novl = lovl + Handle_Redundancies(amatch + lovl, novl - lovl, NULL,
-                                              tbuf, cm);
+                                              match_nuniq + lovl, tbuf, cm);
         }
 
         if (novl - lovl > 1) {
+          int z, nsort;
+
+          // Keep each nuniq value paired with its Overlap through the canonical
+          // qsort by storing the pre-sort slot temporarily in unused flag bits.
+          nsort = novl - lovl;
+          if (nsort > 0x00ffffff) {
+            fprintf(stderr, "%s: Too many alignments in one sort group\n",
+                    Prog_Name);
+            Clean_Exit(1);
+          }
+          for (z = 0; z < nsort; z++) {
+            sort_nuniq[z] = match_nuniq[lovl + z];
+            amatch[lovl + z].flags |= ((uint32)(z + 1) << 8);
+          }
           qsort(amatch + lovl, novl - lovl, sizeof(Overlap), AMATCH_SORT);
+          for (z = 0; z < nsort; z++) {
+            uint32 tag = amatch[lovl + z].flags >> 8;
+            if (tag == 0 || tag > (uint32)nsort) {
+              fprintf(stderr, "%s: Invalid nuniq sort tag\n", Prog_Name);
+              Clean_Exit(1);
+            }
+            match_nuniq[lovl + z] = sort_nuniq[tag - 1];
+            amatch[lovl + z].flags &= 0xff;
+          }
           if (MR_doB) {
             if (cm)
               qsort(bmatch + lovl, novl - lovl, sizeof(Overlap), BC_MATCH_SORT);
@@ -3169,6 +3394,7 @@ static void* report_thread(void* arg) {
   free(part);
   free(perm);
   free(linker);
+  free(sort_nuniq);
   free(match_nuniq);
   if (MR_doB) free(bmatch);
   free(amatch);

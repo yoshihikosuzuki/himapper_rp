@@ -15,12 +15,10 @@ DIP_MERYL="$D_READS/dip.meryl"
 DIP_REP="$D_READS/dip.repetitive.txt"
 READS_PAF="$D_READS/reads.map.paf"
 
-# Build repetitive k-mer list
 meryl count k=15 output "$DIP_MERYL" "$REF_ALL"
 meryl print greater-than distinct=0.9998 "$DIP_MERYL" > "$DIP_REP"
 
-# Map reads to diploid assembly
-winnowmap -I8G -W "$DIP_REP" -x map-pb -t"$THREADS" --secondary=no \
+winnowmap -I8G -W "$DIP_REP" -x map-pb -t"$THREADS" --secondary=no -c \
   "$REF_ALL" "$READS_ALL" > "$READS_PAF"
 
 # Select one chr6 mapping-truth locus per read
