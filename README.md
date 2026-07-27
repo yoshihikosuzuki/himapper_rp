@@ -2,6 +2,32 @@
 
 Fast, haplotype-aware HiFi read mapper using relative k-mer profiles.
 
+## Current workflow
+
+`minimaxmer` takes a whole, partitioned DAZZLER DB and creates one KPOS
+container plus its block-offset sidecar. DB blocks are processed in parallel
+with `-T`, while entries remain block-local and code-sorted within each block.
+
+```sh
+minimaxmer -T16 ref.dam ref.prof ref.reads.prof .ref.minimax.kpos
+minimaxmer -T16 reads.dam reads.ref.prof reads.prof .reads.minimax.kpos
+```
+
+These commands also create `.ref.minimax.kpos.idx` and
+`.reads.minimax.kpos.idx`.
+
+Map the whole reads DB in one process. HiMapper loads the reference KPOS once,
+then processes every reads DB block internally:
+
+```sh
+himapper -1 -T16 \
+  ref.dam .ref.minimax.kpos \
+  reads.dam .reads.minimax.kpos
+```
+
+A multi-block reads DB produces `reads.1.ref.las`,
+`reads.2.ref.las`, and so on. A single-block DB produces `reads.ref.las`.
+
 
 
 

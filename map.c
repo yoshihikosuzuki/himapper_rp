@@ -38,6 +38,7 @@
 //  Both sides tag the SAME matched k-mer with the SAME genome copy tier, so the two
 //  are equivalent when both are tagged; pick whichever side actually carries tiers.
 static int CN_TIER_SRC = 0;
+static uint64 FILTER_EXTRA_MEMORY = 0;
 
 //  CN_UNIQ_W: selection bonus per unique (copy-1) seed.  sel = score + CN_UNIQ_W*nuniq.
 //  0 => sel==score (no nuniq override; exact ties fall through to HASH_TIE).  ~2.3 => one
@@ -62,8 +63,8 @@ static int HASH_TIE = 1;
 
 // #define DEBUG_SEED_HIT      //  Print every seed hit: ref_id/pos,
 // read_id/pos, kmer string
-#define DEBUG_CANDIDATE_STATS  //  Print per-strand seed-hit distribution over
-                               //  reads
+// #define DEBUG_CANDIDATE_STATS  //  Print per-strand seed-hit distribution over
+                                  //  reads
 
 #define HITMIN 2  //  minimum # of k-mers in a potential seed
 
@@ -205,6 +206,10 @@ int Set_Filter_Params(int kmer, int suppress, int nthreads) {
   }
 
   return (0);
+}
+
+void Set_Filter_Extra_Memory(uint64 bytes) {
+  FILTER_EXTRA_MEMORY = bytes;
 }
 
 /*******************************************************************************************
@@ -373,7 +378,7 @@ static void* lex_thread(void* arg) {
 static Double* lex_sort(int bytes[16], Double* src, Double* trg,
                         Lex_Arg* parmx) {
   THREAD threads[NTHREADS];
-  int64 zthresh[NTHREADS];
+  int64 zthresh[NTHREADS + 1];
 
   int64 len, x, y;
   Double* xch;
@@ -388,6 +393,7 @@ static Double* lex_sort(int bytes[16], Double* src, Double* trg,
 
   z = (len - 1) / NTHREADS + 1;
   for (i = 0; i < NTHREADS; i++) zthresh[i] = (i + 1) * z;
+  zthresh[NTHREADS] = len + 1;
   LEX_zthresh = zthresh;
 
   for (c = 0; c < 16; c++)
@@ -858,12 +864,7 @@ no_mers:
 
 /*******************************************************************************************
  *
- *  LOAD PRE-COMPUTED KPOS INDEX
- *
- *  Read a .kpos file produced by modimizer and return a KmerPos array sorted
- *  by code, with two sentinel entries appended — exactly the same contract as
- *  Sort_Kmers.  If comp != 0 each code is replaced by its reverse-complement
- *  2-bit representation before sorting (for RC-strand seed matching).
+ *  LOAD BLOCK-INDEXED KPOS CONTAINER
  *
  ********************************************************************************************/
 
@@ -875,72 +876,171 @@ static int cmp_kmerpos(const void* a, const void* b) {
   return (0);
 }
 
-void* Load_Kpos(const char* path, int comp, DAZZ_DB* block, int* len) {
-  FILE* f;
+struct Kpos_Index {
+  FILE* data;
+  uint64* offset;
+  uint64 total;
+  int nblocks;
+  char* path;
+};
+
+Kpos_Index* Open_Kpos_Index(const char* path, int nblocks) {
+  Kpos_Index* index;
+  FILE* data;
+  FILE* idx;
+  char* idx_path;
+  size_t path_len;
   uint8_t ver, flags, idx_bytes, reserved;
   int32_t kval, entry_size;
-  uint64 n_entries;
-  KmerPos* arr;
-  uint64 i;
+  uint64 total;
+  int b;
   char magic[4];
 
-  f = fopen(path, "rb");
-  if (f == NULL) {
+  data = fopen(path, "rb");
+  if (data == NULL) {
     fprintf(stderr, "%s: Cannot open kpos file %s\n", Prog_Name, path);
     Clean_Exit(1);
   }
 
-  if (fread(magic, 4, 1, f) != 1 || fread(&ver, 1, 1, f) != 1 ||
-      fread(&flags, 1, 1, f) != 1 || fread(&idx_bytes, 1, 1, f) != 1 ||
-      fread(&reserved, 1, 1, f) != 1 ||
-      fread(&kval, sizeof(int32_t), 1, f) != 1 ||
-      fread(&entry_size, sizeof(int32_t), 1, f) != 1 ||
-      fread(&n_entries, sizeof(uint64), 1, f) != 1) {
+  if (fread(magic, 4, 1, data) != 1 || fread(&ver, 1, 1, data) != 1 ||
+      fread(&flags, 1, 1, data) != 1 ||
+      fread(&idx_bytes, 1, 1, data) != 1 ||
+      fread(&reserved, 1, 1, data) != 1 ||
+      fread(&kval, sizeof(int32_t), 1, data) != 1 ||
+      fread(&entry_size, sizeof(int32_t), 1, data) != 1 ||
+      fread(&total, sizeof(uint64), 1, data) != 1) {
     fprintf(stderr, "%s: Failed to read header of %s\n", Prog_Name, path);
-    fclose(f);
+    fclose(data);
     Clean_Exit(1);
   }
 
   if (magic[0] != 'K' || magic[1] != 'P' || magic[2] != 'O' ||
-      magic[3] != 'S') {
-    fprintf(stderr, "%s: Bad magic in kpos file %s\n", Prog_Name, path);
-    fclose(f);
+      magic[3] != 'S' || ver != 2 || idx_bytes != sizeof(uint64) ||
+      entry_size != (int32_t)sizeof(KmerPos)) {
+    fprintf(stderr, "%s: Unsupported kpos format in %s\n", Prog_Name, path);
+    fclose(data);
     Clean_Exit(1);
   }
 
   if (kval != Kmer) {
     fprintf(stderr, "%s: kpos K=%d but filter K=%d\n", Prog_Name, kval, Kmer);
-    fclose(f);
+    fclose(data);
     Clean_Exit(1);
   }
 
+  path_len = strlen(path);
+  idx_path = (char*)Malloc(path_len + 5, "Allocating kpos index path");
+  sprintf(idx_path, "%s.idx", path);
+  idx = fopen(idx_path, "rb");
+  if (idx == NULL) {
+    fprintf(stderr, "%s: Cannot open kpos index %s\n", Prog_Name, idx_path);
+    free(idx_path);
+    fclose(data);
+    Clean_Exit(1);
+  }
+
+  index = (Kpos_Index*)Malloc(sizeof(Kpos_Index), "Allocating kpos index");
+  if (index == NULL) {
+    free(idx_path);
+    fclose(idx);
+    fclose(data);
+    Clean_Exit(1);
+  }
+  index->offset =
+      (uint64*)Malloc(sizeof(uint64) * (nblocks + 1), "Loading kpos offsets");
+  if (index->offset == NULL) {
+    free(idx_path);
+    fclose(idx);
+    fclose(data);
+    Clean_Exit(1);
+  }
+  if (fread(index->offset, sizeof(uint64), (size_t)nblocks + 1, idx) !=
+      (size_t)nblocks + 1) {
+    fprintf(stderr, "%s: Failed to read block offsets from %s\n", Prog_Name,
+            idx_path);
+    free(index->offset);
+    free(index);
+    free(idx_path);
+    fclose(idx);
+    fclose(data);
+    Clean_Exit(1);
+  }
+  fclose(idx);
+  free(idx_path);
+
+  if (index->offset[0] != 0 || index->offset[nblocks] != total) {
+    fprintf(stderr, "%s: Kpos data/index totals disagree for %s\n", Prog_Name,
+            path);
+    free(index->offset);
+    free(index);
+    fclose(data);
+    Clean_Exit(1);
+  }
+  for (b = 0; b < nblocks; b++)
+    if (index->offset[b] > index->offset[b + 1]) {
+      fprintf(stderr, "%s: Kpos block offsets are not monotone in %s\n",
+              Prog_Name, path);
+      free(index->offset);
+      free(index);
+      fclose(data);
+      Clean_Exit(1);
+    }
+
+  index->data = data;
+  index->total = total;
+  index->nblocks = nblocks;
+  index->path = (char*)Malloc(strlen(path) + 1, "Saving kpos path");
+  strcpy(index->path, path);
+  return (index);
+}
+
+void Close_Kpos_Index(Kpos_Index* index) {
+  if (index == NULL) return;
+  fclose(index->data);
+  free(index->offset);
+  free(index->path);
+  free(index);
+}
+
+void* Load_Kpos_Block(Kpos_Index* index, int block_no, int comp,
+                      DAZZ_DB* block, int* len) {
+  KmerPos* arr;
+  uint64 first, n_entries, i;
+  off_t byte_offset;
+
+  if (block_no < 1 || block_no > index->nblocks) {
+    fprintf(stderr, "%s: Kpos block %d is outside 1-%d in %s\n", Prog_Name,
+            block_no, index->nblocks, index->path);
+    Clean_Exit(1);
+  }
+
+  first = index->offset[block_no - 1];
+  n_entries = index->offset[block_no] - first;
+  if (n_entries > INT32_MAX) {
+    fprintf(stderr, "%s: Kpos block %d has too many entries in %s\n", Prog_Name,
+            block_no, index->path);
+    Clean_Exit(1);
+  }
   if (n_entries == 0) {
-    fclose(f);
     *len = 0;
     return (NULL);
   }
 
-  // KmerPos { uint64 code; int rpos; int read; } is binary-compatible with
-  // the modimizer entry { uint64_t code; int32_t rpos; int32_t rid; }.
   arr = (KmerPos*)Malloc(sizeof(KmerPos) * (n_entries + 2),
-                         "Allocating Load_Kpos array");
-  if (arr == NULL) {
-    fclose(f);
-    Clean_Exit(1);
-  }
-
-  if (fread(arr, sizeof(KmerPos), (size_t)n_entries, f) != (size_t)n_entries) {
-    fprintf(stderr, "%s: Failed to read all entries from %s\n", Prog_Name,
-            path);
+                         "Allocating Kpos block");
+  byte_offset = (off_t)(24 + first * sizeof(KmerPos));
+  if (fseeko(index->data, byte_offset, SEEK_SET) != 0 ||
+      fread(arr, sizeof(KmerPos), (size_t)n_entries, index->data) !=
+          (size_t)n_entries) {
+    fprintf(stderr, "%s: Failed to read block %d from %s\n", Prog_Name,
+            block_no, index->path);
     free(arr);
-    fclose(f);
     Clean_Exit(1);
   }
-  fclose(f);
 
   if (comp) {  // Replace each forward code with its reverse-complement 2-bit
                // code.
-    // Also convert rpos from modimizer's start-of-kmer convention to
+    // Also convert rpos from minimaxmer's start-of-kmer convention to
     // tuple_thread's last-base convention in the RC sequence:
     //   rpos_RC = rlen - 1 - rpos_start
     // Derivation: forward k-mer at start s occupies [s, s+K-1].
@@ -1000,14 +1100,16 @@ void* Load_Kpos(const char* path, int comp, DAZZ_DB* block, int* len) {
       arr[i].rpos += (Kmer - 1);
   }
 
-  qsort(arr, (size_t)n_entries, sizeof(KmerPos), cmp_kmerpos);
+  if (comp)
+    qsort(arr, (size_t)n_entries, sizeof(KmerPos), cmp_kmerpos);
 
   arr[n_entries].code = 0xffffffffffffffffllu;
   arr[n_entries + 1].code = 0;
 
   if (VERBOSE) {
-    printf("   Loaded %llu %sk-mers from %s\n", (unsigned long long)n_entries,
-           comp ? "RC " : "", path);
+    printf("   Loaded %llu %sk-mers from %s block %d\n",
+           (unsigned long long)n_entries, comp ? "RC " : "", index->path,
+           block_no);
     fflush(stdout);
   }
 
@@ -3103,6 +3205,42 @@ static Report_Arg* parmr;
 static int tfilt;
 static int firstime = 1;
 
+static void ensure_report_args(void)
+{
+  int i;
+
+  if (!firstime)
+    return;
+
+  firstime = 0;
+  parmr = (Report_Arg*)Malloc(sizeof(Report_Arg) * NTHREADS,
+                              "Allocating chain thread records");
+  for (i = 0; i < NTHREADS; i++) {
+    parmr[i].cbase = NULL;
+    parmr[i].cmax = 0;
+    parmr[i].jbase = NULL;
+    parmr[i].jmax = 0;
+    parmr[i].comax = 0;
+    parmr[i].cover = NULL;
+  }
+}
+
+void Begin_Mapping_Block(DAZZ_DB* block)
+{
+  int i;
+
+  ensure_report_args();
+  tfilt = 0;
+  for (i = 0; i < NTHREADS; i++) {
+    parmr[i].abeg =
+        (int)((((int64)block->nreads) * i) >> NSHIFT);
+    parmr[i].aend =
+        (int)((((int64)block->nreads) * (i + 1)) >> NSHIFT);
+  }
+  for (i = 0; i < block->nreads; i++)
+    block->reads[i].coff = -1;
+}
+
 void Match_Filter(DAZZ_DB* ablock, DAZZ_DB* bblock, void* vasort, int alen,
                   void* vbsort, int blen, int comp, int start)
 
@@ -3125,6 +3263,8 @@ void Match_Filter(DAZZ_DB* ablock, DAZZ_DB* bblock, void* vasort, int alen,
 
   atot = ablock->totlen;
   btot = bblock->totlen;
+  if (start)
+    tfilt = 0;
 
   //  Inside Match_Filter ablock is the READS.  apos must stay below CN_MAXLEN so
   //  its copy-tier bits never enter the radix sort key.
@@ -3163,20 +3303,7 @@ void Match_Filter(DAZZ_DB* ablock, DAZZ_DB* bblock, void* vasort, int alen,
     for (i = 12; i < 12 + nbyte; i++) pairsort[i] = 1;
   }
 
-  if (firstime) {
-    int i;
-
-    firstime = 0;
-    parmr = (Report_Arg*)Malloc(sizeof(Report_Arg) * NTHREADS,
-                                "Allocating chain thread records");
-    for (i = 0; i < NTHREADS; i++) {
-      parmr[i].cmax = 0;
-      parmr[i].jmax = 0;
-      parmr[i].comax = 0;
-      parmr[i].cover = NULL;
-    }
-    tfilt = 0;
-  }
+  ensure_report_args();
 
   nfilt = nhits = 0;
 
@@ -3214,20 +3341,24 @@ void Match_Filter(DAZZ_DB* ablock, DAZZ_DB* bblock, void* vasort, int alen,
     for (i = 0; i < NTHREADS; i++) pthread_join(threads[i], NULL);
 
     if (VERBOSE) printf("\n");
+    limit = MAXGRAM;
     if (MEM_LIMIT > 0) {
       int64 histo[MAXGRAM];
       int64 tom, avail;
+      uint64 resident;
 
       for (j = 0; j < MAXGRAM; j++) histo[j] = parmm[0].hitgram[j];
       for (i = 1; i < NTHREADS; i++)
         for (j = 0; j < MAXGRAM; j++) histo[j] += parmm[i].hitgram[j];
 
-      avail = (int64)(MEM_LIMIT - (sizeof_DB(ablock) + sizeof_DB(bblock))) /
-              sizeof(Double);
-      if (avail > alen + 2 * blen)
-        avail = (avail - alen) / 2;
+      resident =
+          FILTER_EXTRA_MEMORY + sizeof_DB(ablock) + sizeof_DB(bblock);
+      if (resident >= MEM_LIMIT)
+        avail = 0;
       else
-        avail = avail - (alen + blen);
+        avail = (int64)(MEM_LIMIT - resident) / sizeof(Double);
+      avail = (avail - alen - blen) / 2;
+      if (avail < 0) avail = 0;
       avail *= .98;
 
       tom = 0;
@@ -3262,19 +3393,18 @@ void Match_Filter(DAZZ_DB* ablock, DAZZ_DB* bblock, void* vasort, int alen,
         }
         fflush(stderr);
       }
-      if (VERBOSE) {
-        printf("   Capping mutual k-mer matches over %d (effectively -t%d)\n",
-               limit, (int)sqrt(1. * limit));
-        fflush(stdout);
-      }
-
-      for (i = 0; i < NTHREADS; i++) {
-        parmm[i].nhits = 0;
-        for (j = 1; j < limit; j++) parmm[i].nhits += j * parmm[i].hitgram[j];
-        parmm[i].limit = limit;
-      }
-    } else
-      for (i = 0; i < NTHREADS; i++) parmm[i].limit = INT32_MAX;
+    }
+    if (VERBOSE) {
+      printf("   Capping mutual k-mer matches over %d (effectively -t%d)\n",
+             limit, (int)sqrt(1. * limit));
+      fflush(stdout);
+    }
+    for (i = 0; i < NTHREADS; i++) {
+      parmm[i].nhits = 0;
+      for (j = 1; j < limit; j++)
+        parmm[i].nhits += j * parmm[i].hitgram[j];
+      parmm[i].limit = limit;
+    }
 
     nhits = parmm[0].nhits;
     for (i = 1; i < NTHREADS; i++) parmm[i].nhits = nhits += parmm[i].nhits;
@@ -3282,22 +3412,16 @@ void Match_Filter(DAZZ_DB* ablock, DAZZ_DB* bblock, void* vasort, int alen,
     if (VERBOSE) {
       printf("   Hit count = ");
       Print_Number(nhits, 0, stdout);
-      if (nhits >= blen)
-        printf("\n   Highwater of %.2fGb space\n",
-               (1. * (alen + 2 * nhits)) / 67108864);
-      else
-        printf("\n   Highwater of %.2fGb space\n",
-               (1. * (alen + blen + nhits)) / 67108864);
+      printf("\n   Highwater of %.2fGb index/hit space\n",
+             (1. * (alen + blen + 2 * nhits)) / 67108864);
       fflush(stdout);
     }
 
-    if (nhits >= blen)
-      bsort = (KmerPos*)Realloc(bsort, sizeof(SeedPair) * (nhits + 1),
-                                "Reallocating damapper sort vectors");
-    hhit = work1 = (SeedPair*)bsort;
+    hhit = work1 = (SeedPair*)Malloc(sizeof(SeedPair) * (nhits + 1),
+                                     "Allocating damapper hit vectors");
     khit = work2 = (SeedPair*)Malloc(sizeof(SeedPair) * (nhits + 1),
                                      "Allocating damapper hit vectors");
-    if (hhit == NULL || khit == NULL || bsort == NULL) Clean_Exit(1);
+    if (hhit == NULL || khit == NULL) Clean_Exit(1);
 
     MG_blist = bsort;
     MG_hits = khit;

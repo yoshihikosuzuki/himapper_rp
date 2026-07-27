@@ -1,4 +1,5 @@
 #include <stdbool.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -28,13 +29,56 @@ static const uint8_t base2bit[128] = {
 // known (K is capped at 32, so K==32 gives the full uint64 mask).
 static uint64_t KMASK;
 
+typedef struct
+  { uint64_t code;
+    int32_t  rpos;
+    uint32_t rid;
+  } KposEntry;
+
+typedef char KposEntry_must_be_16_bytes[(sizeof(KposEntry) == 16) ? 1 : -1];
+
+typedef struct
+  { KposEntry *entry;
+    size_t     len;
+    size_t     cap;
+  } KposVector;
+
+static void push_kpos(KposVector *vector, uint64_t code, int32_t rpos, uint32_t rid)
+{
+  if (vector->len == vector->cap)
+    { size_t next = vector->cap == 0 ? 65536 : 2 * vector->cap;
+      KposEntry *entry =
+          (KposEntry *)realloc(vector->entry, next * sizeof(KposEntry));
+      if (entry == NULL)
+        { perror("realloc KPOS block");
+          exit(1);
+        }
+      vector->entry = entry;
+      vector->cap   = next;
+    }
+
+  vector->entry[vector->len].code = code;
+  vector->entry[vector->len].rpos = rpos;
+  vector->entry[vector->len].rid  = rid;
+  vector->len += 1;
+}
+
+static int cmp_kpos(const void *a, const void *b)
+{
+  const KposEntry *ka = (const KposEntry *)a;
+  const KposEntry *kb = (const KposEntry *)b;
+
+  if (ka->code < kb->code) return -1;
+  if (ka->code > kb->code) return 1;
+  return 0;
+}
+
 static int write_kpos_header(FILE *out)
 {
   char magic[4] = {'K', 'P', 'O', 'S'};
-  uint8_t ver = 1, flags = 0, idx_bytes = 0, reserved = 0;
+  uint8_t ver = 2, flags = 0, idx_bytes = sizeof(uint64_t), reserved = 0;
   int32_t Kval = K;
-  int32_t entry_size =
-      (int32_t)(sizeof(uint64_t) + sizeof(int32_t) + sizeof(uint32_t));
+  int32_t entry_size = (int32_t)sizeof(KposEntry);
   uint64_t n_entries = 0;
 
   if (fwrite(magic, 4, 1, out) != 1 ||
@@ -57,31 +101,6 @@ static int finish_kpos(FILE *out, uint64_t n_entries)
     return -1;
 
   return 0;
-}
-
-static char *block_output_path(const char *template, int block)
-{
-  const char *at = strchr(template, '#');
-  char block_buf[32];
-  size_t prefix_len, suffix_len, path_len;
-  char *path;
-
-  if (at == NULL || strchr(at + 1, '#') != NULL)
-    return NULL;
-
-  snprintf(block_buf, sizeof(block_buf), "%d", block);
-  prefix_len = (size_t)(at - template);
-  suffix_len = strlen(at + 1);
-  path_len = prefix_len + strlen(block_buf) + suffix_len;
-  path = (char *)malloc(path_len + 1);
-  if (path == NULL)
-    return NULL;
-
-  memcpy(path, template, prefix_len);
-  memcpy(path + prefix_len, block_buf, strlen(block_buf));
-  memcpy(path + prefix_len + strlen(block_buf),
-         at + 1, suffix_len + 1);
-  return path;
 }
 
 // Compare (ca_g, ca_r, ha) < (cb_g, cb_r, hb):
@@ -136,16 +155,16 @@ static int cand_cmp(const void *a, const void *b)
 //   prof_genome – FastK uint16 genome k-mer counts, positions 0..plen-1
 //   prof_reads  – FastK uint16 reads  k-mer counts, positions 0..plen-1
 //   read_id     – 0-based read index
-//   out         – binary output file
+//   out         – block-local KPOS vector
 //
-// Returns the number of entries written.
+// Returns the number of entries appended.
 int find_seeds(const char    *seq,
                const int      plen,
                const int      K,
                const uint16  *prof_genome,
                const uint16  *prof_reads,
                const int      read_id,
-               FILE          *out)
+               KposVector    *out)
 {
   if (plen <= 0) return 0;
 
@@ -294,7 +313,7 @@ int find_seeds(const char    *seq,
     }
 #endif
 
-  // Step 4: write selected seeds.
+  // Step 4: append selected seeds to this block's KPOS run.
   int written = 0;
   for (int i = 0; i < plen; i++)
     { if (!is_seed[i]) continue;
@@ -308,9 +327,7 @@ int find_seeds(const char    *seq,
       // the low 29 bits stay ref/read id. Strip the tier with CN_VAL wherever it needs the id.
       // read_id < CN_MAXVAL (2^29) is enforced in main(), so we pack unconditionally.
       uint32_t rid = CN_PACK(read_id, cn_tier_of(prof_genome[i]));
-      fwrite(&c,    sizeof(uint64_t), 1, out);
-      fwrite(&rpos, sizeof(int32_t),  1, out);
-      fwrite(&rid,  sizeof(uint32_t), 1, out);
+      push_kpos(out, c, rpos, rid);
       written++;
     }
 
@@ -321,8 +338,165 @@ int find_seeds(const char    *seq,
   return written;
 }
 
+typedef struct
+  { KposEntry *entry;
+    size_t     len;
+    int        ready;
+  } BlockResult;
+
+typedef struct
+  { DAZZ_DB       *db;
+    DAZZ_STUB     *stub;
+    Profile_Index *genome;
+    Profile_Index *reads;
+    BlockResult   *result;
+    int            next_block;
+    pthread_mutex_t lock;
+    pthread_cond_t  ready;
+    pthread_cond_t  consumed;
+  } WorkQueue;
+
+static void grow_profiles(int need, int *capacity,
+                          uint16 **prof_genome, uint16 **prof_reads)
+{
+  int next = (int)(1.2 * need) + 1000;
+  uint16 *genome =
+      (uint16 *)realloc(*prof_genome, (size_t)next * sizeof(uint16));
+  uint16 *reads =
+      (uint16 *)realloc(*prof_reads, (size_t)next * sizeof(uint16));
+
+  if (genome == NULL || reads == NULL)
+    { perror("realloc profile");
+      exit(1);
+    }
+  *prof_genome = genome;
+  *prof_reads  = reads;
+  *capacity    = next;
+}
+
+static FILE *open_worker_bases(const DAZZ_DB *db)
+{
+  size_t len = strlen(db->path);
+  char *path = (char *)malloc(len + 5);
+  FILE *bases;
+
+  if (path == NULL)
+    { perror("malloc .bps path");
+      exit(1);
+    }
+  snprintf(path, len + 5, "%s.bps", db->path);
+  bases = fopen(path, "rb");
+  if (bases == NULL)
+    { perror(path);
+      free(path);
+      exit(1);
+    }
+  free(path);
+  return bases;
+}
+
+static void *seed_worker(void *arg)
+{
+  WorkQueue *queue = (WorkQueue *)arg;
+  DAZZ_DB db = *queue->db;
+  Profile_Index *Pg = Clone_Profiles(queue->genome);
+  Profile_Index *Pr = Clone_Profiles(queue->reads);
+  char *seq;
+  uint16 *prof_genome;
+  uint16 *prof_reads;
+  int pmax = 20000;
+  KposVector vector = {NULL, 0, 0};
+
+  db.bases = open_worker_bases(queue->db);
+  seq = New_Read_Buffer(&db);
+  prof_genome = (uint16 *)malloc((size_t)pmax * sizeof(uint16));
+  prof_reads  = (uint16 *)malloc((size_t)pmax * sizeof(uint16));
+  if (prof_genome == NULL || prof_reads == NULL)
+    { perror("malloc profile");
+      exit(1);
+    }
+
+  while (1)
+    { int block;
+      int first, last, id;
+      BlockResult *result;
+
+      pthread_mutex_lock(&queue->lock);
+      block = queue->next_block++;
+      pthread_mutex_unlock(&queue->lock);
+      if (block >= queue->stub->nblocks)
+        break;
+
+      first = queue->stub->ublocks[block];
+      last  = queue->stub->ublocks[block + 1];
+      vector.len = 0;
+
+      for (id = first; id < last; id++)
+        { DAZZ_READ *r = db.reads + id;
+          int plen = r->rlen - K + 1;
+          int64 fetched;
+
+          Load_Read(&db, id, seq, 2);
+
+          fetched = Fetch_Profile(Pg, (int64)id, pmax, prof_genome);
+          if (fetched > pmax)
+            { grow_profiles((int)fetched, &pmax, &prof_genome, &prof_reads);
+              Fetch_Profile(Pg, (int64)id, pmax, prof_genome);
+            }
+
+          fetched = Fetch_Profile(Pr, (int64)id, pmax, prof_reads);
+          if (fetched > pmax)
+            { grow_profiles((int)fetched, &pmax, &prof_genome, &prof_reads);
+              Fetch_Profile(Pr, (int64)id, pmax, prof_reads);
+            }
+
+          if (plen > 0)
+            find_seeds(seq + K - 1, plen, K, prof_genome, prof_reads,
+                       id - first, &vector);
+        }
+
+      if (vector.len > 1)
+        qsort(vector.entry, vector.len, sizeof(KposEntry), cmp_kpos);
+
+      result = queue->result + block;
+      pthread_mutex_lock(&queue->lock);
+      result->entry = vector.entry;
+      result->len   = vector.len;
+      result->ready = 1;
+      pthread_cond_broadcast(&queue->ready);
+      while (result->ready)
+        pthread_cond_wait(&queue->consumed, &queue->lock);
+      pthread_mutex_unlock(&queue->lock);
+    }
+
+  free(vector.entry);
+  free(prof_genome);
+  free(prof_reads);
+  free(seq - 1);
+  fclose((FILE *)db.bases);
+  Free_Profiles(Pg);
+  Free_Profiles(Pr);
+  return NULL;
+}
+
+static char *add_suffix(const char *path, const char *suffix)
+{
+  size_t plen = strlen(path);
+  size_t slen = strlen(suffix);
+  char *result = (char *)malloc(plen + slen + 1);
+
+  if (result == NULL)
+    { perror("malloc output path");
+      exit(1);
+    }
+  memcpy(result, path, plen);
+  memcpy(result + plen, suffix, slen + 1);
+  return result;
+}
+
 int main(int argc, char *argv[]) {
   DAZZ_DB _db, *db = &_db;
+  int NTHREADS = 1;
   // Optional flags precede the 4 positional args.
   { int i, j = 1;
     for (i = 1; i < argc; i++) {
@@ -331,6 +505,7 @@ int main(int argc, char *argv[]) {
           case 'k': K      = atoi(argv[i]+2); break;
           case 'w': WSIZE  = atoi(argv[i]+2); break;
           case 's': RSPACE = atoi(argv[i]+2); break;
+          case 'T': NTHREADS = atoi(argv[i]+2); break;
           default:
             fprintf(stderr, "%s: unknown option '%s'\n", argv[0], argv[i]);
             return 1;
@@ -340,35 +515,23 @@ int main(int argc, char *argv[]) {
     }
     argc = j;
   }
-  if (argc != 5 || WSIZE < 1 || RSPACE < 0) {
-    fprintf(stderr, "Usage: %s [-k<32>] [-w<100>] [-s<100>] <db> <ref.prof> <ref.reads.prof> <output-template>\n", argv[0]);
+  if (argc != 5 || K < 1 || K > 32 || WSIZE < 1 || RSPACE < 0 ||
+      NTHREADS < 1) {
+    fprintf(stderr, "Usage: %s [-T<int>] [-k<32>] [-w<100>] [-s<100>] <db> <ref.prof> <ref.reads.prof> <out.kpos>\n", argv[0]);
+    fprintf(stderr, "  -T<N>           : number of DB blocks processed in parallel (default 1)\n");
     fprintf(stderr, "  -k<N>           : k-mer length (<= 32)\n");
     fprintf(stderr, "  -w<N>           : minimizer window width  (larger => sparser seeds)\n");
     fprintf(stderr, "  -s<N>           : min spacing of uniform sparse seeds (larger => sparser)\n");
     fprintf(stderr, "  <db>            : whole, partitioned DAZZ reference dam/db\n");
     fprintf(stderr, "  <ref.prof>      : FastK genome k-mer count profile\n");
     fprintf(stderr, "  <ref.reads.prof>: FastK reads  k-mer count profile\n");
-    fprintf(stderr, "  <output-template>: block-local KPOS paths; must contain exactly one '#'\n");
-    fprintf(stderr, "                     (for example .reads.#.minimax.kpos)\n");
+    fprintf(stderr, "  <out.kpos>      : block-indexed KPOS container; <out.kpos>.idx is also written\n");
     return 1;
   }
-  if (K > 32) {
-    fprintf(stderr, "%s: K=%d out of range; K must <= 32\n", argv[0], K);
-    return 1;
-  }
-  int Km1 = K - 1;
   KMASK = (K >= 32) ? UINT64_MAX : ((UINT64_C(1) << (2 * K)) - 1);
   int db_type = Open_DB(argv[1], db);
   if (db_type < 0)
     return 1;
-  // The copy-tier occupies the rid's top 3 bits (bits 29..31), so the contig/read id must
-  // fit in the low 29 bits.  A larger DB would overflow the id into the tier bits and make
-  // himapper mis-identify reads — fail loudly rather than emit a corrupt .kpos.
-  if (db->nreads > (int) CN_MAXVAL) {
-    fprintf(stderr, "%s: %d reads/contigs exceeds the copy-tier rid limit (2^29)\n",
-            argv[0], db->nreads);
-    return 1;
-  }
 
   // Open genome profile (argv[2]).
   Profile_Index *Pg = Open_Profiles(argv[2]);
@@ -410,19 +573,12 @@ int main(int argc, char *argv[]) {
     size_t stub_suffix_len;
     int has_stub_suffix;
     int b;
-    const char *output_token = strchr(argv[4], '#');
 
     if (db->part != 0)
       { fprintf(stderr, "%s: requires a whole DB, not block %d\n",
                 argv[0], db->part);
         Free_Profiles(Pg); Free_Profiles(Pr);
-        return 1;
-      }
-    if (output_token == NULL || strchr(output_token + 1, '#') != NULL)
-      { fprintf(stderr,
-                "%s: output template must contain exactly one '#': %s\n",
-                argv[0], argv[4]);
-        Free_Profiles(Pg); Free_Profiles(Pr);
+        Close_DB(db);
         return 1;
       }
 
@@ -440,6 +596,7 @@ int main(int argc, char *argv[]) {
     if (stub_path == NULL)
       { perror("malloc DB stub path");
         Free_Profiles(Pg); Free_Profiles(Pr);
+        Close_DB(db);
         return 1;
       }
     snprintf(stub_path, stub_path_len, "%s%s", argv[1],
@@ -450,6 +607,7 @@ int main(int argc, char *argv[]) {
       { fprintf(stderr, "%s: requires a partitioned DB\n", argv[0]);
         if (stub != NULL) Free_DB_Stub(stub);
         Free_Profiles(Pg); Free_Profiles(Pr);
+        Close_DB(db);
         return 1;
       }
     if (stub->ublocks[0] != 0 ||
@@ -459,6 +617,7 @@ int main(int argc, char *argv[]) {
                 argv[0], db->nreads);
         Free_DB_Stub(stub);
         Free_Profiles(Pg); Free_Profiles(Pr);
+        Close_DB(db);
         return 1;
       }
     for (b = 0; b <= stub->nblocks; b++)
@@ -468,94 +627,140 @@ int main(int argc, char *argv[]) {
                   argv[0]);
           Free_DB_Stub(stub);
           Free_Profiles(Pg); Free_Profiles(Pr);
+          Close_DB(db);
+          return 1;
+        }
+    for (b = 0; b < stub->nblocks; b++)
+      if ((uint64_t)(stub->ublocks[b + 1] - stub->ublocks[b]) > CN_MAXVAL)
+        { fprintf(stderr,
+                  "%s: block %d exceeds the copy-tier rid limit (2^29 reads)\n",
+                  argv[0], b + 1);
+          Free_DB_Stub(stub);
+          Free_Profiles(Pg); Free_Profiles(Pr);
+          Close_DB(db);
           return 1;
         }
   }
 
-  int     pmax       = 20000;
-  uint16 *prof_genome = (uint16 *) malloc((size_t)pmax * sizeof(uint16));
-  uint16 *prof_reads  = (uint16 *) malloc((size_t)pmax * sizeof(uint16));
-  if (!prof_genome || !prof_reads) { perror("malloc profile"); return 1; }
-
   {
-    char *seq = New_Read_Buffer(db);
+    const char *output_path = argv[4];
+    char *index_path = add_suffix(output_path, ".idx");
+    char *output_tmp = add_suffix(output_path, ".tmp");
+    char *index_tmp = add_suffix(index_path, ".tmp");
+    FILE *out = fopen(output_tmp, "wb");
+    FILE *idx;
+    WorkQueue queue;
+    BlockResult *result;
+    pthread_t *thread;
     uint64_t total_written = 0;
-    int noutputs = stub->nblocks;
-    int output;
+    int b, t;
 
-    for (output = 0; output < noutputs; output++)
-      { int first = stub->ublocks[output];
-        int last = stub->ublocks[output + 1];
-        char *generated_path = block_output_path(argv[4], output + 1);
-        const char *output_path = generated_path;
-        uint64_t output_written = 0;
-        FILE *out;
-        int id;
-
-        if (output_path == NULL)
-          { fprintf(stderr, "%s: cannot construct block output path\n", argv[0]);
-            exit(1);
-          }
-        out = fopen(output_path, "wb");
-        if (out == NULL)
-          { perror(output_path);
-            free(generated_path);
-            exit(1);
-          }
-        if (write_kpos_header(out) != 0)
-          { fprintf(stderr, "%s: failed to write KPOS header to %s\n",
-                    argv[0], output_path);
-            fclose(out);
-            free(generated_path);
-            exit(1);
-          }
-
-        for (id = first; id < last; id++)
-          { DAZZ_READ *r = db->reads + id;
-            int rlen = r->rlen;
-            int plen = rlen - Km1;
-            int output_read_id = id - first;
-
-            Load_Read(db, id, seq, 2);
-
-            // Profiles are indexed by the whole-DB read id; KPOS ids are block-local.
-            int fetched = Fetch_Profile(Pg, (int64)id, pmax, prof_genome);
-            if (fetched > pmax)
-              { pmax       = (int)(1.2 * fetched) + 1000;
-                prof_genome = (uint16 *) realloc(prof_genome, (size_t)pmax * sizeof(uint16));
-                prof_reads  = (uint16 *) realloc(prof_reads,  (size_t)pmax * sizeof(uint16));
-                if (!prof_genome || !prof_reads) { perror("realloc profile"); exit(1); }
-                Fetch_Profile(Pg, (int64)id, pmax, prof_genome);
-              }
-
-            Fetch_Profile(Pr, (int64)id, pmax, prof_reads);
-
-            int written = find_seeds(seq + Km1, plen, K, prof_genome,
-                                     prof_reads, output_read_id, out);
-            output_written += (uint64_t)written;
-          }
-
-        if (finish_kpos(out, output_written) != 0 || fclose(out) != 0)
-          { fprintf(stderr, "%s: failed to finalize %s\n", argv[0], output_path);
-            free(generated_path);
-            exit(1);
-          }
-        fprintf(stderr, "Block %d seeds written: %llu (%s)\n",
-                output + 1, (unsigned long long)output_written, output_path);
-        total_written += output_written;
-        free(generated_path);
+    if (out == NULL)
+      { perror(output_tmp);
+        exit(1);
+      }
+    idx = fopen(index_tmp, "wb");
+    if (idx == NULL)
+      { perror(index_tmp);
+        exit(1);
+      }
+    if (write_kpos_header(out) != 0 ||
+        fwrite(&total_written, sizeof(uint64_t), 1, idx) != 1)
+      { fprintf(stderr, "%s: failed to initialize KPOS output\n", argv[0]);
+        exit(1);
       }
 
-    fprintf(stderr, "Seeds written: %llu\n", (unsigned long long)total_written);
+    if (NTHREADS > stub->nblocks)
+      NTHREADS = stub->nblocks;
+    result = (BlockResult *)calloc((size_t)stub->nblocks,
+                                    sizeof(BlockResult));
+    thread = (pthread_t *)malloc((size_t)NTHREADS * sizeof(pthread_t));
+    if (result == NULL || thread == NULL)
+      { perror("malloc minimaxmer workers");
+        exit(1);
+      }
 
-    free(seq-1);
+    queue.db         = db;
+    queue.stub       = stub;
+    queue.genome     = Pg;
+    queue.reads      = Pr;
+    queue.result     = result;
+    queue.next_block = 0;
+    pthread_mutex_init(&queue.lock, NULL);
+    pthread_cond_init(&queue.ready, NULL);
+    pthread_cond_init(&queue.consumed, NULL);
+
+    for (t = 0; t < NTHREADS; t++)
+      if (pthread_create(thread + t, NULL, seed_worker, &queue) != 0)
+        { fprintf(stderr, "%s: cannot create worker thread %d\n",
+                  argv[0], t + 1);
+          exit(1);
+        }
+
+    for (b = 0; b < stub->nblocks; b++)
+      { BlockResult *block = result + b;
+
+        pthread_mutex_lock(&queue.lock);
+        while (!block->ready)
+          pthread_cond_wait(&queue.ready, &queue.lock);
+        pthread_mutex_unlock(&queue.lock);
+
+        if (block->len > 0 &&
+            fwrite(block->entry, sizeof(KposEntry), block->len, out) !=
+                block->len)
+          { fprintf(stderr, "%s: failed to write block %d to %s\n",
+                    argv[0], b + 1, output_tmp);
+            exit(1);
+          }
+        total_written += (uint64_t)block->len;
+        if (fwrite(&total_written, sizeof(uint64_t), 1, idx) != 1)
+          { fprintf(stderr, "%s: failed to write block index %s\n",
+                    argv[0], index_tmp);
+            exit(1);
+          }
+        fprintf(stderr, "Block %d seeds written: %llu\n", b + 1,
+                (unsigned long long)block->len);
+
+        pthread_mutex_lock(&queue.lock);
+        block->ready = 0;
+        pthread_cond_broadcast(&queue.consumed);
+        pthread_mutex_unlock(&queue.lock);
+      }
+
+    for (t = 0; t < NTHREADS; t++)
+      pthread_join(thread[t], NULL);
+
+    if (finish_kpos(out, total_written) != 0 ||
+        fclose(out) != 0 || fclose(idx) != 0)
+      { fprintf(stderr, "%s: failed to finalize KPOS output\n", argv[0]);
+        exit(1);
+      }
+    if (rename(output_tmp, output_path) != 0)
+      { perror(output_path);
+        exit(1);
+      }
+    if (rename(index_tmp, index_path) != 0)
+      { perror(index_path);
+        exit(1);
+      }
+
+    fprintf(stderr, "Seeds written: %llu (%s, %s)\n",
+            (unsigned long long)total_written, output_path, index_path);
+
+    pthread_cond_destroy(&queue.consumed);
+    pthread_cond_destroy(&queue.ready);
+    pthread_mutex_destroy(&queue.lock);
+    free(thread);
+    free(result);
+    free(index_path);
+    free(output_tmp);
+    free(index_tmp);
   }
 
-  free(prof_genome);
-  free(prof_reads);
   Free_Profiles(Pg);
   Free_Profiles(Pr);
   Free_DB_Stub(stub);
+  Close_DB(db);
 
   return 0;
 }

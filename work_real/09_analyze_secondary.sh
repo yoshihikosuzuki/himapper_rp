@@ -5,7 +5,7 @@
 #SBATCH -c 64
 #SBATCH -n 1
 #SBATCH -N 1
-# Separate candidate/secondary analysis for ref-seed/read-all at W=11.5.
+# Separate candidate/secondary analysis for ref-seed/read-seed at W=11.5.
 # This is not part of the primary-only benchmark.
 set -euo pipefail
 source config.sh
@@ -14,8 +14,7 @@ set -x
 
 THREADS=${SLURM_CPUS_PER_TASK:-64}
 HIM="$REPO/himapper"
-HPC="$REPO/HPC.himapper"
-RUN_DIR="$D_HIMAPPER/ref-seed_read-all-secondary"
+RUN_DIR="$D_HIMAPPER/ref-seed_read-seed-secondary"
 WORK_DIR="$RUN_DIR/map-work"
 mkdir -p "$WORK_DIR"
 cd "$WORK_DIR"
@@ -24,20 +23,10 @@ ln -sf "$D_HIMAPPER"/{ref.dam,.ref.bps,.ref.hdr,.ref.idx} .
 ln -sf "$D_HIMAPPER"/{reads.dam,.reads.bps,.reads.hdr,.reads.idx} .
 
 NB=$(awk -F'=' '/blocks/{gsub(/ /,"",$2);print $2}' reads.dam)
-export CN_UNIQ_W=11.5 CN_TIER_SRC=0 CN_HASH_TIE=1 CN_DUMP=0
-COMMANDS="$RUN_DIR/commands.sh"
-{
-  echo '#!/usr/bin/env bash'
-  echo 'set -euo pipefail'
-  "$HPC" -n0.7 -T"$THREADS" -K"$D_HIMAPPER/.ref.#.minimax.kpos" ref.dam reads 2>/dev/null \
-    | grep '^himapper' | sed "s|^himapper|$HIM|"
-} > "$COMMANDS"
-[[ $(tail -n +3 "$COMMANDS" | wc -l) -eq "$NB" ]] || {
-  echo "generated command count does not match blocks=$NB" >&2
-  exit 1
-}
-rm -f reads.*.ref.las
-bash "$COMMANDS"
+export CN_UNIQ_W=11.5 CN_TIER_SRC=1 CN_HASH_TIE=1 CN_DUMP=0
+"$HIM" -n0.7 -T"$THREADS" \
+  ref.dam "$D_HIMAPPER/.ref.minimax.kpos" \
+  reads.dam "$D_HIMAPPER/.reads.minimax.kpos"
 : > "$RUN_DIR/mapping.all-candidates.tsv"
 for k in $(seq 1 "$NB"); do
   LAshow reads ref.dam "reads.$k.ref.las" 2>/dev/null \

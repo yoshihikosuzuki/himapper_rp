@@ -28,7 +28,7 @@
 static char *Usage[] =
   { "[-1vpzCNG] [-k<int(20)>] [-t<int>] [-M<int>] [-T<int(4)>] [-P<dir(/tmp)>]",
     "         [-e<double(.85)] [-s<int(100)>] [-n<double(1.00)>]",
-    "         [-m<track>]+  <reference:dam> <ref.#.kpos|all> <reads:db> <reads.kpos|all>",
+    "         [-m<track>]+  <reference:dam> <ref.kpos|all> <reads:db> <reads.kpos|all>",
   };
 
 int     VERBOSE;   //   Globally visible to map.c
@@ -42,36 +42,13 @@ char   *SORT_PATH;
 uint64  MEM_LIMIT;
 uint64  MEM_PHYSICAL;
 
-static int block_marks(const char *path)
-{ int count = 0;
-
-  while ((path = strchr(path,'#')) != NULL)
-    { count += 1;
-      path += 1;
-    }
-  return (count);
-}
-
-static char *block_kpos_path(const char *template, int block)
-{ const char *mark;
-  char        number[32];
-  char       *path;
-  size_t      prefix, suffix;
-  int         n;
-
-  mark   = strchr(template,'#');
-  prefix = (size_t) (mark-template);
-  suffix = strlen(mark+1);
-  n      = snprintf(number,sizeof(number),"%d",block);
-
-  path = (char *) Malloc(prefix+(size_t)n+suffix+1,"Allocating block kpos path");
-  if (path == NULL)
-    exit (1);
-  memcpy(path,template,prefix);
-  memcpy(path+prefix,number,(size_t)n);
-  memcpy(path+prefix+(size_t)n,mark+1,suffix+1);
-  return (path);
-}
+typedef struct
+  { DAZZ_DB view;
+    void   *forward;
+    void   *reverse;
+    int     forward_len;
+    int     reverse_len;
+  } Ref_Block_Cache;
 
 /*  Adapted from code by David Robert Nadeau (http://NadeauSoftware.com) licensed under
  *     "Creative Commons Attribution 3.0 Unported License"
@@ -426,6 +403,28 @@ static int read_DB(DAZZ_DB *block, char *name, char **mask, int *mstat, int mtop
   return (isdam);
 }
 
+static void reference_block_view(DAZZ_DB *view, DAZZ_DB *whole,
+                                 int part, int first, int last)
+{ int i;
+
+  *view = *whole;
+  view->part   = part;
+  view->ufirst = first;
+  view->tfirst = first;
+  view->nreads = last-first;
+  view->reads  = whole->reads+first;
+  view->tracks = NULL;
+  view->totlen = 0;
+  view->maxlen = 0;
+
+  for (i = first; i < last; i++)
+    { int len = whole->reads[i].rlen;
+      view->totlen += len;
+      if (len > view->maxlen)
+        view->maxlen = len;
+    }
+}
+
 // TODO: hl,dlにはない
 static void complement(char *s, int len)
 { char *t;
@@ -568,13 +567,16 @@ void Clean_Exit(int val)
 }
 
 int main(int argc, char *argv[])
-{ DAZZ_DB    _ablock, _bblock;
-  DAZZ_DB    *ablock = &_ablock, *bblock = &_bblock;
+{ DAZZ_DB    _refdb, _ablock, _bblock;
+  DAZZ_DB    *refdb = &_refdb, *ablock = &_ablock, *bblock = &_bblock;
   // TODO: ここに[a|b]class
   char       *afile,  *bfile;
   char       *aroot,  *broot, *apwd;
   char       *kpos_path;
   char       *bkpos_path;
+  Kpos_Index *ref_kpos = NULL, *read_kpos = NULL;
+  Ref_Block_Cache *ref_cache = NULL;
+  DAZZ_STUB  *ref_stub = NULL, *read_stub = NULL;
   void       *aindex, *bindex;
   int         alen,    blen;
   int         isdam, nblocks;   //  of reference (a-argument)
@@ -589,7 +591,7 @@ int main(int argc, char *argv[])
   double AVE_ERROR;
   int    NTHREADS;
   int    MAP_ORDER;
-  int    MMAX, MTOP, *MSTAT;
+  int    MTOP, *MSTAT;
   char **MASK;
 
   { int    i, j, k;
@@ -622,10 +624,8 @@ int main(int argc, char *argv[])
       }
 
     MTOP  = 0;        // mask-track feature disabled, but MTOP/MSTAT/MASK are still
-    MMAX  = 0;        // passed to read_DB (lines below): initialize them so the mask
-    MASK  = NULL;     // loop is a no-op.  Leaving them uninitialized is UB — benign on
-    MSTAT = NULL;     // Mac/clang (garbage~0) but nonzero garbage on Linux/gcc, which
-                      // makes read_DB walk a bad mask[] -> segfault/hang.
+    MASK  = NULL;     // passed to read_DB: initialize them so the mask loop is a no-op.
+    MSTAT = NULL;
     // MMAX  = 10;
     // MASK  = (char **) Malloc(MMAX*sizeof(char *),"Allocating mask track array");
     // MSTAT = (int *) Malloc(MMAX*sizeof(int),"Allocating mask status array");
@@ -714,7 +714,7 @@ int main(int argc, char *argv[])
     PRIMARY_ONLY = flags['1'];   //  -1: suppress same-region secondaries (cf. minimap2 --secondary=no)
     JUNCTION_PEN = 1 - flags['G'];  //  -G: disable collinear-gap penalties (legacy damapper)
 
-    if (argc <= 4)
+    if (argc != 5)
       { fprintf(stderr,"Usage: %s %s\n",Prog_Name,Usage[0]);
         fprintf(stderr,"       %*s %s\n",(int) strlen(Prog_Name),"",Usage[1]);
         fprintf(stderr,"       %*s %s\n",(int) strlen(Prog_Name),"",Usage[2]);
@@ -741,25 +741,16 @@ int main(int argc, char *argv[])
         fprintf(stderr,"      -C: Output reference vs reads .las.\n");
         fprintf(stderr,"      -N: Do not output reads vs reference .las.\n");
         fprintf(stderr,"\n");
-        fprintf(stderr,"      For <ref.#.kpos|all> and <reads.kpos|all>:\n");
-        fprintf(stderr,"        Specify block-local .kpos files to use precomputed seeds,\n");
-        fprintf(stderr,"        where # denotes the 1-based reference DB block number,\n");
+        fprintf(stderr,"      For <ref.kpos|all> and <reads.kpos|all>:\n");
+        fprintf(stderr,"        Specify block-indexed KPOS containers,\n");
         fprintf(stderr,"        or 'all' to use all k-mers as seeds.\n");
         exit (1);
       }
 
-    // Extract the reference kpos template and the block-local reads kpos path, then adjust argv.
-    // argv[1]=ref.dam  argv[2]=ref.#.kpos|all  argv[3]=reads.db  argv[4]=reads.kpos|all
+    // argv[1]=ref.dam  argv[2]=ref.kpos|all
+    // argv[3]=reads.db argv[4]=reads.kpos|all
     kpos_path  = argv[2];
     bkpos_path = argv[4];
-    if (strcmp(kpos_path,"all") != 0 && block_marks(kpos_path) != 1)
-      { fprintf(stderr,"%s: reference kpos template '%s' must contain exactly one '#'\n",
-                       Prog_Name,kpos_path);
-        exit (1);
-      }
-    // Shift: argv[3] (reads.db) becomes argv[2]
-    argv[2] = argv[3];
-    argc -= 2;   // now argc counts: prog ref.dam reads.db
 
     if (COVER)
       if (NOMAP)
@@ -840,6 +831,12 @@ int main(int argc, char *argv[])
       }
 
     fclose(dbvis);
+    ref_stub = Read_DB_Stub(cat,DB_STUB_BLOCKS);
+    if (ref_stub == NULL || ref_stub->nblocks != nblocks)
+      { fprintf(stderr,"%s: Cannot read reference block boundaries for %s\n",
+                       Prog_Name,aroot);
+        exit (1);
+      }
 
     if ((index = Fopen(Catenate(apwd,"/.",aroot,".idx"),"r")) == NULL)
       exit (1);
@@ -874,85 +871,75 @@ int main(int argc, char *argv[])
     SORT_PATH = newpath;
   }
 
-  //  Compare reads in subsequent argument to the reference in both orientations
+  //  Load the whole reference once.  Reporter needs all reference bases, while
+  //  Match_Filter receives lightweight block views and cached block-local KPOS.
 
-  { int i, j, k;
+  { DAZZ_DB probe;
+    char *bpwd, *base;
+    char *stub_path;
+    char *bsuffix;
+    int bdam, b, k, started;
+    int read_blocks;
+    uint64 ref_bytes, cache_bytes;
 
-    aindex = NULL;
-    broot  = NULL;
-    for (i = 2; i < argc; i++)
-      { bfile = argv[i];
-        if (read_DB(bblock,bfile,MASK,MSTAT,MTOP,KMER_LEN))
-          broot = Root(bfile,".dam");
-        else
-          broot = Root(bfile,".db");
-        if (VERBOSE)
-          printf("\nBuilding index for %s\n",broot);
-        if (strcmp(bkpos_path, "all") == 0)
-          bindex = Sort_Kmers(bblock,&blen);
-        else
-          bindex = Load_Kpos(bkpos_path, 0, bblock, &blen);
+    read_DB(refdb,argv[1],MASK,MSTAT,0,KMER_LEN);
+    ref_bytes = sizeof_DB(refdb);
 
-        // TODO: hl,dlだとAdvance_Block_Arg(parse)としている。aとb逆だからだめ？
-        for (k = 1; k <= nblocks; k++)
-          { char *akpos_path = NULL;
+    ref_cache = (Ref_Block_Cache *)
+        calloc((size_t)nblocks,sizeof(Ref_Block_Cache));
+    if (ref_cache == NULL)
+      Clean_Exit(1);
 
-            if (isdam)
-              afile = Strdup(Catenate(apwd,"/",aroot,Numbered_Suffix(".",k,".dam")),
-                             "Allocating name");
-            else
-              afile = Strdup(Catenate(apwd,"/",aroot,Numbered_Suffix(".",k,".db")),
-                             "Allocating name");
-            read_DB(ablock,afile,MASK,MSTAT,MTOP,KMER_LEN);
-            free(afile);
+    if (strcmp(kpos_path,"all") != 0)
+      { ref_kpos = Open_Kpos_Index(kpos_path,nblocks);
+        for (k = 0; k < nblocks; k++)
+          { Ref_Block_Cache *cache = ref_cache+k;
+            reference_block_view(&cache->view,refdb,k+1,
+                                 ref_stub->tblocks[k],
+                                 ref_stub->tblocks[k+1]);
+            cache->forward =
+                Load_Kpos_Block(ref_kpos,k+1,0,&cache->view,
+                                &cache->forward_len);
+            cache->reverse =
+                Load_Kpos_Block(ref_kpos,k+1,1,&cache->view,
+                                &cache->reverse_len);
+          }
+      }
 
-            if (VERBOSE)
-              printf("\nBuilding index for %s.%d\n",aroot,k);
-            if (strcmp(kpos_path, "all") == 0)
-              aindex = Sort_Kmers(ablock, &alen);
-            else
-              { akpos_path = block_kpos_path(kpos_path,k);
-                aindex = Load_Kpos(akpos_path, 0, ablock, &alen);
-              }
+    bdam = Open_DB(argv[3],&probe);
+    if (bdam < 0)
+      Clean_Exit(1);
+    if (probe.part != 0)
+      { fprintf(stderr,"%s: reads argument '%s' must be a whole DB\n",
+                       Prog_Name,argv[3]);
+        Close_DB(&probe);
+        Clean_Exit(1);
+      }
+    Close_DB(&probe);
 
-            if (VERBOSE)
-              printf("\nComparing %s to %s.%d\n",broot,aroot,k);
-            Match_Filter(bblock,ablock,bindex,blen,aindex,alen,0,(k==1));
+    bsuffix = bdam ? ".dam" : ".db";
+    base = Root(argv[3],bsuffix);
+    bpwd = PathTo(argv[3]);
+    stub_path =
+        Strdup(Catenate(bpwd,"/",base,bsuffix),"Allocating reads stub path");
+    read_stub = Read_DB_Stub(stub_path,DB_STUB_BLOCKS);
+    free(stub_path);
+    if (read_stub == NULL || read_stub->nblocks < 1)
+      { fprintf(stderr,"%s: Cannot read block boundaries for %s\n",
+                       Prog_Name,argv[3]);
+        Clean_Exit(1);
+      }
+    read_blocks = read_stub->nblocks;
+    if (strcmp(bkpos_path,"all") != 0)
+      read_kpos = Open_Kpos_Index(bkpos_path,read_blocks);
 
-            ablock = complement_DB(ablock,1);
- 
-            if (VERBOSE)
-              printf("\nBuilding index for c(%s.%d)\n",aroot,k);
-            if (strcmp(kpos_path, "all") == 0)
-              { aindex = Sort_Kmers(ablock, &alen);
-              }
-            else
-              aindex = Load_Kpos(akpos_path, 1, ablock, &alen);
-
-            if (VERBOSE)
-              printf("\nComparing %s to c(%s.%d)\n",broot,aroot,k);
-            Match_Filter(bblock,ablock,bindex,blen,aindex,alen,1,0);
-
-            Close_DB(ablock);
-            free(akpos_path);
-          }   // for (k = 1; k <= nblocks; k++)
-
-        if (isdam)
-          afile = Strdup(Catenate(apwd,"/",aroot,".dam"),"Allocating name");
-        else
-          afile = Strdup(Catenate(apwd,"/",aroot,".db"),"Allocating name");
-        read_DB(ablock,afile,MASK,MSTAT,0,KMER_LEN);   // TODO: 何をしている？
-        free(afile);
-
-        if (VERBOSE)
-          printf("\nFinding best matches for block %s\n",broot);
-        Reporter(broot,bblock,aroot,ablock,settings,mflag);
-
-        Close_DB(ablock);
-
-        free(bindex);
-        Close_DB(bblock);
-
+    cache_bytes = 0;
+    for (k = 0; k < nblocks; k++)
+      { cache_bytes +=
+            (uint64)(ref_cache[k].forward_len+2) * 16;
+        cache_bytes +=
+            (uint64)(ref_cache[k].reverse_len+2) * 16;
+      }
 
 #define SYSTEM_CHECK(command)                                           \
  if (VERBOSE)                                                           \
@@ -963,6 +950,113 @@ int main(int argc, char *argv[])
      Clean_Exit(1);                                                     \
    }
 
+    for (b = 1; b <= read_blocks; b++)
+      { if (read_blocks == 1)
+          bfile = Strdup(argv[3],"Allocating reads DB name");
+        else
+          bfile = Strdup(Catenate(bpwd,"/",base,
+                                  Numbered_Suffix(".",b,bsuffix)),
+                         "Allocating reads block name");
+
+        if (read_DB(bblock,bfile,MASK,MSTAT,MTOP,KMER_LEN))
+          broot = Root(bfile,".dam");
+        else
+          broot = Root(bfile,".db");
+        free(bfile);
+
+        if (VERBOSE)
+          printf("\nBuilding index for %s\n",broot);
+        if (strcmp(bkpos_path,"all") == 0)
+          bindex = Sort_Kmers(bblock,&blen);
+        else
+          bindex = Load_Kpos_Block(read_kpos,b,0,bblock,&blen);
+
+        Begin_Mapping_Block(bblock);
+        started = 0;
+        for (k = 1; k <= nblocks; k++)
+          { if (strcmp(kpos_path,"all") == 0)
+              { if (isdam)
+                  afile = Strdup(Catenate(apwd,"/",aroot,
+                                         Numbered_Suffix(".",k,".dam")),
+                                 "Allocating reference block name");
+                else
+                  afile = Strdup(Catenate(apwd,"/",aroot,
+                                         Numbered_Suffix(".",k,".db")),
+                                 "Allocating reference block name");
+                read_DB(ablock,afile,MASK,MSTAT,MTOP,KMER_LEN);
+                free(afile);
+
+                if (VERBOSE)
+                  printf("\nBuilding index for %s.%d\n",aroot,k);
+                aindex = Sort_Kmers(ablock,&alen);
+                Set_Filter_Extra_Memory(ref_bytes);
+                if (alen > 0 && blen > 0)
+                  { if (VERBOSE)
+                      printf("\nComparing %s to %s.%d\n",broot,aroot,k);
+                    Match_Filter(bblock,ablock,bindex,blen,aindex,alen,
+                                 0,!started);
+                    started = 1;
+                  }
+                free(aindex);
+
+                ablock = complement_DB(ablock,1);
+                if (VERBOSE)
+                  printf("\nBuilding index for c(%s.%d)\n",aroot,k);
+                aindex = Sort_Kmers(ablock,&alen);
+                if (alen > 0 && blen > 0)
+                  { if (VERBOSE)
+                      printf("\nComparing %s to c(%s.%d)\n",broot,aroot,k);
+                    Match_Filter(bblock,ablock,bindex,blen,aindex,alen,
+                                 1,!started);
+                    started = 1;
+                  }
+                free(aindex);
+                Close_DB(ablock);
+              }
+            else
+              { Ref_Block_Cache *cache = ref_cache+(k-1);
+                uint64 view_bytes = sizeof_DB(&cache->view);
+                uint64 active_bytes;
+                uint64 extra =
+                    ref_bytes > view_bytes ? ref_bytes-view_bytes : 0;
+
+                alen = cache->forward_len;
+                aindex = cache->forward;
+                active_bytes = (uint64)(alen+2) * 16;
+                if (cache_bytes > active_bytes)
+                  extra += cache_bytes-active_bytes;
+                Set_Filter_Extra_Memory(extra);
+                if (alen > 0 && blen > 0)
+                  { if (VERBOSE)
+                      printf("\nComparing %s to %s.%d\n",broot,aroot,k);
+                    Match_Filter(bblock,&cache->view,bindex,blen,aindex,alen,
+                                 0,!started);
+                    started = 1;
+                  }
+
+                alen = cache->reverse_len;
+                aindex = cache->reverse;
+                active_bytes = (uint64)(alen+2) * 16;
+                extra = ref_bytes > view_bytes ? ref_bytes-view_bytes : 0;
+                if (cache_bytes > active_bytes)
+                  extra += cache_bytes-active_bytes;
+                Set_Filter_Extra_Memory(extra);
+                if (alen > 0 && blen > 0)
+                  { if (VERBOSE)
+                      printf("\nComparing %s to c(%s.%d)\n",broot,aroot,k);
+                    Match_Filter(bblock,&cache->view,bindex,blen,aindex,alen,
+                                 1,!started);
+                    started = 1;
+                  }
+              }
+          }
+
+        if (VERBOSE)
+          printf("\nFinding best matches for block %s\n",broot);
+        Reporter(broot,bblock,aroot,refdb,settings,mflag);
+
+        free(bindex);
+        Close_DB(bblock);
 
         command = CommandBuffer(aroot,broot,SORT_PATH);
 
@@ -987,11 +1081,21 @@ int main(int argc, char *argv[])
           }
 
         free(broot);
-      }   // for (i = 2; i < argc; i++)
+      }
 
-    // for (j = 0; j < MTOP; j++)
-    //   if (MSTAT[j] == 0)
-    //     printf("%s: Warning: Track %s given but never used.\n", Prog_Name,MASK[j]);
+    Set_Filter_Extra_Memory(0);
+    Close_Kpos_Index(read_kpos);
+    Close_Kpos_Index(ref_kpos);
+    for (k = 0; k < nblocks; k++)
+      { free(ref_cache[k].forward);
+        free(ref_cache[k].reverse);
+      }
+    free(ref_cache);
+    Free_DB_Stub(read_stub);
+    Free_DB_Stub(ref_stub);
+    Close_DB(refdb);
+    free(base);
+    free(bpwd);
   }
 
   Clean_Exit(0);

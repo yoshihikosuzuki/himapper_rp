@@ -11,6 +11,7 @@ set -x
 
 TOOLS=(
   ref-all_read-seed="$D_HIMAPPER/ref-all_read-seed/mapping.tsv"
+  ref-seed_read-seed="$D_HIMAPPER/ref-seed_read-seed/mapping.tsv"
   mm2="$D_MM2/mapping.tsv"
   wm2="$D_WM2/mapping.tsv"
 )

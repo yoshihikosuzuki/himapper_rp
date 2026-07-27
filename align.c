@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <stddef.h>
 #include <unistd.h>
 #include <math.h>
 #include <limits.h>
@@ -3072,7 +3073,12 @@ int Read_Trace(FILE *input, Overlap *ovl, int tbytes)
 }
 
 int Write_Overlap(FILE *output, Overlap *ovl, int tbytes)
-{ if (fwrite( ((char *) ovl) + PtrSize, OvlIOSize, 1, output) != 1)
+{ size_t field_end = offsetof(Overlap,bread) + sizeof(ovl->bread);
+
+  if (field_end < sizeof(Overlap))
+    memset(((char *) ovl) + field_end,0,sizeof(Overlap)-field_end);
+
+  if (fwrite( ((char *) ovl) + PtrSize, OvlIOSize, 1, output) != 1)
     return (1);
   if (ovl->path.trace != NULL)
     if (fwrite(ovl->path.trace,tbytes,ovl->path.tlen,output) != (size_t) ovl->path.tlen)

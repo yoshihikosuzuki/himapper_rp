@@ -15,3 +15,7 @@ dump_kpos
 memory/
 work*/*
 !work*/*.sh
+!work_real/DESIGN.md
+!work_real/scripts/
+!work_real/scripts/*.py
+!work_real/scripts/*.awk

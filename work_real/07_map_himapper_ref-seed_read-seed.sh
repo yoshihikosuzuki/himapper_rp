@@ -14,7 +14,6 @@ set -x
 
 THREADS=${SLURM_CPUS_PER_TASK:-16}
 HIM="$REPO/himapper"
-HPC="$REPO/HPC.himapper"
 RUN_DIR="$D_HIMAPPER/ref-seed_read-seed"
 mkdir -p "$RUN_DIR"
 cd "$RUN_DIR"
@@ -25,21 +24,10 @@ ln -sf "$D_HIMAPPER"/{reads.dam,.reads.bps,.reads.hdr,.reads.idx} .
 NB=$(awk -F'=' '/blocks/{gsub(/ /,"",$2);print $2}' reads.dam)
 export CN_UNIQ_W=11.5 CN_TIER_SRC=1 CN_HASH_TIE=1 CN_DUMP=0
 
-COMMANDS="$RUN_DIR/command.sh"
-{
-  echo '#!/usr/bin/env bash'
-  echo 'set -euo pipefail'
-  "$HPC" -1 -v -T"$THREADS" -K"$D_HIMAPPER/.ref.#.minimax.kpos" \
-    -R"$D_HIMAPPER/.reads.#.minimax.kpos" ref.dam reads 2>/dev/null \
-    | grep '^himapper' | sed "s|^himapper|$HIM|"
-} > "$COMMANDS"
-n_commands=$(tail -n +3 "$COMMANDS" | wc -l)
-[[ "$n_commands" -eq "$NB" ]] || {
-  echo "generated $n_commands commands for $NB blocks" >&2
-  exit 1
-}
-
-run_timed "$RUN_DIR/map.time" bash "$COMMANDS"
+run_timed "$RUN_DIR/map.time" \
+  "$HIM" -1 -v -T"$THREADS" \
+  ref.dam "$D_HIMAPPER/.ref.minimax.kpos" \
+  reads.dam "$D_HIMAPPER/.reads.minimax.kpos"
 : > "$RUN_DIR/mapping.tsv"
 for k in $(seq 1 "$NB"); do
   LAshow reads ref.dam "reads.$k.ref.las" 2>/dev/null \
