@@ -22,7 +22,7 @@
 #include <math.h>
 #include <limits.h>
 
-#include "DB.h"
+#include <DB.h>
 #include "align.h"
 
 #undef    DEBUG_PASSES     //  Show forward / backward extension termini for Local_Alignment

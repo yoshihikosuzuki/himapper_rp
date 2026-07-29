@@ -7,37 +7,39 @@
 #SBATCH -N 1
 set -euo pipefail
 source config.sh
-module load ${_DAZZ_DB} ${_FASTK}
+for tool in "$DAZZ_DB_ROOT/fasta2DAM" "$DAZZ_DB_ROOT/DBshow" \
+            "$DAZZ_DB_ROOT/DBsplit" \
+            "$FASTK_ROOT/FastK" "$FASTK_ROOT/Fastrm"; do
+  if [[ ! -x "$tool" ]]; then
+    echo "Missing local tool: $tool; run 'make local-tools' in $REPO" >&2
+    exit 1
+  fi
+done
 set -x
 THREADS=${SLURM_CPUS_PER_TASK:-16}
-# Reuse existing DAM/profiles while re-splitting the DBs and regenerating KPOS.
-SEEDS_ONLY=${SEEDS_ONLY:-0}
 
 cd "$D_HIMAPPER"
+sha256sum "$DAZZ_DB_ROOT/fasta2DAM" "$DAZZ_DB_ROOT/DBshow" \
+  "$DAZZ_DB_ROOT/DBsplit" \
+  "$FASTK_ROOT/FastK" "$FASTK_ROOT/Fastrm" "$REPO/minimaxmer"
 
-if [[ "$SEEDS_ONLY" != 1 ]]; then
-  # Build DAMs in a fresh preparation directory.
-  fasta2DAM ref "$REF"
-  fasta2DAM reads "$READS"
-fi
+"$DAZZ_DB_ROOT/fasta2DAM" ref "$REF"
+"$DAZZ_DB_ROOT/fasta2DAM" reads "$READS"
 
-# KPOS runs and the 10,000-hit threshold follow these DB block boundaries.
-DBsplit -s200 -f ref.dam
-DBsplit -s200 -f reads.dam
+"$DAZZ_DB_ROOT/DBsplit" -s200 -f ref.dam
+"$DAZZ_DB_ROOT/DBsplit" -s200 -f reads.dam
 
-if [[ "$SEEDS_ONLY" != 1 ]]; then
-  ln -sf "$READ_NAMES" reads.names
-  cut -f1 "${REF}.fai" > ref.names
+ln -sf "$READ_NAMES" reads.names
+cut -f1 "${REF}.fai" > ref.names
 
-  run_timed "$D_HIMAPPER/ref-profile.time" \
-    FastK -k"$KMER" -v -T"$THREADS" -t1 -p -P"$TMPDIR" ref.dam
-  run_timed "$D_HIMAPPER/reads-profile.time" \
-    FastK -k"$KMER" -v -T"$THREADS" -t1 -p -P"$TMPDIR" reads.dam
-  run_timed "$D_HIMAPPER/reads-vs-ref-profile.time" \
-    FastK -k"$KMER" -v -T"$THREADS" -t1 -p:ref -Nreads.ref -P"$TMPDIR" reads.dam
-  run_timed "$D_HIMAPPER/ref-vs-reads-profile.time" \
-    FastK -k"$KMER" -v -T"$THREADS" -t1 -p:reads -Nref.reads -P"$TMPDIR" ref.dam
-fi
+run_timed "$D_HIMAPPER/ref-profile.time" \
+  "$FASTK_ROOT/FastK" -k"$KMER" -v -T"$THREADS" -t1 -p -P"$TMPDIR" ref.dam
+run_timed "$D_HIMAPPER/reads-profile.time" \
+  "$FASTK_ROOT/FastK" -k"$KMER" -v -T"$THREADS" -t1 -p -P"$TMPDIR" reads.dam
+run_timed "$D_HIMAPPER/reads-vs-ref-profile.time" \
+  "$FASTK_ROOT/FastK" -k"$KMER" -v -T"$THREADS" -t1 -p:ref -Nreads.ref -P"$TMPDIR" reads.dam
+run_timed "$D_HIMAPPER/ref-vs-reads-profile.time" \
+  "$FASTK_ROOT/FastK" -k"$KMER" -v -T"$THREADS" -t1 -p:reads -Nref.reads -P"$TMPDIR" ref.dam
 
 # Generate seeds
 run_timed "$D_HIMAPPER/ref-seeds.time" \

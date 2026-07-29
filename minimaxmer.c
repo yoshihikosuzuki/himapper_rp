@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include <string.h>
 
-#include "DB.h"
+#include <DB.h>
 #include "nthash.h"
 #include "libfastk.h"
 #include "copynum.h"

@@ -23,16 +23,18 @@ ln -sf "$D_HIMAPPER"/{ref.dam,.ref.bps,.ref.hdr,.ref.idx} .
 ln -sf "$D_HIMAPPER"/{reads.dam,.reads.bps,.reads.hdr,.reads.idx} .
 
 NB=$(awk -F'=' '/blocks/{gsub(/ /,"",$2);print $2}' reads.dam)
+REF_LAYOUT="$RUN_DIR/ref.dam.layout"
+"$DAZZ_DB_ROOT/DBshow" -n ref.dam > "$REF_LAYOUT"
 export CN_UNIQ_W=11.5 CN_TIER_SRC=1 CN_HASH_TIE=1 CN_DUMP=0
 "$HIM" -n0.7 -T"$THREADS" \
   ref.dam "$D_HIMAPPER/.ref.minimax.kpos" \
   reads.dam "$D_HIMAPPER/.reads.minimax.kpos"
-: > "$RUN_DIR/mapping.all-candidates.tsv"
-for k in $(seq 1 "$NB"); do
-  LAshow reads ref.dam "reads.$k.ref.las" 2>/dev/null \
-    | python3 "$SCRIPTS/lashow_to_placement.py" --all "$D_HIMAPPER/reads.names" \
-        "$D_HIMAPPER/ref.names" >> "$RUN_DIR/mapping.all-candidates.tsv"
-done
+LAcat "reads.@1-${NB}.ref.las" > "$RUN_DIR/reads.ref.las"
+LAshow reads ref.dam "$RUN_DIR/reads.ref.las" 2>/dev/null \
+  | python3 "$SCRIPTS/lashow_to_placement.py" --all \
+      --ref-layout "$REF_LAYOUT" \
+      "$D_HIMAPPER/reads.names" "$D_HIMAPPER/ref.names" \
+  > "$RUN_DIR/mapping.all-candidates.tsv"
 # Keep the LAS files: unlike mapping.all-candidates.tsv, they retain the
 # chain flags needed to distinguish candidates from split alignment pieces.
 awk -F'\t' '{c[$1]++} END{for(r in c)d[c[r]]++; for(n=1;n<=5;n++)printf "  %d cand: %d reads\n",n,d[n]+0; s=0;for(n=6;n<=999;n++)s+=d[n];printf "  6+ cand: %d reads\n",s}' \

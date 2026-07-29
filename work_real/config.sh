@@ -12,12 +12,12 @@ WR="$REPO/work_real"
 
 # Tools
 SCRIPTS="$WR/scripts"
-export PATH="$REPO:$PATH"
+DAZZ_DB_ROOT="$REPO/DAZZ_DB"
+FASTK_ROOT="$REPO/FASTK"
+export PATH="$DAZZ_DB_ROOT:$FASTK_ROOT:$REPO:$PATH"
 
 _SEQKIT="seqkit/2.6.0"
-_DAZZ_DB="dazz_db/2025.02.17"
 _DALIGNER="daligner/2024.01.19"
-_FASTK="fastk/2025.09.13"
 _SAMTOOLS="samtools/1.18"
 _MINIMAP2="minimap2/2.26"
 _WINNOWMAP="winnowmap/2.03"

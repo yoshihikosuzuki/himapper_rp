@@ -20,21 +20,23 @@ ln -sf "$D_HIMAPPER"/{ref.dam,.ref.bps,.ref.hdr,.ref.idx} .
 ln -sf "$D_HIMAPPER"/{reads.dam,.reads.bps,.reads.hdr,.reads.idx} .
 
 NB=$(awk -F'=' '/blocks/{gsub(/ /,"",$2);print $2}' reads.dam)
+REF_LAYOUT="$RUN_DIR/ref.dam.layout"
+"$DAZZ_DB_ROOT/DBshow" -n ref.dam > "$REF_LAYOUT"
 export CN_UNIQ_W=11.5 CN_TIER_SRC=1 CN_HASH_TIE=1 CN_DUMP=0
 
 run_timed "$RUN_DIR/map.time" \
   "$HIM" -1 -v -T"$THREADS" \
   ref.dam all \
   reads.dam "$D_HIMAPPER/.reads.minimax.kpos"
-: > "$RUN_DIR/mapping.tsv"
-for k in $(seq 1 "$NB"); do
-  LAshow reads ref.dam "reads.$k.ref.las" 2>/dev/null \
-    | python3 "$SCRIPTS/lashow_to_placement.py" "$D_HIMAPPER/reads.names" "$D_HIMAPPER/ref.names" \
-    >> "$RUN_DIR/mapping.tsv"
-done
+LAcat "reads.@1-${NB}.ref.las" > "$RUN_DIR/reads.ref.las"
+LAshow reads ref.dam "$RUN_DIR/reads.ref.las" 2>/dev/null \
+  | python3 "$SCRIPTS/lashow_to_placement.py" \
+      --ref-layout "$REF_LAYOUT" \
+      "$D_HIMAPPER/reads.names" "$D_HIMAPPER/ref.names" \
+  > "$RUN_DIR/mapping.tsv"
 
 plot_coverage "$RUN_DIR/coverage.png" \
   --xlo-mb 54 --xhi-mb 68 \
-  minimap2="$D_MM2/mapping.tsv" \
-  winnowmap2="$D_WM2/mapping.tsv" \
-  himapper="$RUN_DIR/mapping.tsv"
+  himapper="$RUN_DIR/mapping.tsv" \
+  minimap2="$D_MM2/mapping.tsv"
+#   winnowmap2="$D_WM2/mapping.tsv" \

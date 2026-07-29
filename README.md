@@ -1,6 +1,34 @@
-# Himapper_rp
+# himapper_rp
 
 Fast, haplotype-aware HiFi read mapper using relative k-mer profiles.
+
+## Local DAZZ_DB and FASTK
+
+himapper is built against the `DAZZ_DB/` clone in this repository, and the
+preparation workflows call `DAZZ_DB/fasta2DAM`, `DAZZ_DB/DBshow`,
+`DAZZ_DB/DBsplit`, and `FASTK/FastK` by absolute path.  Build the local
+dependencies and himapper with:
+
+```sh
+make local-tools
+make
+```
+
+On compute nodes without the system curl development files, load the dependency
+documented by `~/code/install-scripts/pg/app/fastk.sh` while building:
+
+```sh
+source /bio/lmod/lmod/init/bash
+module purge
+module use /bio/package/.modulefiles
+module load curl/7.65.3
+make local-tools
+module purge
+make
+```
+
+The local DAZZ_DB parser accepts block sizes wider than the historical
+11-character field while retaining the fixed-width stub layout when writing.
 
 ## Current workflow
 
@@ -16,7 +44,7 @@ minimaxmer -T16 reads.dam reads.ref.prof reads.prof .reads.minimax.kpos
 These commands also create `.ref.minimax.kpos.idx` and
 `.reads.minimax.kpos.idx`.
 
-Map the whole reads DB in one process. HiMapper loads the reference KPOS once,
+Map the whole reads DB in one process. himapper loads the reference KPOS once,
 then processes every reads DB block internally:
 
 ```sh
@@ -27,6 +55,21 @@ himapper -1 -T16 \
 
 A multi-block reads DB produces `reads.1.ref.las`,
 `reads.2.ref.las`, and so on. A single-block DB produces `reads.ref.las`.
+
+When converting LAS output back to FASTA scaffold coordinates, first retain
+the N-delimited DAM layout and pass it to the placement converter:
+
+```sh
+DBshow -n ref.dam > ref.dam.layout
+LAshow reads ref.dam reads.ref.las |
+  work_real/scripts/lashow_to_placement.py \
+    --ref-layout ref.dam.layout reads.names ref.names > mapping.tsv
+```
+
+The layout is required because a FASTA scaffold containing N runs becomes
+multiple DAM contigs.  Forward LAshow coordinates already contain `fpulse`;
+the converter adjusts only reverse hits for himapper's per-contig reverse
+complement convention.
 
 
 

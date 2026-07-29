@@ -26,7 +26,7 @@
 #include <string.h>
 #include <unistd.h>
 
-#include "DB.h"
+#include <DB.h>
 #include "align.h"
 #include "copynum.h"
 

@@ -36,14 +36,88 @@ STRATIFICATION_ORDER = {
 
 
 def load_mapping_truth(path):
+    mapping_truth, _excluded, _total = load_mapping_truth_filtered(path)
+    return mapping_truth
+
+
+def load_mapping_truth_filtered(path, exclusion_index=None):
+    """Load truth records, optionally dropping any interval touching a mask."""
     mapping_truth = {}
+    excluded = 0
+    total = 0
     with open(path) as fh:
         for line in fh:
             p = line.rstrip("\n").split("\t")
             if len(p) < 5:
                 continue
-            mapping_truth[p[0]] = (p[1], p[2], int(p[3]), int(p[4]))
-    return mapping_truth
+            record = (p[1], p[2], int(p[3]), int(p[4]))
+            total += 1
+            if (
+                exclusion_index is not None
+                and truth_overlaps_exclusion(record, exclusion_index)
+            ):
+                excluded += 1
+                continue
+            mapping_truth[p[0]] = record
+    return mapping_truth, excluded, total
+
+
+def merge_bed_records(records):
+    """Return sorted, same-contig overlap/book-end merged BED3 records."""
+    merged = []
+    for contig, start, end in sorted(records):
+        if start < 0 or end <= start:
+            raise ValueError(f"invalid BED interval: {contig}:{start}-{end}")
+        if (
+            merged
+            and merged[-1][0] == contig
+            and start <= merged[-1][2]
+        ):
+            old_contig, old_start, old_end = merged[-1]
+            merged[-1] = (old_contig, old_start, max(old_end, end))
+        else:
+            merged.append((contig, start, end))
+    return tuple(merged)
+
+
+def load_exclusion_beds(paths):
+    """Load one or more BEDs as a single 0-based, half-open interval union."""
+    records = []
+    for path in paths:
+        with open(path) as fh:
+            for line_number, line in enumerate(fh, 1):
+                if (
+                    not line.strip()
+                    or line.startswith(("#", "track", "browser"))
+                ):
+                    continue
+                fields = line.rstrip("\n").split("\t")
+                if len(fields) < 3:
+                    raise ValueError(
+                        f"{path}:{line_number}: fewer than 3 BED columns")
+                try:
+                    start, end = int(fields[1]), int(fields[2])
+                except ValueError as error:
+                    raise ValueError(
+                        f"{path}:{line_number}: non-integer BED coordinate"
+                    ) from error
+                records.append((fields[0], start, end))
+    if paths and not records:
+        raise RuntimeError("truth-exclusion BEDs contain no intervals")
+    merged = merge_bed_records(records)
+    index = collections.defaultdict(list)
+    for contig, start, end in merged:
+        index[contig].append((start, end))
+    return dict(index), merged
+
+
+def truth_overlaps_exclusion(truth_record, exclusion_index):
+    """Whether a truth interval has at least one base in the exclusion union."""
+    _hap, contig, start, end = truth_record
+    return any(
+        start < mask_end and end > mask_start
+        for mask_start, mask_end in exclusion_index.get(contig, ())
+    )
 
 
 def load_map(path, ncol):
@@ -226,26 +300,38 @@ def aggregate_times(paths):
 
 
 def preprocessing_time_groups(time_dir):
-    """Return preprocessing groups matching the current stage 05/06 outputs."""
+    """Return named preprocessing stages for current stage 05/06 outputs."""
     himapper_dir = os.path.join(time_dir, "himapper")
     def himapper_paths(*names):
         return [os.path.join(himapper_dir, name) for name in names]
 
-    common = ("ref-profile.time", "reads-profile.time")
+    fastk_common = ("ref-profile.time", "reads-profile.time")
     return {
-        "himapper/ref-all_read-seed": himapper_paths(
-            *common, "reads-vs-ref-profile.time", "read-seeds.time"),
-        "himapper/ref-seed_read-all": himapper_paths(
-            *common, "ref-vs-reads-profile.time", "ref-seeds.time"),
-        "himapper/ref-seed_read-seed": himapper_paths(
-            *common,
-            "reads-vs-ref-profile.time", "ref-vs-reads-profile.time",
-            "ref-seeds.time", "read-seeds.time"),
-        "mm2": [os.path.join(time_dir, "mm2", "index.time")],
-        "wm2": [
-            os.path.join(time_dir, "wm2", "ref-meryl.time"),
-            os.path.join(time_dir, "wm2", "repetitive-kmers.time"),
-        ],
+        "himapper/ref-all_read-seed": {
+            "FastK": himapper_paths(
+                *fastk_common, "reads-vs-ref-profile.time"),
+            "seed": himapper_paths("read-seeds.time"),
+        },
+        "himapper/ref-seed_read-all": {
+            "FastK": himapper_paths(
+                *fastk_common, "ref-vs-reads-profile.time"),
+            "seed": himapper_paths("ref-seeds.time"),
+        },
+        "himapper/ref-seed_read-seed": {
+            "FastK": himapper_paths(
+                *fastk_common,
+                "reads-vs-ref-profile.time", "ref-vs-reads-profile.time"),
+            "seed": himapper_paths("ref-seeds.time", "read-seeds.time"),
+        },
+        "mm2": {
+            "prep": [os.path.join(time_dir, "mm2", "index.time")],
+        },
+        "wm2": {
+            "prep": [
+                os.path.join(time_dir, "wm2", "ref-meryl.time"),
+                os.path.join(time_dir, "wm2", "repetitive-kmers.time"),
+            ],
+        },
     }
 
 
@@ -284,6 +370,14 @@ def main():
         action="append",
         help="stratification axis; repeat to include multiple axes")
     ap.add_argument(
+        "--strata-file", action="append", default=[], metavar="AXIS=TSV",
+        help="override a stratification TSV path; repeat by axis")
+    ap.add_argument(
+        "--exclude-truth-bed", action="append", default=[], metavar="BED",
+        help=(
+            "exclude reads whose 0-based half-open truth interval overlaps "
+            "BED by at least one base; repeated BEDs are unioned"))
+    ap.add_argument(
         "--strata-only", action="store_true",
         help="report named strata without the aggregate all stratum")
     ap.add_argument("--liftover-paf", action="append", default=[],
@@ -297,12 +391,30 @@ def main():
     ap.add_argument("tools", nargs="+", help="name=mapping.tsv ...")
     args = ap.parse_args()
 
-    mapping_truth = load_mapping_truth(args.mapping_truth)
+    exclusion_index, exclusion_records = load_exclusion_beds(
+        args.exclude_truth_bed)
+    mapping_truth, excluded_truth, source_truth = load_mapping_truth_filtered(
+        args.mapping_truth,
+        exclusion_index if exclusion_records else None,
+    )
     population = list(mapping_truth)
+    strata_files = dict(STRATIFICATION_FILES)
+    for specification in args.strata_file:
+        if "=" not in specification:
+            ap.error(
+                f"--strata-file must be AXIS=TSV: {specification}")
+        axis, path = specification.split("=", 1)
+        if axis not in STRATIFICATION_FILES:
+            ap.error(
+                f"unknown --strata-file axis {axis!r}; choose from "
+                + ", ".join(STRATIFICATION_FILES))
+        if not path:
+            ap.error(f"empty --strata-file path for axis {axis!r}")
+        strata_files[axis] = path
     axes = list(dict.fromkeys(args.strata))
     stratifications = []
     for axis in axes:
-        strata_path = STRATIFICATION_FILES[axis]
+        strata_path = strata_files[axis]
         strata = load_map(strata_path, 2)
         strata = {name: fields[1] for name, fields in strata.items()}
         missing_strata = [name for name in population if name not in strata]
@@ -327,7 +439,20 @@ def main():
         }
         tools.append((name, path, categories))
 
-    print(f"# mapping truth: {args.mapping_truth}\n")
+    print(f"# mapping truth: {args.mapping_truth}")
+    if exclusion_records:
+        for path in args.exclude_truth_bed:
+            print(f"# truth exclusion mask: {path}")
+        print(
+            "# truth exclusion rule: any >=1-bp truth-interval overlap "
+            "(0-based, half-open)")
+        print(
+            f"# truth exclusion union: {len(exclusion_records):,} intervals, "
+            f"{sum(end - start for _contig, start, end in exclusion_records):,} bp")
+        print(
+            f"# truth population: original={source_truth:,} "
+            f"excluded={excluded_truth:,} evaluated={len(mapping_truth):,}")
+    print()
 
     def rate(a, b):
         return f"{100 * a / b:.3f}" if b else "N/A"
@@ -444,8 +569,18 @@ def main():
             map_timing = parse_time(
                 os.path.join(os.path.dirname(path), "map.time"))
             family = mapping_family(path, args.time_dir)
-            prep_timing = (
-                aggregate_times(prep_groups[family]) if family else None)
+            stage_paths = prep_groups[family] if family else {"prep": []}
+            stage_labels = tuple(stage_paths)
+            stage_timings = tuple(
+                aggregate_times(paths) if paths else None
+                for paths in stage_paths.values()
+            )
+            prep_paths = [
+                stage_path
+                for paths in stage_paths.values()
+                for stage_path in paths
+            ]
+            prep_timing = aggregate_times(prep_paths) if prep_paths else None
             if prep_timing is not None and map_timing is not None:
                 total_timing = (
                     prep_timing[0] + map_timing[0],
@@ -454,48 +589,38 @@ def main():
                 )
             else:
                 total_timing = None
-            prep_cpu, prep_wall, prep_rss = (
-                prep_timing if prep_timing is not None
-                else (None, None, None))
-            map_cpu, map_wall, map_rss = (
-                map_timing if map_timing is not None
-                else (None, None, None))
-            total_cpu, total_wall, peak_rss = (
-                total_timing if total_timing is not None
-                else (None, None, None))
-
             timing_rows.append((
                 name,
-                (seconds(total_cpu), seconds(prep_cpu), seconds(map_cpu)),
-                (seconds(total_wall), seconds(prep_wall), seconds(map_wall)),
-                (rss(peak_rss), rss(prep_rss), rss(map_rss)),
-                (total_cpu, total_wall, peak_rss),
+                stage_labels + ("map",),
+                stage_timings + (map_timing,),
+                total_timing,
             ))
 
         minimum_totals = []
         for metric in range(3):
             values = [
-                row[4][metric] for row in timing_rows
-                if row[4][metric] is not None
+                row[3][metric] for row in timing_rows
+                if row[3] is not None and row[3][metric] is not None
             ]
             minimum_totals.append(min(values) if values else None)
 
-        value_widths = [
-            [
-                max(len(row[metric][part]) for row in timing_rows)
-                for part in range(3)
-            ]
-            for metric in range(1, 4)
-        ]
         formatted_timing_rows = []
         for row in timing_rows:
-            cells = [
-                f"{row[metric][0]:>{value_widths[metric - 1][0]}}"
-                f"{'*' if (minimum_totals[metric - 1] is not None and row[4][metric - 1] == minimum_totals[metric - 1]) else ' '}"
-                f"[{row[metric][1]:>{value_widths[metric - 1][1]}}/"
-                f"{row[metric][2]:>{value_widths[metric - 1][2]}}]"
-                for metric in range(1, 4)
-            ]
+            cells = []
+            for metric, formatter in enumerate((seconds, seconds, rss)):
+                total_value = row[3][metric] if row[3] is not None else None
+                total = formatter(total_value)
+                parts = [
+                    formatter(timing[metric]) if timing is not None else "N/A"
+                    for timing in row[2]
+                ]
+                marker = (
+                    "*" if (
+                        minimum_totals[metric] is not None
+                        and total_value == minimum_totals[metric]
+                    ) else " "
+                )
+                cells.append(f"{total}{marker}[{'/'.join(parts)}]")
             formatted_timing_rows.append((row[0], *cells))
 
         headers = ("tool", "CPU time (s)", "wall time (s)", "peak RSS (GB)")
@@ -506,7 +631,8 @@ def main():
             for i in range(len(headers))
         ]
         print("=== resources ===")
-        print("# time / memory [prep/map]")
+        print("# himapper time / memory [FastK/seed/map]")
+        print("# Other tools time / memory [prep/map]")
         print("# * = lowest total in each resource column")
         print("  ".join(
             f"{header:<{width}}" if i == 0 else f"{header:>{width}}"

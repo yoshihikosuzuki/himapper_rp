@@ -5,8 +5,6 @@
 #SBATCH -c 16
 #SBATCH -n 1
 #SBATCH -N 1
-# Himapper reference-seed/read-all W sweep.  W=0 is the no-copy-bonus baseline;
-# copy-aware anchoring is always enabled.  W=11.5 is the initial comparison candidate.
 set -euo pipefail
 source config.sh
 module load ${_DALIGNER} ${_PYTHON}
@@ -22,6 +20,8 @@ ln -sf "$D_HIMAPPER"/{ref.dam,.ref.bps,.ref.hdr,.ref.idx} .
 ln -sf "$D_HIMAPPER"/{reads.dam,.reads.bps,.reads.hdr,.reads.idx} .
 
 NB=$(awk -F'=' '/blocks/{gsub(/ /,"",$2);print $2}' reads.dam)
+REF_LAYOUT="$RUN_DIR/ref.dam.layout"
+"$DAZZ_DB_ROOT/DBshow" -n ref.dam > "$REF_LAYOUT"
 export CN_TIER_SRC=0 CN_HASH_TIE=1 CN_DUMP=0
 
 run_cfg() {
@@ -31,11 +31,13 @@ run_cfg() {
     "$HIM" -1 -T"$THREADS" \
     ref.dam "$D_HIMAPPER/.ref.minimax.kpos" \
     reads.dam all
-  : > "$RUN_DIR/mapping.$name.tsv"
+  LAcat "reads.@1-${NB}.ref.las" > "$RUN_DIR/reads.ref.$name.las"
+  LAshow reads ref.dam "$RUN_DIR/reads.ref.$name.las" 2>/dev/null \
+    | python3 "$SCRIPTS/lashow_to_placement.py" \
+        --ref-layout "$REF_LAYOUT" \
+        "$D_HIMAPPER/reads.names" "$D_HIMAPPER/ref.names" \
+    > "$RUN_DIR/mapping.$name.tsv"
   for k in $(seq 1 "$NB"); do
-    LAshow reads ref.dam "reads.$k.ref.las" 2>/dev/null \
-      | python3 "$SCRIPTS/lashow_to_placement.py" "$D_HIMAPPER/reads.names" "$D_HIMAPPER/ref.names" \
-      >> "$RUN_DIR/mapping.$name.tsv"
     mv -f "reads.$k.ref.las" "reads.$k.ref.$name.las"
   done
 }

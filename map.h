@@ -11,7 +11,7 @@
 
 #define _FILTER
 
-#include "DB.h"
+#include <DB.h>
 #include "align.h"
 
 extern int    VERBOSE;

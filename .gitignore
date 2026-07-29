@@ -1,6 +1,7 @@
 .vscode/
 __pycache__/
 
+DAZZ_DB
 DALIGNER
 DAMAPPER
 FASTK
@@ -13,8 +14,9 @@ minimaxmer
 dump_kpos
 
 memory/
+tests/
 work*/*
 !work*/*.sh
-!work_real/scripts/
-!work_real/scripts/*.py
-!work_real/scripts/*.awk
+!work*/scripts/
+!work*/scripts/*.py
+!work*/scripts/*.awk

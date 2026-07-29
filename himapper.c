@@ -22,7 +22,7 @@
 #include <sys/sysctl.h>
 #endif
 
-#include "DB.h"
+#include <DB.h>
 #include "map.h"
 
 static char *Usage[] =
