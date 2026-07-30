@@ -12,9 +12,14 @@ modimizer
 copy_minimizer
 minimaxmer
 dump_kpos
+fastkdual/FastKdual
+fastkdual/compare_profiles*
+fastkdual/validation
+fastkdual/*.log
 
 memory/
 tests/
+!tests/test_eval_dual_profiles.py
 work*/*
 !work*/*.sh
 !work*/scripts/

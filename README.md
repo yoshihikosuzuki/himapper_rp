@@ -32,6 +32,25 @@ The local DAZZ_DB parser accepts block sizes wider than the historical
 
 ## Current workflow
 
+### One-pass reads profiles
+
+`fastkdual/FastKdual` is a separate FastK-derived executable.  It leaves the
+vendored `FASTK/FastK` source and behavior unchanged, but reuses one input
+partition and weighted k-mer sort to produce both the reads self
+table/profile and the reads-vs-reference profile:
+
+```sh
+fastkdual/FastKdual -k32 -T16 -t1 \
+  -p:ref -Nreads -Rreads.ref -P"$TMPDIR/fastk" reads.dam
+```
+
+The command creates the same `reads.hist`, `reads.ktab`, `reads.prof`, and
+`reads.ref.prof` artifacts that previously required separate self and relative
+FastK runs.  Build it together with the local dependencies using
+`make local-tools`.
+
+### Seed selection and mapping
+
 `minimaxmer` takes a whole, partitioned DAZZLER DB and creates one KPOS
 container plus its block-offset sidecar. DB blocks are processed in parallel
 with `-T`, while entries remain block-local and code-sorted within each block.
@@ -45,7 +64,9 @@ These commands also create `.ref.minimax.kpos.idx` and
 `.reads.minimax.kpos.idx`.
 
 Map the whole reads DB in one process. himapper loads the reference KPOS once,
-then processes every reads DB block internally:
+then processes every reads DB block internally.  A fixed worker team is reused
+throughout each reads block instead of creating a new pthread gang for every
+sort, match, and report phase:
 
 ```sh
 himapper -1 -T16 \

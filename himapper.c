@@ -964,6 +964,8 @@ int main(int argc, char *argv[])
           broot = Root(bfile,".db");
         free(bfile);
 
+        Start_Filter_Workers();
+
         if (VERBOSE)
           printf("\nBuilding index for %s\n",broot);
         if (strcmp(bkpos_path,"all") == 0)
@@ -1054,6 +1056,7 @@ int main(int argc, char *argv[])
         if (VERBOSE)
           printf("\nFinding best matches for block %s\n",broot);
         Reporter(broot,bblock,aroot,refdb,settings,mflag);
+        Stop_Filter_Workers();
 
         free(bindex);
         Close_DB(bblock);

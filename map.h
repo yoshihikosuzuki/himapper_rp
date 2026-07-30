@@ -27,6 +27,13 @@ extern uint64 MEM_PHYSICAL;
 
 int Set_Filter_Params(int kmer, int suppress, int nthreads); 
 
+// Filter setup and dispatch are a single-control-thread API.  Set environment
+// configuration before Set_Filter_Params, then start/stop the fixed-lane
+// worker team around one reads block.  Do not call filter operations or stop
+// the team concurrently from another control thread.
+void Start_Filter_Workers(void);
+void Stop_Filter_Workers(void);
+
 void *Sort_Kmers(DAZZ_DB *block, int *len);
 
 typedef struct Kpos_Index Kpos_Index;

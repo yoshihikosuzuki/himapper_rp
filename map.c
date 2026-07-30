@@ -55,6 +55,14 @@ static double CN_UNIQ_W = 0.0;
 //  CN_HASH_TIE=0 to restore the old deterministic tie-break.
 static int HASH_TIE = 1;
 
+//  CN_DUMP: emit every alignment candidate for offline tie analysis.
+//  Read once by the control thread before the worker team starts.
+static int CN_DUMP = 0;
+
+//  Lookup used by the optional repeat-profile path.  Initialize it on the
+//  control thread so report workers only perform immutable reads.
+static double SPECIAL_LOG_POWERS[41];
+
 #define MAXGRAM \
   50000  //  Cap on k-mer count histogram (in count_thread, merge_thread)
 
@@ -189,6 +197,9 @@ static int NTHREADS;  //  Adjusted downward to nearest power of 2
 static int NSHIFT;    //  NTHREADS = 1 << NSHIFT
 
 int Set_Filter_Params(int kmer, int suppress, int nthreads) {
+  char* e;
+  int i;
+
   if (kmer <= 1) return (1);
 
   Kmer = kmer;
@@ -212,11 +223,264 @@ int Set_Filter_Params(int kmer, int suppress, int nthreads) {
     NSHIFT += 1;
   }
 
+  // Environment configuration is immutable while the worker team is live.
+  // Reading it here avoids concurrent writes by the Reporter workers.
+  if ((e = getenv("CN_TIER_SRC")) != NULL) CN_TIER_SRC = atoi(e);
+  if ((e = getenv("CN_UNIQ_W")) != NULL) CN_UNIQ_W = atof(e);
+  if ((e = getenv("CN_HASH_TIE")) != NULL) HASH_TIE = atoi(e);
+  if ((e = getenv("CN_DUMP")) != NULL) CN_DUMP = atoi(e);
+
+  for (i = 0; i <= 40; i++)
+    SPECIAL_LOG_POWERS[i] = pow(10., i / 10.);
+
   return (0);
 }
 
 void Set_Filter_Extra_Memory(uint64 bytes) {
   FILTER_EXTRA_MEMORY = bytes;
+}
+
+/*******************************************************************************************
+ *
+ *  FIXED-LANE WORKER TEAM
+ *
+ ********************************************************************************************/
+
+typedef void* (*Parallel_Routine)(void*);
+
+typedef struct {
+  int lane;
+} Filter_Worker;
+
+typedef struct {
+  pthread_mutex_t lock;
+  pthread_cond_t ready;
+  pthread_cond_t done;
+  THREAD* threads;
+  Filter_Worker* workers;
+  Parallel_Routine routine;
+  char* args;
+  size_t stride;
+  unsigned long generation;
+  int completed;
+  int active;
+  int stopping;
+} Filter_Pool;
+
+static Filter_Pool FILTER_POOL = {
+    PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER,
+    PTHREAD_COND_INITIALIZER,  NULL,
+    NULL,                      NULL,
+    NULL,                      0,
+    0,                         0,
+    0,                         0};
+
+static _Thread_local int FILTER_WORKER_LANE = -1;
+
+static int filter_worker_lane(void) {
+  return (FILTER_WORKER_LANE);
+}
+
+static void* filter_worker(void* arg) {
+  Filter_Worker* worker = (Filter_Worker*)arg;
+  unsigned long observed = 0;
+
+  FILTER_WORKER_LANE = worker->lane;
+  pthread_mutex_lock(&FILTER_POOL.lock);
+  while (1) {
+    Parallel_Routine routine;
+    char* lane_arg;
+
+    while (!FILTER_POOL.stopping &&
+           FILTER_POOL.generation == observed)
+      pthread_cond_wait(&FILTER_POOL.ready, &FILTER_POOL.lock);
+    if (FILTER_POOL.stopping) {
+      pthread_mutex_unlock(&FILTER_POOL.lock);
+      FILTER_WORKER_LANE = -1;
+      return (NULL);
+    }
+
+    observed = FILTER_POOL.generation;
+    routine = FILTER_POOL.routine;
+    lane_arg = FILTER_POOL.args + worker->lane * FILTER_POOL.stride;
+    pthread_mutex_unlock(&FILTER_POOL.lock);
+
+    routine(lane_arg);
+
+    pthread_mutex_lock(&FILTER_POOL.lock);
+    FILTER_POOL.completed += 1;
+    if (FILTER_POOL.completed == NTHREADS)
+      pthread_cond_signal(&FILTER_POOL.done);
+  }
+}
+
+void Start_Filter_Workers(void) {
+  int i, created, error;
+
+  if (NTHREADS < 1) {
+    fprintf(stderr,
+            "%s: Set_Filter_Params must precede Start_Filter_Workers\n",
+            Prog_Name);
+    Clean_Exit(1);
+  }
+  if (FILTER_POOL.active) {
+    fprintf(stderr, "%s: Filter worker team is already active\n", Prog_Name);
+    Clean_Exit(1);
+  }
+
+  FILTER_POOL.threads =
+      (THREAD*)calloc((size_t)NTHREADS, sizeof(THREAD));
+  FILTER_POOL.workers =
+      (Filter_Worker*)calloc((size_t)NTHREADS, sizeof(Filter_Worker));
+  if (FILTER_POOL.threads == NULL || FILTER_POOL.workers == NULL) {
+    free(FILTER_POOL.threads);
+    free(FILTER_POOL.workers);
+    FILTER_POOL.threads = NULL;
+    FILTER_POOL.workers = NULL;
+    fprintf(stderr, "%s: Out of memory creating filter worker team\n",
+            Prog_Name);
+    Clean_Exit(1);
+  }
+
+  FILTER_POOL.routine = NULL;
+  FILTER_POOL.args = NULL;
+  FILTER_POOL.stride = 0;
+  FILTER_POOL.generation = 0;
+  FILTER_POOL.completed = 0;
+  FILTER_POOL.stopping = 0;
+  FILTER_POOL.active = 1;
+
+  created = 0;
+  error = 0;
+  for (i = 0; i < NTHREADS; i++) {
+    int status;
+
+    FILTER_POOL.workers[i].lane = i;
+    status = pthread_create(FILTER_POOL.threads + i, NULL, filter_worker,
+                            FILTER_POOL.workers + i);
+    if (status != 0) {
+      error = status;
+      break;
+    }
+    created += 1;
+  }
+
+  if (error != 0) {
+    pthread_mutex_lock(&FILTER_POOL.lock);
+    FILTER_POOL.stopping = 1;
+    pthread_cond_broadcast(&FILTER_POOL.ready);
+    pthread_mutex_unlock(&FILTER_POOL.lock);
+    for (i = 0; i < created; i++)
+      pthread_join(FILTER_POOL.threads[i], NULL);
+    free(FILTER_POOL.threads);
+    free(FILTER_POOL.workers);
+    FILTER_POOL.threads = NULL;
+    FILTER_POOL.workers = NULL;
+    FILTER_POOL.active = 0;
+    FILTER_POOL.stopping = 0;
+    fprintf(stderr, "%s: Cannot create filter worker %d: %s\n",
+            Prog_Name, created, strerror(error));
+    Clean_Exit(1);
+  }
+}
+
+void Stop_Filter_Workers(void) {
+  int i, error;
+
+  if (!FILTER_POOL.active) return;
+  if (filter_worker_lane() >= 0) {
+    fprintf(stderr, "%s: A filter worker cannot stop its own team\n",
+            Prog_Name);
+    Clean_Exit(1);
+  }
+
+  pthread_mutex_lock(&FILTER_POOL.lock);
+  FILTER_POOL.stopping = 1;
+  pthread_cond_broadcast(&FILTER_POOL.ready);
+  pthread_mutex_unlock(&FILTER_POOL.lock);
+
+  error = 0;
+  for (i = 0; i < NTHREADS; i++) {
+    int status = pthread_join(FILTER_POOL.threads[i], NULL);
+    if (status != 0 && error == 0) error = status;
+  }
+
+  free(FILTER_POOL.threads);
+  free(FILTER_POOL.workers);
+  FILTER_POOL.threads = NULL;
+  FILTER_POOL.workers = NULL;
+  FILTER_POOL.routine = NULL;
+  FILTER_POOL.args = NULL;
+  FILTER_POOL.stride = 0;
+  FILTER_POOL.active = 0;
+  FILTER_POOL.stopping = 0;
+
+  if (error != 0) {
+    fprintf(stderr, "%s: Cannot join filter worker team: %s\n",
+            Prog_Name, strerror(error));
+    Clean_Exit(1);
+  }
+}
+
+static void run_parallel(Parallel_Routine routine, void* args, size_t stride) {
+  int i;
+
+  if (FILTER_POOL.active) {
+    if (filter_worker_lane() >= 0) {
+      fprintf(stderr, "%s: Nested filter worker dispatch is not supported\n",
+              Prog_Name);
+      Clean_Exit(1);
+    }
+
+    pthread_mutex_lock(&FILTER_POOL.lock);
+    FILTER_POOL.routine = routine;
+    FILTER_POOL.args = (char*)args;
+    FILTER_POOL.stride = stride;
+    FILTER_POOL.completed = 0;
+    FILTER_POOL.generation += 1;
+    pthread_cond_broadcast(&FILTER_POOL.ready);
+    while (FILTER_POOL.completed < NTHREADS)
+      pthread_cond_wait(&FILTER_POOL.done, &FILTER_POOL.lock);
+    pthread_mutex_unlock(&FILTER_POOL.lock);
+    return;
+  }
+
+  // Preserve the map API for callers that do not opt into a persistent team.
+  {
+    THREAD* threads;
+    int created, error;
+
+    threads = (THREAD*)malloc(sizeof(THREAD) * (size_t)NTHREADS);
+    if (threads == NULL) {
+      fprintf(stderr, "%s: Out of memory creating filter workers\n",
+              Prog_Name);
+      Clean_Exit(1);
+    }
+
+    created = 0;
+    error = 0;
+    for (i = 0; i < NTHREADS; i++) {
+      int status =
+          pthread_create(threads + i, NULL, routine,
+                         ((char*)args) + i * stride);
+      if (status != 0) {
+        error = status;
+        break;
+      }
+      created += 1;
+    }
+    for (i = 0; i < created; i++) {
+      int status = pthread_join(threads[i], NULL);
+      if (status != 0 && error == 0) error = status;
+    }
+    free(threads);
+
+    if (error != 0) {
+      fprintf(stderr, "%s: Cannot run filter worker team: %s\n",
+              Prog_Name, strerror(error));
+      Clean_Exit(1);
+    }
+  }
 }
 
 /*******************************************************************************************
@@ -384,7 +648,6 @@ static void* lex_thread(void* arg) {
 
 static Double* lex_sort(int bytes[16], Double* src, Double* trg,
                         Lex_Arg* parmx) {
-  THREAD threads[NTHREADS];
   int64 zthresh[NTHREADS + 1];
 
   int64 len, x, y;
@@ -452,10 +715,7 @@ static Double* lex_sort(int bytes[16], Double* src, Double* trg,
         x += y;
       }
 
-    for (i = 0; i < NTHREADS; i++)
-      pthread_create(threads + i, NULL, lex_thread, parmx + i);
-
-    for (i = 0; i < NTHREADS; i++) pthread_join(threads[i], NULL);
+    run_parallel(lex_thread, parmx, sizeof(Lex_Arg));
 
     xch = LEX_src;
     LEX_src = LEX_trg;
@@ -705,7 +965,6 @@ static int find_read(int x, DAZZ_READ* a, int n) {
 }
 
 void* Sort_Kmers(DAZZ_DB* block, int* len) {
-  THREAD threads[NTHREADS];
   Tuple_Arg parmt[NTHREADS];
   Comp_Arg parmf[NTHREADS];
   Lex_Arg parmx[NTHREADS];
@@ -761,10 +1020,7 @@ void* Sort_Kmers(DAZZ_DB* block, int* len) {
     parmt[i].rend = z = find_read(x, block->reads, nreads);
   }
 
-  for (i = 0; i < NTHREADS; i++)
-    pthread_create(threads + i, NULL, tuple_thread, parmt + i);
-
-  for (i = 0; i < NTHREADS; i++) pthread_join(threads[i], NULL);
+  run_parallel(tuple_thread, parmt, sizeof(Tuple_Arg));
 
   rez = (KmerPos*)lex_sort(mersort, (Double*)src, (Double*)trg, parmx);
 
@@ -794,10 +1050,7 @@ void* Sort_Kmers(DAZZ_DB* block, int* len) {
       FR_trg = rez = src;
     }
 
-    for (i = 0; i < NTHREADS; i++)
-      pthread_create(threads + i, NULL, compsize_thread, parmf + i);
-
-    for (i = 0; i < NTHREADS; i++) pthread_join(threads[i], NULL);
+    run_parallel(compsize_thread, parmf, sizeof(Comp_Arg));
 
     x = 0;
     for (i = 0; i < NTHREADS; i++) {
@@ -807,10 +1060,7 @@ void* Sort_Kmers(DAZZ_DB* block, int* len) {
     }
     kmers = x;
 
-    for (i = 0; i < NTHREADS; i++)
-      pthread_create(threads + i, NULL, compress_thread, parmf + i);
-
-    for (i = 0; i < NTHREADS; i++) pthread_join(threads[i], NULL);
+    run_parallel(compress_thread, parmf, sizeof(Comp_Arg));
   }
 
   rez[kmers].code = 0xffffffffffffffffllu;
@@ -2729,16 +2979,8 @@ static int Handle_Redundancies(Overlap* amatch, int novls, Overlap* bmatch,
 }
 
 int special_log(int cover) {
-  static double Spow[51];
-  static int first = 1;
-
   int l, r, m;
   double x;
-
-  if (first) {
-    first = 0;
-    for (m = 0; m <= 40; m++) Spow[m] = pow(10., m / 10.);
-  }
 
   if (cover <= 1)
     return (cover);
@@ -2752,7 +2994,7 @@ int special_log(int cover) {
   r = 41;
   while (l < r) {
     m = ((l + r) >> 1);
-    if (Spow[m] <= x)
+    if (SPECIAL_LOG_POWERS[m] <= x)
       l = m + 1;
     else
       r = m;
@@ -2880,11 +3122,6 @@ static void* report_thread(void* arg) {
   bhits = 0;
   align->path = apath;
   acomp = New_Read_Buffer(MR_ablock);
-
-  { char* e;
-    if ((e = getenv("CN_UNIQ_W")) != NULL) CN_UNIQ_W = atof(e);
-    if ((e = getenv("CN_HASH_TIE")) != NULL) HASH_TIE = atoi(e);
-  }
 
   if (SPACING <= TRACE_XOVR) {
     small = 1;
@@ -3251,15 +3488,12 @@ static void* report_thread(void* arg) {
 
     //  Debug: dump every candidate of this A-read (CN_DUMP=1) as
     //  "CAND  aread  bread  n/c  score  diffs  nuniq" for offline tie analysis.
-    { static int CN_DUMP = -2;
-      if (CN_DUMP == -2) { char* e = getenv("CN_DUMP"); CN_DUMP = e ? atoi(e) : 0; }
-      if (CN_DUMP)
-        for (c = 0; c < novl; c++)
-          fprintf(stderr, "CAND\t%d\t%d\t%c\t%d\t%d\t%d\n",
-                  amatch[c].aread, amatch[c].bread,
-                  COMP(amatch[c].flags) ? 'c' : 'n',
-                  linker[c].score, amatch[c].path.diffs, linker[c].nuniq);
-    }
+    if (CN_DUMP)
+      for (c = 0; c < novl; c++)
+        fprintf(stderr, "CAND\t%d\t%d\t%c\t%d\t%d\t%d\n",
+                amatch[c].aread, amatch[c].bread,
+                COMP(amatch[c].flags) ? 'c' : 'n',
+                linker[c].score, amatch[c].path.diffs, linker[c].nuniq);
 
     qsort(perm, novl, sizeof(Links*), LINK_SORT);
 
@@ -3471,7 +3705,6 @@ void Match_Filter(DAZZ_DB* ablock, DAZZ_DB* bblock, void* vasort, int alen,
                   void* vbsort, int blen, int comp, int start)
 
 {
-  THREAD threads[NTHREADS];
   Merge_Arg parmm[NTHREADS];
   Lex_Arg parmx[NTHREADS];
   int pairsort[16];
@@ -3501,9 +3734,6 @@ void Match_Filter(DAZZ_DB* ablock, DAZZ_DB* bblock, void* vasort, int alen,
               Prog_Name, ablock->maxlen, CN_MAXLEN-1);
       Clean_Exit(1);
     }
-  { char* e;  //  read here (runs before the count threads that consume CN_TIER_SRC at seed-hit gen)
-    if ((e = getenv("CN_TIER_SRC")) != NULL) CN_TIER_SRC = atoi(e);
-  }
   if (VERBOSE)
     printf("   Copy-tier source: %s seed\n", CN_TIER_SRC ? "READ (asort)" : "REF (bsort)");
 
@@ -3561,10 +3791,7 @@ void Match_Filter(DAZZ_DB* ablock, DAZZ_DB* bblock, void* vasort, int alen,
     for (i = 0; i < NTHREADS; i++)
       for (j = 0; j < MAXGRAM; j++) parmm[i].hitgram[j] = 0;
 
-    for (i = 0; i < NTHREADS; i++)
-      pthread_create(threads + i, NULL, count_thread, parmm + i);
-
-    for (i = 0; i < NTHREADS; i++) pthread_join(threads[i], NULL);
+    run_parallel(count_thread, parmm, sizeof(Merge_Arg));
 
     if (VERBOSE) printf("\n");
     limit = MAXGRAM;
@@ -3660,10 +3887,7 @@ void Match_Filter(DAZZ_DB* ablock, DAZZ_DB* bblock, void* vasort, int alen,
       for (p = 0; p < BPOWR; p++) parmm[i].kptr[p] = 0;
     }
 
-    for (i = 0; i < NTHREADS; i++)
-      pthread_create(threads + i, NULL, merge_thread, parmm + i);
-
-    for (i = 0; i < NTHREADS; i++) pthread_join(threads[i], NULL);
+    run_parallel(merge_thread, parmm, sizeof(Merge_Arg));
 
 #ifdef TEST_PAIRS
     printf("\nSETUP SORT:\n");
@@ -3733,10 +3957,7 @@ void Match_Filter(DAZZ_DB* ablock, DAZZ_DB* bblock, void* vasort, int alen,
 
 #else
 
-    for (i = 0; i < NTHREADS; i++)
-      pthread_create(threads + i, NULL, chain_thread, parmr + i);
-
-    for (i = 0; i < NTHREADS; i++) pthread_join(threads[i], NULL);
+    run_parallel(chain_thread, parmr, sizeof(Report_Arg));
 
 #endif
 
@@ -3847,9 +4068,6 @@ static char* NameBuffer(char* aname, char* bname) {
 
 void Reporter(char* aname, DAZZ_DB* ablock, char* bname, DAZZ_DB* bblock,
               Align_Spec* aspec, int mflag) {
-#ifndef NOTHREAD
-  THREAD threads[NTHREADS];
-#endif
   int i;
   int ncheck;
   char* fname;
@@ -3885,10 +4103,7 @@ void Reporter(char* aname, DAZZ_DB* ablock, char* bname, DAZZ_DB* bblock,
 
 #else
 
-  for (i = 0; i < NTHREADS; i++)
-    pthread_create(threads + i, NULL, report_thread, parmr + i);
-
-  for (i = 0; i < NTHREADS; i++) pthread_join(threads[i], NULL);
+  run_parallel(report_thread, parmr, sizeof(Report_Arg));
 
 #endif
 

@@ -305,22 +305,36 @@ def preprocessing_time_groups(time_dir):
     def himapper_paths(*names):
         return [os.path.join(himapper_dir, name) for name in names]
 
-    fastk_common = ("ref-profile.time", "reads-profile.time")
+    dual_profile = os.path.join(himapper_dir, "reads-dual-profile.time")
+    if os.path.exists(dual_profile):
+        # FastKdual produces reads.prof, reads.ktab, and reads.ref.prof from
+        # one partition/sort.  Keep the legacy layout as a fallback for runs
+        # prepared before FastKdual was introduced.
+        ref_and_reads = ("ref-profile.time", "reads-dual-profile.time")
+        read_seed_profiles = ref_and_reads
+        ref_seed_profiles = (*ref_and_reads, "ref-vs-reads-profile.time")
+        both_seed_profiles = ref_seed_profiles
+    else:
+        ref_and_reads = ("ref-profile.time", "reads-profile.time")
+        read_seed_profiles = (*ref_and_reads, "reads-vs-ref-profile.time")
+        ref_seed_profiles = (*ref_and_reads, "ref-vs-reads-profile.time")
+        both_seed_profiles = (
+            *ref_and_reads,
+            "reads-vs-ref-profile.time",
+            "ref-vs-reads-profile.time",
+        )
+
     return {
         "himapper/ref-all_read-seed": {
-            "FastK": himapper_paths(
-                *fastk_common, "reads-vs-ref-profile.time"),
+            "FastK": himapper_paths(*read_seed_profiles),
             "seed": himapper_paths("read-seeds.time"),
         },
         "himapper/ref-seed_read-all": {
-            "FastK": himapper_paths(
-                *fastk_common, "ref-vs-reads-profile.time"),
+            "FastK": himapper_paths(*ref_seed_profiles),
             "seed": himapper_paths("ref-seeds.time"),
         },
         "himapper/ref-seed_read-seed": {
-            "FastK": himapper_paths(
-                *fastk_common,
-                "reads-vs-ref-profile.time", "ref-vs-reads-profile.time"),
+            "FastK": himapper_paths(*both_seed_profiles),
             "seed": himapper_paths("ref-seeds.time", "read-seeds.time"),
         },
         "mm2": {
