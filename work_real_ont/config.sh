@@ -80,14 +80,15 @@ READ_NAMES="$D_READS/$READS_BASE.names"
 READS_MAPPING_TRUTH="$D_READS/$READS_BASE.mapping_truth.tsv"
 READS_CONFIDENT_MAPPING_TRUTH="$D_READS/$READS_BASE.confident.mapping_truth.tsv"
 
-# Initial project baseline. These values have not yet been tuned for ONT.
+# ONT mainline defaults.  Keep seed density at w=s=100; e and the unique-seed
+# selection weight were selected with the chain-aware chr6 ONT comparison.
 KMER=32
 HIMAPPER_WS=100
-HIMAPPER_E=0.95
+HIMAPPER_E=0.70
 HIMAPPER_TRACE_SPACING=100
 DB_BLOCK_SIZE=200
 
-CN_UNIQ_W=11.5
+CN_UNIQ_W=200
 CN_TIER_SRC=1
 CN_HASH_TIE=1
 CN_DUMP=0

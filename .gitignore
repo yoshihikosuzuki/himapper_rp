@@ -19,8 +19,7 @@ fastkdual/*.log
 
 memory/
 tests/
-!tests/test_eval_dual_profiles.py
-work*/*
+work*/
 !work*/*.sh
 !work*/scripts/
 !work*/scripts/*.py

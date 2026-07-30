@@ -1,5 +1,9 @@
 CC = gcc
 CFLAGS = -O3 -Wall -Wextra -Wno-unused-result -fno-strict-aliasing
+MINIMAX_SELECTOR_FLAGS ?= -DMINIMAX_HASH_MOD=2003 \
+                          -DMINIMAX_HASH_REFINE=0 \
+                          -DMINIMAX_ROBUST_WINNOW=1 \
+                          -DMINIMAX_CANONICAL_WINNOW=1
 
 DAZZ_DB_DIR ?= DAZZ_DB
 FASTK_DIR ?= FASTK
@@ -20,8 +24,8 @@ ALL = himapper minimaxmer dump_kpos
 
 all: $(ALL)
 
-minimaxmer: minimaxmer.c $(DAZZ_DB_SRC) $(DAZZ_DB_HDR) libfastk.c libfastk.h gene_core.h copynum.h
-	$(CC) $(CPPFLAGS) $(CFLAGS) -DSKIP_GENE_CORE -o minimaxmer minimaxmer.c $(DAZZ_DB_SRC) libfastk.c -lpthread -lm
+minimaxmer: minimaxmer.c nthash.h $(DAZZ_DB_SRC) $(DAZZ_DB_HDR) libfastk.c libfastk.h gene_core.h copynum.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(MINIMAX_SELECTOR_FLAGS) -DSKIP_GENE_CORE -o minimaxmer minimaxmer.c $(DAZZ_DB_SRC) libfastk.c -lpthread -lm
 
 himapper: himapper.c map.c map.h align.c align.h $(DAZZ_DB_SRC) $(DAZZ_DB_HDR) copynum.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o himapper himapper.c map.c align.c $(DAZZ_DB_SRC) -lpthread -lm

@@ -63,6 +63,15 @@ minimaxmer -T16 reads.dam reads.ref.prof reads.prof .reads.minimax.kpos
 These commands also create `.ref.minimax.kpos.idx` and
 `.reads.minimax.kpos.idx`.
 
+The default seed selector keeps the historical
+`(genome_count, -reads_count, canonical_ntHash % 2003)` priority.  When a
+window has several occurrences of the same minimum tuple, it uses robust
+winnowing: the selected occurrence is retained while it remains a minimum.
+The traversal direction of each tied subrun is chosen with
+`D(W) = #G + #T - #A - #C` over the `K + W - 1` spelled bases, so the selected
+positions mirror between a sequence and its reverse complement.  `D(W)` is
+computed lazily only for tied windows.
+
 Map the whole reads DB in one process. himapper loads the reference KPOS once,
 then processes every reads DB block internally.  A fixed worker team is reused
 throughout each reads block instead of creating a new pthread gang for every
@@ -90,7 +99,12 @@ LAshow reads ref.dam reads.ref.las |
 The layout is required because a FASTA scaffold containing N runs becomes
 multiple DAM contigs.  Forward LAshow coordinates already contain `fpulse`;
 the converter adjusts only reverse hits for himapper's per-contig reverse
-complement convention.
+complement convention.  By default, the converter reconstructs DALIGNER
+START/NEXT chains and emits the maximum-query-span chain for each read.
+Pass `--all` only for secondary diagnostics; it emits every reconstructed
+candidate chain in input order, one chain per row.  Because this produces
+multiple rows per read, do not use it as input to primary evaluation or
+coverage plotting.
 
 
 

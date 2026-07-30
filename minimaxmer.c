@@ -16,16 +16,24 @@ int K = 32;          // k-mer length; maximum 32   [-k]
 int WSIZE  = 100;    // sliding window width for (count, hash) minimizer   [-w]
 int RSPACE = 100;    // minimum spacing between uniformly sparse seeds     [-s]
 
-// Experimental build-time controls.  The defaults preserve the historical
-// minimaxmer selector exactly.  They are compile-time rather than run-time
-// options so production invocations cannot accidentally change seed semantics.
+// Build-time selector controls.  Production keeps the historical h%2003 key,
+// but uses D-oriented robust winnowing so that tied window minima are selected
+// consistently from a sequence and its reverse complement.
 //
 // MINIMAX_HASH_MOD=0 uses the full canonical 64-bit ntHash.  With
 // MINIMAX_HASH_REFINE=1, the key is (hash % MINIMAX_HASH_MOD, full_hash);
 // this preserves every non-tied legacy ordering and only resolves modulo ties.
 // MINIMAX_ROBUST_WINNOW=1 implements Schleimer/Winnowmap robust winnowing:
 // retain the previous winner while it remains a minimum, otherwise choose the
-// rightmost minimum in the new complete window.
+// extreme minimum in the current traversal direction.
+// MINIMAX_CANONICAL_WINNOW=1 orients a tied-window run with
+// D(W)=#G+#T-#A-#C over its K+W-1 spelled bases.  Negative-D runs are traversed
+// left-to-right with rightmost fallback; positive-D runs are traversed
+// right-to-left with leftmost fallback.  State is reset when the orientation
+// changes.  This makes the window assignments reverse-complement equivariant.
+// MINIMAX_CANONICAL_THINNING controls the strand-safe positional-pair policy
+// after window counting.  It follows canonical winnowing by default and is
+// independently switchable only for controlled performance attribution.
 #ifndef MINIMAX_HASH_MOD
 #define MINIMAX_HASH_MOD 2003
 #endif
@@ -33,20 +41,51 @@ int RSPACE = 100;    // minimum spacing between uniformly sparse seeds     [-s]
 #define MINIMAX_HASH_REFINE 0
 #endif
 #ifndef MINIMAX_ROBUST_WINNOW
-#define MINIMAX_ROBUST_WINNOW 0
+#define MINIMAX_ROBUST_WINNOW 1
+#endif
+#ifndef MINIMAX_CANONICAL_WINNOW
+#define MINIMAX_CANONICAL_WINNOW 1
+#endif
+#ifndef MINIMAX_CANONICAL_THINNING
+#define MINIMAX_CANONICAL_THINNING MINIMAX_CANONICAL_WINNOW
 #endif
 #ifndef MINIMAX_TIE_AUDIT
 #define MINIMAX_TIE_AUDIT 0
 #endif
+#if (MINIMAX_HASH_REFINE != 0 && MINIMAX_HASH_REFINE != 1) || \
+    (MINIMAX_ROBUST_WINNOW != 0 && MINIMAX_ROBUST_WINNOW != 1) || \
+    (MINIMAX_CANONICAL_WINNOW != 0 && MINIMAX_CANONICAL_WINNOW != 1) || \
+    (MINIMAX_CANONICAL_THINNING != 0 && \
+     MINIMAX_CANONICAL_THINNING != 1) || \
+    (MINIMAX_TIE_AUDIT != 0 && MINIMAX_TIE_AUDIT != 1)
+#error "minimaxmer selector controls must be either 0 or 1"
+#endif
 #if MINIMAX_HASH_REFINE && MINIMAX_HASH_MOD == 0
 #error "MINIMAX_HASH_REFINE requires a non-zero MINIMAX_HASH_MOD"
 #endif
+#if MINIMAX_CANONICAL_WINNOW && !MINIMAX_ROBUST_WINNOW
+#error "MINIMAX_CANONICAL_WINNOW requires MINIMAX_ROBUST_WINNOW"
+#endif
 #if MINIMAX_TIE_AUDIT && \
-    (MINIMAX_HASH_MOD != 2003 || MINIMAX_HASH_REFINE || MINIMAX_ROBUST_WINNOW)
+    (MINIMAX_HASH_MOD != 2003 || MINIMAX_HASH_REFINE || \
+     MINIMAX_ROBUST_WINNOW || MINIMAX_CANONICAL_WINNOW)
 #error "MINIMAX_TIE_AUDIT is defined only for the legacy h%2003 selector"
 #endif
 
+#if MINIMAX_CANONICAL_WINNOW && !MINIMAX_HASH_REFINE && \
+    MINIMAX_HASH_MOD > 0 && MINIMAX_HASH_MOD <= 65536
+#define MINIMAX_PACK_POSITION_TUPLE 1
+#else
+#define MINIMAX_PACK_POSITION_TUPLE 0
+#endif
+
 static const uint64_t MOD = MINIMAX_HASH_MOD;
+
+#if MINIMAX_PACK_POSITION_TUPLE
+typedef uint16_t PositionHash;
+#else
+typedef uint64_t PositionHash;
+#endif
 
 // ASCII base → 2-bit value  (A=0, C=1, G=2, T=3), matching the DAZZ_DB
 // numeric encoding used by himapper's tuple_thread.
@@ -54,6 +93,20 @@ static const uint8_t base2bit[128] = {
     ['A'] = 0, ['C'] = 1, ['G'] = 2, ['T'] = 3,
     ['a'] = 0, ['c'] = 1, ['g'] = 2, ['t'] = 3,
 };
+
+#if MINIMAX_CANONICAL_WINNOW
+// D(W) contribution and validity tables.  The production path receives
+// uppercase A/C/G/T from Load_Read(..., 2); lowercase entries keep the core
+// helper safe for direct unit tests.
+static const int8_t base_balance[256] = {
+    ['A'] = -1, ['C'] = -1, ['G'] = 1, ['T'] = 1,
+    ['a'] = -1, ['c'] = -1, ['g'] = 1, ['t'] = 1,
+};
+static const uint8_t base_is_acgt[256] = {
+    ['A'] = 1, ['C'] = 1, ['G'] = 1, ['T'] = 1,
+    ['a'] = 1, ['c'] = 1, ['g'] = 1, ['t'] = 1,
+};
+#endif
 
 // Bitmask covering the low 2*K bits of a k-mer's 2-bit code; set in main() once K is
 // known (K is capped at 32, so K==32 gives the full uint64 mask).
@@ -180,20 +233,53 @@ static int finish_kpos(FILE *out, uint64_t n_entries)
   return 0;
 }
 
+#if MINIMAX_PACK_POSITION_TUPLE
+// Production h%2003 tuples fit in one uint64:
+//   [ genome count:16 ][ UINT16_MAX-reads count:16 ][ hash key:16 ]
+// The full-length array stores only the 16-bit hash.  The canonical deque
+// caches this packed key for its O(W) live entries, so its hot comparisons
+// remain one integer comparison without paying 8 bytes per sequence position.
+static inline uint64_t pack_position_tuple(uint16_t genome_count,
+                                           uint16_t reads_count,
+                                           uint64_t hash)
+{
+  return ((uint64_t)genome_count << 32) |
+         ((uint64_t)(UINT16_MAX - reads_count) << 16) |
+         (hash & UINT64_C(0xffff));
+}
+
+static inline uint64_t position_tuple_key(
+    int pos,
+    const uint16_t *prof_genome,
+    const uint16_t *prof_reads,
+    const PositionHash *hvals)
+{
+  return pack_position_tuple(
+      prof_genome[pos], prof_reads[pos], (uint64_t)hvals[pos]);
+}
+#endif
+
 // Compare (ca_g, ca_r, ha) < (cb_g, cb_r, hb):
-//   primary:   lower genome count  → more unique in genome   → better seed
-//   secondary: higher reads count  → better covered in reads → better seed
-//   tertiary:  lower hash key       → stable tiebreaker
+//   primary:   lower genome count  -> more unique in genome -> better seed
+//   secondary: higher reads count  -> better covered in reads -> better seed
+//   tertiary:  lower hash key      -> stable tiebreaker
 // In refinement builds only, the full hash is the final collision resolver.
 static inline int position_tuple_lt(int a, int b,
                                     const uint16_t *prof_genome,
                                     const uint16_t *prof_reads,
-                                    const uint64_t *hvals,
+                                    const PositionHash *hvals,
                                     const uint64_t *full_hvals)
+#if MINIMAX_PACK_POSITION_TUPLE
+{
+  (void)full_hvals;
+  return position_tuple_key(a, prof_genome, prof_reads, hvals) <
+         position_tuple_key(b, prof_genome, prof_reads, hvals);
+}
+#else
 { if (prof_genome[a] != prof_genome[b])
     return prof_genome[a] < prof_genome[b];
   if (prof_reads[a] != prof_reads[b])
-    return prof_reads[a] > prof_reads[b];   // higher reads count wins
+    return prof_reads[a] > prof_reads[b];
   if (hvals[a] != hvals[b])
     return hvals[a] < hvals[b];
 #if MINIMAX_HASH_REFINE
@@ -203,13 +289,22 @@ static inline int position_tuple_lt(int a, int b,
   return 0;
 #endif
 }
+#endif
 
 static inline int position_tuple_equal(int a, int b,
                                        const uint16_t *prof_genome,
                                        const uint16_t *prof_reads,
-                                       const uint64_t *hvals,
+                                       const PositionHash *hvals,
                                        const uint64_t *full_hvals)
-{ if (prof_genome[a] != prof_genome[b] ||
+#if MINIMAX_PACK_POSITION_TUPLE
+{
+  (void)full_hvals;
+  return position_tuple_key(a, prof_genome, prof_reads, hvals) ==
+         position_tuple_key(b, prof_genome, prof_reads, hvals);
+}
+#else
+{
+  if (prof_genome[a] != prof_genome[b] ||
       prof_reads[a] != prof_reads[b] ||
       hvals[a] != hvals[b])
     return 0;
@@ -220,6 +315,7 @@ static inline int position_tuple_equal(int a, int b,
   return 1;
 #endif
 }
+#endif
 
 #if MINIMAX_TIE_AUDIT
 static inline int profile_tuple_lt(int a, int b,
@@ -273,10 +369,19 @@ static void fill_canonical_codes(const char *seq, int plen, int kmer,
 typedef struct {
   int      pos;
   int      nw_val;
+#if MINIMAX_PACK_POSITION_TUPLE && MINIMAX_CANONICAL_THINNING
+  uint64_t tuple;
+#else
   uint16_t g_count;
   uint16_t r_count;
   uint64_t hash;
+#endif
 } Candidate;
+
+#if MINIMAX_PACK_POSITION_TUPLE && MINIMAX_CANONICAL_THINNING
+typedef char Candidate_must_be_16_bytes[
+    (sizeof(Candidate) == 16) ? 1 : -1];
+#endif
 
 #if MINIMAX_HASH_REFINE
 // Keep Candidate byte-layout identical to the historical build.  A larger
@@ -295,6 +400,10 @@ static int cand_cmp(const void *a, const void *b)
   const Candidate *cb = (const Candidate *)b;
   if (ca->nw_val != cb->nw_val)
     return (cb->nw_val > ca->nw_val) ? 1 : -1;
+#if MINIMAX_PACK_POSITION_TUPLE && MINIMAX_CANONICAL_THINNING
+  if (ca->tuple != cb->tuple)
+    return (ca->tuple > cb->tuple) ? 1 : -1;
+#else
   if (ca->g_count != cb->g_count)
     return (ca->g_count > cb->g_count) ? 1 : -1;
   if (ca->r_count != cb->r_count)
@@ -308,8 +417,41 @@ static int cand_cmp(const void *a, const void *b)
       return (fa > fb) ? 1 : -1;
   }
 #endif
+#endif
   return 0;
 }
+
+#if MINIMAX_CANONICAL_THINNING
+static int cand_pos_cmp(const void *a, const void *b)
+{
+  const Candidate *ca = (const Candidate *)a;
+  const Candidate *cb = (const Candidate *)b;
+  return (ca->pos > cb->pos) - (ca->pos < cb->pos);
+}
+
+static int candidate_priority_equal(const Candidate *a, const Candidate *b,
+                                    const uint64_t *full_hvals)
+{
+  if (a->nw_val != b->nw_val)
+    return 0;
+#if MINIMAX_PACK_POSITION_TUPLE && MINIMAX_CANONICAL_THINNING
+  (void)full_hvals;
+  return a->tuple == b->tuple;
+#else
+  if (
+      a->g_count != b->g_count ||
+      a->r_count != b->r_count ||
+      a->hash != b->hash)
+    return 0;
+#if MINIMAX_HASH_REFINE
+  return full_hvals[a->pos] == full_hvals[b->pos];
+#else
+  (void)full_hvals;
+  return 1;
+#endif
+#endif
+}
+#endif
 
 static inline int seed_bit_is_set(const uint64_t *bits, size_t pos)
 {
@@ -323,7 +465,8 @@ static inline void seed_bit_set(uint64_t *bits, size_t pos)
 
 // Set the inclusive bit range [lo, hi].  Keep the first/last-word cases
 // separate so no expression ever shifts a uint64_t by 64 bits.
-static void seed_bit_set_range(uint64_t *bits, size_t lo, size_t hi)
+static inline __attribute__((always_inline))
+void seed_bit_set_range(uint64_t *bits, size_t lo, size_t hi)
 {
   size_t first = lo >> 6;
   size_t last  = hi >> 6;
@@ -343,10 +486,717 @@ static void seed_bit_set_range(uint64_t *bits, size_t lo, size_t hi)
   bits[last] |= right_mask;
 }
 
+static inline __attribute__((always_inline))
+void accept_sparse_seed(uint64_t *selected, uint64_t *blocked,
+                        size_t plen, size_t pos)
+{
+  seed_bit_set(selected, pos);
+  // The historical test rejects distances strictly less than RSPACE, so an
+  // accepted seed blocks radius RSPACE-1.  RSPACE==0 blocks nothing.
+  if (RSPACE > 0)
+    { size_t radius = (size_t)RSPACE - 1;
+      size_t lo = radius > pos ? 0 : pos - radius;
+      size_t remaining = plen - 1 - pos;
+      size_t hi = radius > remaining ? plen - 1 : pos + radius;
+      seed_bit_set_range(blocked, lo, hi);
+    }
+}
+
+#if MINIMAX_CANONICAL_WINNOW
+// Return the D(W) balance for bases[start..start+span), or -1 if a direct
+// caller supplied a non-ACGT character.  DAZZ Load_Read(..., 2) itself only
+// yields uppercase A/C/G/T.
+static int initial_window_balance(const char *bases, int start, int span,
+                                  int *balance)
+{
+  int d = 0;
+  int j;
+
+  for (j = 0; j < span; j++)
+    { unsigned char base = (unsigned char)bases[start + j];
+      if (!base_is_acgt[base])
+        return -1;
+      d += base_balance[base];
+    }
+  *balance = d;
+  return 0;
+}
+
+static int roll_window_balance(const char *bases, int start, int span,
+                               int *balance)
+{
+  unsigned char outgoing = (unsigned char)bases[start - 1];
+  unsigned char incoming = (unsigned char)bases[start + span - 1];
+
+  if (!base_is_acgt[outgoing] || !base_is_acgt[incoming])
+    return -1;
+  *balance += base_balance[incoming] - base_balance[outgoing];
+  return 0;
+}
+
+// D is non-zero whenever the spelled window length is odd.  For even spans,
+// an exact comparison against the reverse complement supplies an
+// anti-symmetric secondary orientation.  Positive selects the right-to-left
+// traversal; zero means that the window is exactly
+// self-reverse-complementary.
+static int exact_window_orientation(const char *bases, int start, int span,
+                                    int balance)
+{
+  int j;
+
+  if (balance > 0)
+    return 1;
+  if (balance < 0)
+    return -1;
+
+  for (j = 0; j < span; j++)
+    { unsigned char left = (unsigned char)bases[start + j];
+      unsigned char right =
+          (unsigned char)bases[start + span - 1 - j];
+      uint8_t forward;
+      uint8_t reverse;
+
+      if (!base_is_acgt[left] || !base_is_acgt[right])
+        return 2;
+      forward = base2bit[left];
+      reverse = (uint8_t)(UINT8_C(3) - base2bit[right]);
+      if (forward < reverse)
+        return 1;
+      if (forward > reverse)
+        return -1;
+    }
+  return 0;
+}
+
+// Refresh the cached end of the deque's equal-minimum prefix.  The cache is
+// invalidated whenever a tail contraction removes its slot, or the front moves
+// past it.  New equal minima extend it at insertion time below.  Consequently
+// tuple equality is loaded only when a different minimum group reaches the
+// front, rather than once per complete window.
+typedef struct
+{
+  int pos;
+#if MINIMAX_PACK_POSITION_TUPLE
+  uint64_t key;
+#endif
+} CanonicalMinimum;
+
+typedef struct
+{
+  void *value;
+  int   narrow;
+} WindowCounts;
+
+static inline CanonicalMinimum invalid_canonical_minimum(void)
+{
+  CanonicalMinimum result;
+
+  result.pos = -1;
+#if MINIMAX_PACK_POSITION_TUPLE
+  result.key = 0;
+#endif
+  return result;
+}
+
+static inline CanonicalMinimum canonical_minimum_at(
+    int pos,
+    const uint16_t *prof_genome,
+    const uint16_t *prof_reads,
+    const PositionHash *hvals)
+{
+  CanonicalMinimum result;
+
+  result.pos = pos;
+#if MINIMAX_PACK_POSITION_TUPLE
+  result.key = position_tuple_key(pos, prof_genome, prof_reads, hvals);
+#else
+  (void)prof_genome;
+  (void)prof_reads;
+  (void)hvals;
+#endif
+  return result;
+}
+
+static inline int canonical_minimum_lt(
+    CanonicalMinimum a,
+    CanonicalMinimum b,
+    const uint16_t *prof_genome,
+    const uint16_t *prof_reads,
+    const PositionHash *hvals,
+    const uint64_t *full_hvals)
+{
+#if MINIMAX_PACK_POSITION_TUPLE
+  (void)prof_genome;
+  (void)prof_reads;
+  (void)hvals;
+  (void)full_hvals;
+  return a.key < b.key;
+#else
+  return position_tuple_lt(
+      a.pos, b.pos, prof_genome, prof_reads, hvals, full_hvals);
+#endif
+}
+
+static inline int canonical_minimum_equal(
+    CanonicalMinimum a,
+    CanonicalMinimum b,
+    const uint16_t *prof_genome,
+    const uint16_t *prof_reads,
+    const PositionHash *hvals,
+    const uint64_t *full_hvals)
+{
+#if MINIMAX_PACK_POSITION_TUPLE
+  (void)prof_genome;
+  (void)prof_reads;
+  (void)hvals;
+  (void)full_hvals;
+  return a.key == b.key;
+#else
+  return position_tuple_equal(
+      a.pos, b.pos, prof_genome, prof_reads, hvals, full_hvals);
+#endif
+}
+
+static void init_window_counts(WindowCounts *counts, int plen)
+{
+  size_t element_size;
+
+  counts->narrow = WSIZE <= UINT8_MAX;
+  element_size = counts->narrow ? sizeof(uint8_t) : sizeof(int);
+  if ((size_t)plen > SIZE_MAX / element_size)
+    { fprintf(stderr, "canonical winnowing: window-count size overflow\n");
+      exit(1);
+    }
+  counts->value = calloc((size_t)plen, element_size);
+  if (counts->value == NULL && plen > 0)
+    { perror("calloc window counts");
+      exit(1);
+    }
+}
+
+static void free_window_counts(WindowCounts *counts)
+{
+  free(counts->value);
+  counts->value = NULL;
+  counts->narrow = 0;
+}
+
+static inline __attribute__((always_inline))
+void increment_window_count(void *value, int narrow, int pos)
+{
+  if (__builtin_expect(narrow, 1))
+    ((uint8_t *)value)[pos]++;
+  else
+    ((int *)value)[pos]++;
+}
+
+static inline unsigned int get_window_count(
+    const WindowCounts *counts, int pos)
+{
+  if (__builtin_expect(counts->narrow, 1))
+    return ((const uint8_t *)counts->value)[pos];
+  return (unsigned int)((const int *)counts->value)[pos];
+}
+
+static CanonicalMinimum cached_rightmost_equal_minimum(
+    const CanonicalMinimum *dq,
+    size_t mask,
+    size_t head,
+    size_t tail,
+    size_t *equal_end,
+    const uint16_t *prof_genome,
+    const uint16_t *prof_reads,
+    const PositionHash *hvals,
+    const uint64_t *full_hvals)
+{
+  size_t q = *equal_end;
+
+  if (q == SIZE_MAX || q < head || q >= tail)
+    {
+      q = head;
+      while (q + 1 < tail &&
+             canonical_minimum_equal(
+                 dq[(q + 1) & mask], dq[head & mask],
+                 prof_genome, prof_reads, hvals, full_hvals))
+        q++;
+    }
+  *equal_end = q;
+  return dq[q & mask];
+}
+
+typedef struct
+{
+  CanonicalMinimum *leftmost;
+  size_t             capacity;
+  size_t             mask;
+  CanonicalMinimum *deque;
+  size_t             deque_capacity;
+  size_t             deque_mask;
+} CanonicalWindowScratch;
+
+static size_t canonical_ring_capacity(size_t need)
+{
+  size_t capacity = 1;
+
+  while (capacity < need)
+    {
+      if (capacity > SIZE_MAX / 2)
+        { fprintf(stderr, "canonical winnowing: ring size overflow\n");
+          exit(1);
+        }
+      capacity <<= 1;
+    }
+  if (capacity > SIZE_MAX / sizeof(CanonicalMinimum))
+    { fprintf(stderr, "canonical winnowing: ring allocation overflow\n");
+      exit(1);
+    }
+  return capacity;
+}
+
+static void init_canonical_window_scratch(CanonicalWindowScratch *scratch)
+{
+  size_t deque_capacity =
+      canonical_ring_capacity((size_t)WSIZE + 1);
+  size_t capacity = deque_capacity;
+
+  // Most positive-D subruns are short.  A small floor removes their replay
+  // without making scratch scale with the sequence length; WSIZE+1 still
+  // guarantees enough space for the exact replay fallback.
+  if (capacity < 512)
+    capacity = 512;
+  if (capacity > SIZE_MAX / sizeof(CanonicalMinimum))
+    { fprintf(stderr, "canonical winnowing: scratch size overflow\n");
+      exit(1);
+    }
+  scratch->leftmost =
+      (CanonicalMinimum *)malloc(capacity * sizeof(CanonicalMinimum));
+  scratch->deque =
+      (CanonicalMinimum *)malloc(
+          deque_capacity * sizeof(CanonicalMinimum));
+  if (scratch->leftmost == NULL || scratch->deque == NULL)
+    { perror("malloc canonical window scratch");
+      exit(1);
+    }
+  scratch->capacity = capacity;
+  scratch->mask = capacity - 1;
+  scratch->deque_capacity = deque_capacity;
+  scratch->deque_mask = deque_capacity - 1;
+}
+
+static void free_canonical_window_scratch(CanonicalWindowScratch *scratch)
+{
+  free(scratch->leftmost);
+  free(scratch->deque);
+  scratch->leftmost = NULL;
+  scratch->deque = NULL;
+  scratch->capacity = 0;
+  scratch->mask = 0;
+  scratch->deque_capacity = 0;
+  scratch->deque_mask = 0;
+}
+
+// Assign a positive-D tie subrun in its canonical (right-to-left) traversal.
+// The circular monotone deque keeps the leftmost representative of equal
+// minima.  right_anchor is the unique winner of the immediately following
+// window, or has pos=-1 at an orientation/empty/sequence boundary.
+static __attribute__((cold, noinline))
+void assign_reverse_tie_subrun(int run_start, int run_end,
+                               CanonicalMinimum right_anchor,
+                               const uint16_t *prof_genome,
+                               const uint16_t *prof_reads,
+                               const PositionHash *hvals,
+                               const uint64_t *full_hvals,
+                               CanonicalWindowScratch *scratch,
+                               void *nw,
+                               int nw_narrow)
+{
+  size_t head = 0;
+  size_t tail = 0;
+  CanonicalMinimum previous = right_anchor;
+  int high = run_end + WSIZE - 1;
+  int pos;
+
+  for (pos = high; pos >= run_start; pos--)
+    {
+      if (prof_genome[pos] != 0)
+        {
+          CanonicalMinimum incoming =
+              canonical_minimum_at(
+                  pos, prof_genome, prof_reads, hvals);
+
+          while (head < tail)
+            { CanonicalMinimum back =
+                  scratch->leftmost[(tail - 1) & scratch->mask];
+              if (canonical_minimum_lt(
+                      back, incoming, prof_genome, prof_reads,
+                      hvals, full_hvals))
+                break;
+              tail--;
+            }
+          scratch->leftmost[tail & scratch->mask] = incoming;
+          tail++;
+        }
+
+      if (pos <= run_end)
+        {
+          int window_end = pos + WSIZE - 1;
+          CanonicalMinimum minimum;
+          CanonicalMinimum winner;
+
+          while (head < tail &&
+                 scratch->leftmost[head & scratch->mask].pos > window_end)
+            head++;
+          if (head == tail)
+            { fprintf(stderr,
+                      "canonical winnowing: empty deferred tie window at %d\n",
+                      pos);
+              exit(1);
+            }
+
+          minimum = scratch->leftmost[head & scratch->mask];
+          if (previous.pos >= pos && previous.pos <= window_end &&
+              canonical_minimum_equal(
+                  previous, minimum, prof_genome, prof_reads,
+                  hvals, full_hvals))
+            winner = previous;
+          else
+            winner = minimum;
+          increment_window_count(nw, nw_narrow, winner.pos);
+          previous = winner;
+        }
+    }
+}
+
+// The forward scan already knows the leftmost minimum of every positive-D
+// window.  Evaluating those positions backwards is exactly the right-to-left
+// robust recurrence and avoids rebuilding the deque over the run plus its
+// WSIZE-1 halo.
+static void assign_buffered_reverse_tie_subrun(
+    int run_start,
+    size_t run_length,
+    CanonicalMinimum right_anchor,
+    const uint16_t *prof_genome,
+    const uint16_t *prof_reads,
+    const PositionHash *hvals,
+    const uint64_t *full_hvals,
+    const CanonicalMinimum *leftmost,
+    void *nw,
+    int nw_narrow)
+{
+  CanonicalMinimum previous = right_anchor;
+  size_t j = run_length;
+
+  while (j > 0)
+    {
+      int start;
+      CanonicalMinimum minimum;
+      CanonicalMinimum winner;
+
+      j--;
+      start = run_start + (int)j;
+      minimum = leftmost[j];
+      if (previous.pos >= start && previous.pos < start + WSIZE &&
+          canonical_minimum_equal(
+              previous, minimum, prof_genome, prof_reads,
+              hvals, full_hvals))
+        winner = previous;
+      else
+        winner = minimum;
+      increment_window_count(nw, nw_narrow, winner.pos);
+      previous = winner;
+    }
+}
+
+static void assign_positive_tie_subrun(
+    int run_start,
+    int run_end,
+    size_t run_length,
+    CanonicalMinimum right_anchor,
+    const uint16_t *prof_genome,
+    const uint16_t *prof_reads,
+    const PositionHash *hvals,
+    const uint64_t *full_hvals,
+    CanonicalWindowScratch *scratch,
+    void *nw,
+    int nw_narrow)
+{
+  if (run_start < 0)
+    return;
+  if (run_length != (size_t)(run_end - run_start + 1))
+    { fprintf(stderr,
+              "canonical winnowing: inconsistent positive-D subrun\n");
+      exit(1);
+    }
+
+  if (run_length <= scratch->capacity)
+    assign_buffered_reverse_tie_subrun(
+        run_start, run_length, right_anchor,
+        prof_genome, prof_reads, hvals, full_hvals,
+        scratch->leftmost, nw, nw_narrow);
+  else
+    assign_reverse_tie_subrun(
+        run_start, run_end, right_anchor,
+        prof_genome, prof_reads, hvals, full_hvals,
+        scratch, nw, nw_narrow);
+}
+
+// D-oriented robust winnowing.  Unique minima are direction-independent.
+// Consecutive tied windows are divided at D-sign changes:
+//   D < 0: traverse left-to-right, retain the actual previous winner, and
+//          choose the rightmost minimum when a new winner is needed.
+//   D > 0: mirror the same policy right-to-left with leftmost fallback.
+// D==0 uses an exact window-vs-RC comparison.  An exactly self-RC tied window
+// has no strand-safe singleton winner, so both extreme minima receive the
+// window and directional state is reset.
+static inline __attribute__((always_inline))
+void count_canonical_robust_minima(const char *seq,
+                                   int plen,
+                                   int kmer,
+                                   const uint16_t *prof_genome,
+                                   const uint16_t *prof_reads,
+                                   const PositionHash *hvals,
+                                   const uint64_t *full_hvals,
+                                   int read_id,
+                                   void *nw,
+                                   int nw_narrow,
+                                   CanonicalWindowScratch *scratch)
+{
+  const char *bases = seq - kmer + 1;
+  CanonicalMinimum *dq = scratch->deque;
+  size_t dq_mask = scratch->deque_mask;
+  int span;
+  size_t dq_head = 0;
+  size_t dq_tail = 0;
+  size_t equal_end = SIZE_MAX;
+  int previous_class = 0;  // 0=reset, 1=unique, -1=negative, 2=positive
+  CanonicalMinimum forward_previous = invalid_canonical_minimum();
+  int positive_start = -1;
+  size_t positive_length = 0;
+  int previous_window_tied = 0;
+  int balance = 0;
+  int i;
+
+  if (plen < WSIZE)
+    return;
+  span = kmer + WSIZE - 1;
+
+  for (i = 0; i < plen; i++)
+    {
+      int start;
+
+      if (prof_genome[i] != 0)
+        {
+          CanonicalMinimum incoming =
+              canonical_minimum_at(
+                  i, prof_genome, prof_reads, hvals);
+
+          // Retain equal tuples.  The front is therefore the leftmost
+          // minimum.  Keep the historical boolean comparator in this hot
+          // loop; only an incoming item adjacent to the cached minimum prefix
+          // needs a separate equality test.
+          while (dq_head < dq_tail &&
+                 canonical_minimum_lt(
+                     incoming, dq[(dq_tail - 1) & dq_mask],
+                     prof_genome, prof_reads, hvals, full_hvals))
+            dq_tail--;
+          // A tail contraction can invalidate the cached equal-prefix end,
+          // including the one-element case where its slot is now overwritten.
+          if (equal_end != SIZE_MAX && equal_end >= dq_tail)
+            equal_end = SIZE_MAX;
+          if (equal_end != SIZE_MAX &&
+              dq_head < dq_tail &&
+              equal_end == dq_tail - 1 &&
+              canonical_minimum_equal(
+                  incoming, dq[dq_head & dq_mask],
+                  prof_genome, prof_reads, hvals, full_hvals))
+            equal_end = dq_tail;
+          dq[dq_tail & dq_mask] = incoming;
+          dq_tail++;
+        }
+
+      start = i - WSIZE + 1;
+      while (dq_head < dq_tail &&
+             dq[dq_head & dq_mask].pos < start)
+        dq_head++;
+      if (start < 0)
+        continue;
+
+      if (dq_head == dq_tail)
+        {
+          if (positive_start >= 0)
+            assign_positive_tie_subrun(
+                positive_start, start - 1, positive_length,
+                invalid_canonical_minimum(),
+                prof_genome, prof_reads, hvals, full_hvals,
+                scratch, nw, nw_narrow);
+          positive_start = -1;
+          positive_length = 0;
+          previous_class = 0;
+          forward_previous = invalid_canonical_minimum();
+          previous_window_tied = 0;
+          continue;
+        }
+
+      {
+        CanonicalMinimum leftmost = dq[dq_head & dq_mask];
+        CanonicalMinimum rightmost =
+            cached_rightmost_equal_minimum(
+                dq, dq_mask, dq_head, dq_tail, &equal_end,
+                prof_genome, prof_reads, hvals, full_hvals);
+        int tied = equal_end > dq_head;
+
+        if (!tied)
+          {
+            if (positive_start >= 0)
+              {
+                assign_positive_tie_subrun(
+                    positive_start, start - 1, positive_length, leftmost,
+                    prof_genome, prof_reads, hvals, full_hvals,
+                    scratch, nw, nw_narrow);
+                positive_start = -1;
+                positive_length = 0;
+              }
+            increment_window_count(nw, nw_narrow, leftmost.pos);
+            previous_class = 1;
+            forward_previous = leftmost;
+            previous_window_tied = 0;
+            continue;
+          }
+
+        if (previous_window_tied)
+          {
+            if (roll_window_balance(bases, start, span, &balance) != 0)
+              { fprintf(stderr,
+                        "canonical winnowing: non-ACGT base in read %d "
+                        "window %d\n",
+                        read_id, start);
+                exit(1);
+              }
+          }
+        else if (initial_window_balance(bases, start, span, &balance) != 0)
+          {
+            fprintf(stderr,
+                    "canonical winnowing: non-ACGT base in read %d window %d\n",
+                    read_id, start);
+            exit(1);
+          }
+        previous_window_tied = 1;
+
+        {
+          // A sum of an odd number of +/-1 terms cannot be zero.  Production
+          // K=32,W=100 has span=131, so it never needs the more expensive
+          // exact window-versus-RC fallback.
+          int orientation =
+              (span & 1) ? (balance > 0 ? 1 : -1) :
+              exact_window_orientation(bases, start, span, balance);
+
+          if (orientation == 2)
+            { fprintf(stderr,
+                      "canonical winnowing: non-ACGT base in read %d "
+                      "window %d\n",
+                      read_id, start);
+              exit(1);
+            }
+
+          if (orientation < 0)
+            {
+              CanonicalMinimum winner;
+
+              if (positive_start >= 0)
+                assign_positive_tie_subrun(
+                    positive_start, start - 1, positive_length,
+                    invalid_canonical_minimum(),
+                    prof_genome, prof_reads, hvals, full_hvals,
+                    scratch, nw, nw_narrow);
+              positive_start = -1;
+              positive_length = 0;
+              if (previous_class != -1 && previous_class != 1)
+                forward_previous = invalid_canonical_minimum();
+
+              if (forward_previous.pos >= start &&
+                  forward_previous.pos <= i &&
+                  canonical_minimum_equal(
+                      forward_previous, leftmost,
+                      prof_genome, prof_reads, hvals, full_hvals))
+                winner = forward_previous;
+              else
+                winner = rightmost;
+              increment_window_count(nw, nw_narrow, winner.pos);
+              forward_previous = winner;
+              previous_class = -1;
+            }
+          else if (orientation > 0)
+            {
+              if (previous_class != 2)
+                { positive_start = start;
+                  positive_length = 0;
+                }
+              if (positive_length < scratch->capacity)
+                scratch->leftmost[positive_length] = leftmost;
+              positive_length++;
+              previous_class = 2;
+              forward_previous = invalid_canonical_minimum();
+            }
+          else
+            {
+              if (positive_start >= 0)
+                assign_positive_tie_subrun(
+                    positive_start, start - 1, positive_length,
+                    invalid_canonical_minimum(),
+                    prof_genome, prof_reads, hvals, full_hvals,
+                    scratch, nw, nw_narrow);
+              positive_start = -1;
+              positive_length = 0;
+              increment_window_count(nw, nw_narrow, leftmost.pos);
+              if (rightmost.pos != leftmost.pos)
+                increment_window_count(nw, nw_narrow, rightmost.pos);
+              previous_class = 0;
+              forward_previous = invalid_canonical_minimum();
+            }
+        }
+      }
+    }
+
+  if (positive_start >= 0)
+    assign_positive_tie_subrun(
+        positive_start, plen - WSIZE, positive_length,
+        invalid_canonical_minimum(),
+        prof_genome, prof_reads, hvals, full_hvals,
+        scratch, nw, nw_narrow);
+}
+#endif
+
+#if MINIMAX_CANONICAL_WINNOW
+static void count_window_minima_with_scratch(
+    const char *seq,
+    int plen,
+    int kmer,
+    const uint16_t *prof_genome,
+    const uint16_t *prof_reads,
+    const PositionHash *hvals,
+    const uint64_t *full_hvals,
+    int read_id,
+    WindowCounts *nw,
+    CanonicalWindowScratch *scratch)
+{
+  // Dispatch once per sequence.  The always-inlined selector sees a constant
+  // storage width in each arm, so assigned windows do not pay this test.
+  if (__builtin_expect(nw->narrow, 1))
+    count_canonical_robust_minima(
+        seq, plen, kmer, prof_genome, prof_reads,
+        hvals, full_hvals, read_id, nw->value, 1, scratch);
+  else
+    count_canonical_robust_minima(
+        seq, plen, kmer, prof_genome, prof_reads,
+        hvals, full_hvals, read_id, nw->value, 0, scratch);
+}
+#endif
+
 // Count how many complete windows are assigned to each position.  Keeping this
 // selector separate from hashing and spacing lets the experiment validate both
 // deque policies against a simple O(nW) oracle without changing KPOS output.
-static void count_window_minima(const char *seq,
+static __attribute__((unused))
+void count_window_minima(const char *seq,
                                 int plen,
                                 int kmer,
                                 const uint16_t *prof_genome,
@@ -363,6 +1213,54 @@ static void count_window_minima(const char *seq,
 #endif
                                 )
 {
+#if MINIMAX_CANONICAL_WINNOW
+  CanonicalWindowScratch scratch;
+  WindowCounts compact_nw;
+  int i;
+#if MINIMAX_PACK_POSITION_TUPLE
+  PositionHash *compact_hvals = NULL;
+  const PositionHash *selector_hvals = compact_hvals;
+
+  // This internal test/helper entry receives the configured hash key, not an
+  // unmodded full hash.  In this arm MINIMAX_HASH_MOD<=65536, so every key is
+  // losslessly representable in 16 bits.
+  if (plen > 0)
+    {
+      compact_hvals =
+          (PositionHash *)malloc((size_t)plen * sizeof(PositionHash));
+      if (compact_hvals == NULL)
+        { perror("malloc compact selector hashes");
+          exit(1);
+        }
+      for (i = 0; i < plen; i++)
+        {
+          if (hvals[i] > UINT16_MAX)
+            { fprintf(stderr,
+                      "canonical winnowing: selector hash exceeds 16 bits\n");
+              exit(1);
+            }
+          compact_hvals[i] = (PositionHash)hvals[i];
+        }
+      selector_hvals = compact_hvals;
+    }
+#else
+  const PositionHash *selector_hvals = hvals;
+#endif
+
+  (void)dq;
+  init_canonical_window_scratch(&scratch);
+  init_window_counts(&compact_nw, plen);
+  count_window_minima_with_scratch(
+      seq, plen, kmer, prof_genome, prof_reads,
+      selector_hvals, full_hvals, read_id, &compact_nw, &scratch);
+  for (i = 0; i < plen; i++)
+    nw[i] += (int)get_window_count(&compact_nw, i);
+  free_window_counts(&compact_nw);
+  free_canonical_window_scratch(&scratch);
+#if MINIMAX_PACK_POSITION_TUPLE
+  free(compact_hvals);
+#endif
+#else
 #ifndef DEBUG_HASH
   (void)seq;
   (void)kmer;
@@ -537,6 +1435,7 @@ static void count_window_minima(const char *seq,
   if (sequence_has_tie)
     tie_stats->sequences_with_full_tie++;
 #endif
+#endif
 }
 
 // Select seeds using a sliding-window (genome_count, -reads_count, hash) minimizer.
@@ -553,14 +1452,20 @@ static void count_window_minima(const char *seq,
 //   read_id     – 0-based read index
 //   out         – block-local KPOS vector
 //
-// Returns the number of entries appended.
-int find_seeds(const char    *seq,
+// Returns the number of entries appended.  Production workers pass a reusable
+// canonical scratch buffer; the public wrapper below preserves the historical
+// find_seeds() interface for direct callers and selector tests.
+static int find_seeds_with_scratch(
+               const char    *seq,
                const int      plen,
                const int      K,
                const uint16  *prof_genome,
                const uint16  *prof_reads,
                const int      read_id,
                KposVector    *out
+#if MINIMAX_CANONICAL_WINNOW
+               , CanonicalWindowScratch *window_scratch
+#endif
 #if MINIMAX_TIE_AUDIT
                , TieStats    *tie_stats
 #endif
@@ -569,7 +1474,8 @@ int find_seeds(const char    *seq,
   if (plen <= 0) return 0;
 
   // Step 1: compute all canonical hash values and derive the configured key.
-  uint64_t *hvals = (uint64_t *) malloc((size_t)plen * sizeof(uint64_t));
+  PositionHash *hvals =
+      (PositionHash *)malloc((size_t)plen * sizeof(PositionHash));
   uint64_t *full_hvals = NULL;
 #if MINIMAX_TIE_AUDIT
   uint64_t *canonical_codes =
@@ -585,6 +1491,17 @@ int find_seeds(const char    *seq,
   fill_canonical_codes(seq, plen, K, canonical_codes);
 #endif
   { uint64_t fhVal = 0, rhVal = 0;
+#if MINIMAX_PACK_POSITION_TUPLE
+    uint64_t hash = NTC64_b(seq - K + 1, K, &fhVal, &rhVal) % MOD;
+    hvals[0] = (PositionHash)hash;
+    for (int i = 1; i < plen; i++)
+      {
+        hash =
+            NTC64_c((unsigned char)seq[i - K], (unsigned char)seq[i],
+                    K, &fhVal, &rhVal) % MOD;
+        hvals[i] = (PositionHash)hash;
+      }
+#else
     hvals[0] = NTC64_b(seq - K + 1, K, &fhVal, &rhVal);
     for (int i = 1; i < plen; i++)
       hvals[i] = NTC64_c((unsigned char)seq[i - K], (unsigned char)seq[i],
@@ -592,7 +1509,7 @@ int find_seeds(const char    *seq,
 #if MINIMAX_HASH_REFINE
     full_hvals = (uint64_t *)malloc((size_t)plen * sizeof(uint64_t));
     if (!full_hvals) { perror("malloc full_hvals"); exit(1); }
-    memcpy(full_hvals, hvals, (size_t)plen * sizeof(uint64_t));
+    memcpy(full_hvals, hvals, (size_t)plen * sizeof(PositionHash));
 #endif
 #if MINIMAX_HASH_MOD > 0
     // Historical builds use MOD=2003.  Larger-modulus and refinement builds
@@ -600,23 +1517,36 @@ int find_seeds(const char    *seq,
     for (int i = 0; i < plen; i++)
       hvals[i] %= MOD;
 #endif
+#endif
   }
 
   // Step 2: sliding-window minimum with a monotone deque.
   //   The deque stores indices in increasing position order.
   //   Front = index with the minimum (count, hash) in the current window.
-  //   We pop from the back any index j whose tuple >= the incoming tuple
-  //   (it can never win a future window while the new element is around).
-  int  *dq      = (int  *) malloc((size_t)plen * sizeof(int));
-  int  *nw      = (int  *) calloc((size_t)plen,  sizeof(int));   // # of windows for which position i is minimizer
-  if (!dq || !nw) { perror("malloc deque/nw"); exit(1); }
+  //   Canonical mode retains the equal-minimum prefix so D-oriented robust
+  //   traversal can choose either extreme; historical modes use their
+  //   original strict/non-strict pop policy.
+#if MINIMAX_CANONICAL_WINNOW
+  WindowCounts nw;
 
+  init_window_counts(&nw, plen);
+  count_window_minima_with_scratch(
+      seq, plen, K, prof_genome, prof_reads,
+      hvals, full_hvals, read_id, &nw, window_scratch);
+#define NW_AT(pos) get_window_count(&nw, (pos))
+#else
+  int *dq = (int *)malloc((size_t)plen * sizeof(int));
+  int *nw = (int *)calloc((size_t)plen, sizeof(int));
+
+  if (!dq || !nw) { perror("malloc deque/nw"); exit(1); }
   count_window_minima(seq, plen, K, prof_genome, prof_reads,
                       hvals, full_hvals, read_id, dq, nw
 #if MINIMAX_TIE_AUDIT
                       , canonical_codes, profile_dq, tie_stats
 #endif
                       );
+#define NW_AT(pos) ((unsigned int)nw[(pos)])
+#endif
 
   // Step 3: Uniformly sparse thinning.
   // Sort candidates by descending h_nw = (NW, -h_minimax) priority, then
@@ -629,19 +1559,25 @@ int find_seeds(const char    *seq,
 
   { int ncand = 0;
     for (int i = 0; i < plen; i++)
-      if (nw[i] > 0) ncand++;
+      if (NW_AT(i) > 0) ncand++;
 
     if (ncand > 0)
       { Candidate *cands = (Candidate *) malloc((size_t)ncand * sizeof(Candidate));
         if (!cands) { perror("malloc cands"); exit(1); }
         { int ci = 0;
           for (int i = 0; i < plen; i++)
-            if (nw[i] > 0)
+            if (NW_AT(i) > 0)
               { cands[ci].pos     = i;
-                cands[ci].nw_val  = nw[i];
+                cands[ci].nw_val  = (int)NW_AT(i);
+#if MINIMAX_PACK_POSITION_TUPLE && MINIMAX_CANONICAL_THINNING
+                cands[ci].tuple =
+                    position_tuple_key(
+                        i, prof_genome, prof_reads, hvals);
+#else
                 cands[ci].g_count = prof_genome[i];
                 cands[ci].r_count = prof_reads[i];
-                cands[ci].hash    = hvals[i];
+                cands[ci].hash    = (uint64_t)hvals[i];
+#endif
                 ci++;
               }
         }
@@ -656,23 +1592,79 @@ int find_seeds(const char    *seq,
 #endif
           }
 
+#if MINIMAX_CANONICAL_THINNING
+        {
+          // Within each priority-equal group, order by position and visit the
+          // two extremes as a pair.  Keeping the positional key out of the
+          // primary qsort is intentional: reads contain many duplicate
+          // priorities, and forcing a total order there costs more than these
+          // small group-local sorts.  Accept both extremes when mutually
+          // compatible, then move inward past candidates blocked by that
+          // pair.  Left and right exchange under RC, so every decision is
+          // strand-safe.
+          int begin = 0;
+
+          while (begin < ncand)
+            {
+              int end = begin + 1;
+              int left;
+              int right;
+
+              while (end < ncand &&
+                     candidate_priority_equal(cands + begin, cands + end,
+                                              full_hvals))
+                end++;
+              if (end - begin > 1)
+                qsort(cands + begin, (size_t)(end - begin),
+                      sizeof(Candidate), cand_pos_cmp);
+              left = begin;
+              right = end - 1;
+              while (left <= right)
+                {
+                  int left_pos;
+                  int right_pos;
+
+                  while (left <= right &&
+                         seed_bit_is_set(
+                             blocked, (size_t)cands[left].pos))
+                    left++;
+                  if (left > right)
+                    break;
+                  while (left < right &&
+                         seed_bit_is_set(
+                             blocked, (size_t)cands[right].pos))
+                    right--;
+
+                  left_pos = cands[left].pos;
+                  right_pos = cands[right].pos;
+                  if (left == right)
+                    {
+                      accept_sparse_seed(selected, blocked, (size_t)plen,
+                                         (size_t)left_pos);
+                      break;
+                    }
+
+                  if (right_pos - left_pos >= RSPACE)
+                    {
+                      accept_sparse_seed(selected, blocked, (size_t)plen,
+                                         (size_t)left_pos);
+                      accept_sparse_seed(selected, blocked, (size_t)plen,
+                                         (size_t)right_pos);
+                    }
+                  left++;
+                  right--;
+                }
+              begin = end;
+            }
+        }
+#else
         for (int ci = 0; ci < ncand; ci++)
           { size_t p = (size_t)cands[ci].pos;
             if (seed_bit_is_set(blocked, p))
               continue;
-
-            seed_bit_set(selected, p);
-
-            // The old test rejects distances strictly less than RSPACE, so an
-            // accepted seed blocks radius RSPACE-1.  RSPACE==0 blocks nothing.
-            if (RSPACE > 0)
-              { size_t radius = (size_t)RSPACE - 1;
-                size_t lo = radius > p ? 0 : p - radius;
-                size_t remaining = (size_t)plen - 1 - p;
-                size_t hi = radius > remaining ? (size_t)plen - 1 : p + radius;
-                seed_bit_set_range(blocked, lo, hi);
-              }
+            accept_sparse_seed(selected, blocked, (size_t)plen, p);
           }
+#endif
         free(cands);
       }
   }
@@ -686,9 +1678,11 @@ int find_seeds(const char    *seq,
       for (int b2 = 0; b2 < K; b2++) wkstr[b2] = wkp[b2];
       wkstr[K] = '\0';
       fprintf(stderr, "  i=%-6d nw=%-5d g=%-5u r=%-5u h=%-4lu  %s  %s%s\n",
-              i, nw[i],
-              (unsigned)prof_genome[i], (unsigned)prof_reads[i], hvals[i],
-              wkstr, nw[i] ? "*" : "", seed_bit_is_set(selected, (size_t)i) ? "****" : "");
+              i, (int)NW_AT(i),
+              (unsigned)prof_genome[i], (unsigned)prof_reads[i],
+              (unsigned long)hvals[i],
+              wkstr, NW_AT(i) ? "*" : "",
+              seed_bit_is_set(selected, (size_t)i) ? "****" : "");
     }
 #endif
 
@@ -712,15 +1706,51 @@ int find_seeds(const char    *seq,
 
   free(blocked);
   free(selected);
+#if MINIMAX_CANONICAL_WINNOW
+  free_window_counts(&nw);
+#else
   free(nw);
   free(dq);
+#endif
 #if MINIMAX_TIE_AUDIT
   free(profile_dq);
   free(canonical_codes);
 #endif
   free(full_hvals);
   free(hvals);
+#undef NW_AT
   return written;
+}
+
+int find_seeds(const char    *seq,
+               const int      plen,
+               const int      K,
+               const uint16  *prof_genome,
+               const uint16  *prof_reads,
+               const int      read_id,
+               KposVector    *out
+#if MINIMAX_TIE_AUDIT
+               , TieStats    *tie_stats
+#endif
+               )
+{
+#if MINIMAX_CANONICAL_WINNOW
+  CanonicalWindowScratch scratch;
+  int written;
+
+  init_canonical_window_scratch(&scratch);
+  written = find_seeds_with_scratch(
+      seq, plen, K, prof_genome, prof_reads, read_id, out, &scratch);
+  free_canonical_window_scratch(&scratch);
+  return written;
+#else
+  return find_seeds_with_scratch(
+      seq, plen, K, prof_genome, prof_reads, read_id, out
+#if MINIMAX_TIE_AUDIT
+      , tie_stats
+#endif
+      );
+#endif
 }
 
 typedef struct
@@ -794,6 +1824,9 @@ static void *seed_worker(void *arg)
   uint16 *prof_reads;
   int pmax = 20000;
   KposVector vector = {NULL, 0, 0};
+#if MINIMAX_CANONICAL_WINNOW
+  CanonicalWindowScratch window_scratch;
+#endif
 
   db.bases = open_worker_bases(queue->db);
   seq = New_Read_Buffer(&db);
@@ -803,6 +1836,9 @@ static void *seed_worker(void *arg)
     { perror("malloc profile");
       exit(1);
     }
+#if MINIMAX_CANONICAL_WINNOW
+  init_canonical_window_scratch(&window_scratch);
+#endif
 
   while (1)
     { int block;
@@ -842,12 +1878,20 @@ static void *seed_worker(void *arg)
             }
 
           if (plen > 0)
-            find_seeds(seq + K - 1, plen, K, prof_genome, prof_reads,
-                       id - first, &vector
+            {
+#if MINIMAX_CANONICAL_WINNOW
+              find_seeds_with_scratch(
+                  seq + K - 1, plen, K, prof_genome, prof_reads,
+                  id - first, &vector, &window_scratch);
+#else
+              find_seeds(seq + K - 1, plen, K, prof_genome, prof_reads,
+                         id - first, &vector
 #if MINIMAX_TIE_AUDIT
-                       , &block_tie_stats
+                         , &block_tie_stats
 #endif
-                       );
+                         );
+#endif
+            }
         }
 
       if (vector.len > 1)
@@ -868,6 +1912,9 @@ static void *seed_worker(void *arg)
     }
 
   free(vector.entry);
+#if MINIMAX_CANONICAL_WINNOW
+  free_canonical_window_scratch(&window_scratch);
+#endif
   free(prof_genome);
   free(prof_reads);
   free(seq - 1);
@@ -996,14 +2043,21 @@ int main(int argc, char *argv[]) {
 #if MINIMAX_TIE_AUDIT
   fprintf(stderr,
           "Seed selector: hash_mod=%llu hash_refine=%d robust_winnow=%d "
-          "tie_audit=1\n",
+          "canonical_winnow=%d canonical_thinning=%d packed_tuple=%d "
+          "hash_bytes=%zu candidate_bytes=%zu tie_audit=1\n",
           (unsigned long long)MOD, MINIMAX_HASH_REFINE,
-          MINIMAX_ROBUST_WINNOW);
+          MINIMAX_ROBUST_WINNOW, MINIMAX_CANONICAL_WINNOW,
+          MINIMAX_CANONICAL_THINNING, MINIMAX_PACK_POSITION_TUPLE,
+          sizeof(PositionHash), sizeof(Candidate));
 #else
   fprintf(stderr,
-          "Seed selector: hash_mod=%llu hash_refine=%d robust_winnow=%d\n",
+          "Seed selector: hash_mod=%llu hash_refine=%d robust_winnow=%d "
+          "canonical_winnow=%d canonical_thinning=%d packed_tuple=%d "
+          "hash_bytes=%zu candidate_bytes=%zu\n",
           (unsigned long long)MOD, MINIMAX_HASH_REFINE,
-          MINIMAX_ROBUST_WINNOW);
+          MINIMAX_ROBUST_WINNOW, MINIMAX_CANONICAL_WINNOW,
+          MINIMAX_CANONICAL_THINNING, MINIMAX_PACK_POSITION_TUPLE,
+          sizeof(PositionHash), sizeof(Candidate));
 #endif
   KMASK = (K >= 32) ? UINT64_MAX : ((UINT64_C(1) << (2 * K)) - 1);
   int db_type = Open_DB(argv[1], db);

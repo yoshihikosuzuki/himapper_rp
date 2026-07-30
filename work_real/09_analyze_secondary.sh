@@ -35,7 +35,22 @@ LAshow reads ref.dam "$RUN_DIR/reads.ref.las" 2>/dev/null \
       --ref-layout "$REF_LAYOUT" \
       "$D_HIMAPPER/reads.names" "$D_HIMAPPER/ref.names" \
   > "$RUN_DIR/mapping.all-candidates.tsv"
-# Keep the LAS files: unlike mapping.all-candidates.tsv, they retain the
-# chain flags needed to distinguish candidates from split alignment pieces.
-awk -F'\t' '{c[$1]++} END{for(r in c)d[c[r]]++; for(n=1;n<=5;n++)printf "  %d cand: %d reads\n",n,d[n]+0; s=0;for(n=6;n<=999;n++)s+=d[n];printf "  6+ cand: %d reads\n",s}' \
+# Headerless candidate-chain-v1 TSV: read, hap, scaffold, 0-based half-open
+# reference start/end, strand, and reference bounding span (internal gaps
+# included).  Each row is one bounded START/NEXT chain in LAshow input order.
+# Unmapped reads are omitted and the default-selected chain is not marked.
+# This is for candidate diagnostics only, not primary eval/coverage.
+awk -F'\t' '
+  { c[$1]++ }
+  END {
+    for (r in c) {
+      n = c[r]
+      if (n >= 6) d[6]++
+      else d[n]++
+    }
+    for (n = 1; n <= 5; n++)
+      printf "  %d cand: %d reads\n", n, d[n] + 0
+    printf "  6+ cand: %d reads\n", d[6] + 0
+  }
+' \
   "$RUN_DIR/mapping.all-candidates.tsv" >&2
