@@ -16,6 +16,8 @@ export PATH="$DAZZ_DB_ROOT:$FASTK_ROOT:$REPO:$PATH"
 _SEQKIT="seqkit/2.6.0"
 _DALIGNER="daligner/2024.01.19"
 _MINIMAP2="minimap2/2.26"
+_WINNOWMAP="winnowmap/2.03"
+_MERYL="meryl/1.3"
 _YAK="yak/0.1"
 _PYTHON="python/3.10.14"
 
@@ -33,7 +35,10 @@ D_TRIO="$WR/trio"
 D_EVAL="$WR/eval"
 D_HIMAPPER="$WR/himapper"
 D_MM2="$WR/mm2"
-mkdir -p "$D_REF" "$D_READS" "$D_TRIO" "$D_EVAL" "$D_HIMAPPER" "$D_MM2"
+D_WM="$WR/wm"
+D_WM2="$WR/wm2"
+mkdir -p "$D_REF" "$D_READS" "$D_TRIO" "$D_EVAL" \
+  "$D_HIMAPPER" "$D_MM2" "$D_WM" "$D_WM2"
 
 # Evaluation annotations and derived exclusion mask.
 EVAL_ANNOTATION_DIR="$WR/experiments/hotspot_coverage/annotations"

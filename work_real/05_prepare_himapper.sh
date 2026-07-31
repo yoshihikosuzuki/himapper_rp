@@ -9,7 +9,8 @@ set -euo pipefail
 source config.sh
 for tool in "$DAZZ_DB_ROOT/fasta2DAM" "$DAZZ_DB_ROOT/DBshow" \
             "$DAZZ_DB_ROOT/DBsplit" \
-            "$FASTK_ROOT/FastK" "$FASTK_ROOT/Fastrm"; do
+            "$FASTK_ROOT/FastK" "$FASTK_ROOT/Fastrm" \
+            "$REPO/fastkdual/FastKdual"; do
   if [[ ! -x "$tool" ]]; then
     echo "Missing local tool: $tool; run 'make local-tools' in $REPO" >&2
     exit 1
@@ -21,7 +22,8 @@ THREADS=${SLURM_CPUS_PER_TASK:-16}
 cd "$D_HIMAPPER"
 sha256sum "$DAZZ_DB_ROOT/fasta2DAM" "$DAZZ_DB_ROOT/DBshow" \
   "$DAZZ_DB_ROOT/DBsplit" \
-  "$FASTK_ROOT/FastK" "$FASTK_ROOT/Fastrm" "$REPO/minimaxmer"
+  "$FASTK_ROOT/FastK" "$FASTK_ROOT/Fastrm" \
+  "$REPO/fastkdual/FastKdual" "$REPO/minimaxmer"
 
 "$DAZZ_DB_ROOT/fasta2DAM" ref "$REF"
 "$DAZZ_DB_ROOT/fasta2DAM" reads "$READS"
@@ -34,10 +36,9 @@ cut -f1 "${REF}.fai" > ref.names
 
 run_timed "$D_HIMAPPER/ref-profile.time" \
   "$FASTK_ROOT/FastK" -k"$KMER" -v -T"$THREADS" -t1 -p -P"$TMPDIR" ref.dam
-run_timed "$D_HIMAPPER/reads-profile.time" \
-  "$FASTK_ROOT/FastK" -k"$KMER" -v -T"$THREADS" -t1 -p -P"$TMPDIR" reads.dam
-run_timed "$D_HIMAPPER/reads-vs-ref-profile.time" \
-  "$FASTK_ROOT/FastK" -k"$KMER" -v -T"$THREADS" -t1 -p:ref -Nreads.ref -P"$TMPDIR" reads.dam
+run_timed "$D_HIMAPPER/reads-dual-profile.time" \
+  "$REPO/fastkdual/FastKdual" -k"$KMER" -v -T"$THREADS" -t1 \
+  -p:ref -Nreads -Rreads.ref -P"$TMPDIR" reads.dam
 run_timed "$D_HIMAPPER/ref-vs-reads-profile.time" \
   "$FASTK_ROOT/FastK" -k"$KMER" -v -T"$THREADS" -t1 -p:reads -Nref.reads -P"$TMPDIR" ref.dam
 

@@ -16,6 +16,7 @@ _DALIGNER="daligner/2024.01.19"
 _SAMTOOLS="samtools/1.18"
 _MINIMAP2="minimap2/2.26"
 _WINNOWMAP="winnowmap/2.03"
+_MERYL="meryl/1.3"
 _YAK="yak/0.1"
 _PYTHON="python/3.10.14"
 
@@ -33,8 +34,10 @@ D_TRIO="$WR/trio"
 D_EVAL="$WR/eval"
 D_HIMAPPER="$WR/himapper"
 D_MM2="$WR/mm2"
+D_WM="$WR/wm"
+D_WM2="$WR/wm2"
 mkdir -p "$D_REF" "$D_READS" "$D_RAW" "$D_TRIO" "$D_EVAL" \
-  "$D_HIMAPPER" "$D_MM2"
+  "$D_HIMAPPER" "$D_MM2" "$D_WM" "$D_WM2"
 
 # HG002 R10.4.1 ultra-long reads, 2022-11-16 runs, Guppy 6.3.8 SUP.
 ONT_FASTQ_BASE="https://human-pangenomics.s3.us-west-2.amazonaws.com/T2T/scratch/HG002/sequencing/ont/11_16_22_R1041_HG002_UL_Kit14_260_Guppy_6.3.8"

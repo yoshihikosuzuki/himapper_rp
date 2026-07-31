@@ -46,10 +46,11 @@ D_REGIONS="$WR/regions"
 D_EVAL="$WR/eval"
 D_HIMAPPER="$WR/himapper"
 D_MM2="$WR/mm2"
+D_WM="$WR/wm"
 D_WM2="$WR/wm2"
 
 mkdir -p "$D_REF" "$D_READS" "$D_TRIO" "$D_REGIONS" "$D_EVAL" \
-  "$D_HIMAPPER" "$D_MM2" "$D_WM2"
+  "$D_HIMAPPER" "$D_MM2" "$D_WM" "$D_WM2"
 
 # Whole-genome inputs
 REF_ALL="$D_REF/dip.fa"

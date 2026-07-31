@@ -340,6 +340,12 @@ def preprocessing_time_groups(time_dir):
         "mm2": {
             "prep": [os.path.join(time_dir, "mm2", "index.time")],
         },
+        "wm": {
+            "prep": [
+                os.path.join(time_dir, "wm", "ref-meryl.time"),
+                os.path.join(time_dir, "wm", "repetitive-kmers.time"),
+            ],
+        },
         "wm2": {
             "prep": [
                 os.path.join(time_dir, "wm2", "ref-meryl.time"),
@@ -618,23 +624,57 @@ def main():
             ]
             minimum_totals.append(min(values) if values else None)
 
-        formatted_timing_rows = []
+        formatted_timing_values = []
         for row in timing_rows:
-            cells = []
+            metrics = []
             for metric, formatter in enumerate((seconds, seconds, rss)):
                 total_value = row[3][metric] if row[3] is not None else None
                 total = formatter(total_value)
-                parts = [
+                parts = tuple(
                     formatter(timing[metric]) if timing is not None else "N/A"
                     for timing in row[2]
-                ]
+                )
                 marker = (
                     "*" if (
                         minimum_totals[metric] is not None
                         and total_value == minimum_totals[metric]
                     ) else " "
                 )
-                cells.append(f"{total}{marker}[{'/'.join(parts)}]")
+                metrics.append((total, marker, row[1], parts))
+            formatted_timing_values.append((row[0], *metrics))
+
+        value_widths = []
+        for metric in range(1, 4):
+            total_width = max(
+                len(row[metric][0]) for row in formatted_timing_values)
+            part_widths = {}
+            for row in formatted_timing_values:
+                _total, _marker, labels, parts = row[metric]
+                widths = part_widths.setdefault(labels, [0] * len(parts))
+                for part_index, part in enumerate(parts):
+                    widths[part_index] = max(
+                        widths[part_index], len(part))
+            detail_width = max(
+                2 + sum(widths) + max(0, len(widths) - 1)
+                for widths in part_widths.values()
+            )
+            value_widths.append((total_width, part_widths, detail_width))
+
+        formatted_timing_rows = []
+        for row in formatted_timing_values:
+            cells = []
+            for metric in range(1, 4):
+                total, marker, labels, parts = row[metric]
+                total_width, part_widths, detail_width = (
+                    value_widths[metric - 1])
+                widths = part_widths[labels]
+                detail = "[" + "/".join(
+                    f"{part:>{width}}"
+                    for part, width in zip(parts, widths)
+                ) + "]"
+                cells.append(
+                    f"{total:>{total_width}}{marker}"
+                    f"{detail:<{detail_width}}")
             formatted_timing_rows.append((row[0], *cells))
 
         headers = ("tool", "CPU time (s)", "wall time (s)", "peak RSS (GB)")
@@ -654,7 +694,7 @@ def main():
         for row in formatted_timing_rows:
             print("  ".join(
                 f"{cell:<{width}}" if i == 0 else f"{cell:>{width}}"
-                for i, (cell, width) in enumerate(zip(row, widths))))
+                for i, (cell, width) in enumerate(zip(row, widths))).rstrip())
 
 
 if __name__ == "__main__":
