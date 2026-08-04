@@ -12,6 +12,7 @@
 #define _FILTER
 
 #include <DB.h>
+#include <stdio.h>
 #include "align.h"
 
 extern int    VERBOSE;
@@ -25,7 +26,43 @@ extern char  *SORT_PATH;
 extern uint64 MEM_LIMIT;
 extern uint64 MEM_PHYSICAL;
 
-int Set_Filter_Params(int kmer, int suppress, int nthreads); 
+#define HIMAPPER_MAX_THREADS 128
+
+/* Historical mapping rounds down to a power of two.  The integrated
+ * seed/map path uses the exact worker budget, including non-power-of-two
+ * pipeline remainders, up to HIMAPPER_MAX_THREADS. */
+int Set_Filter_Params(int kmer, int suppress, int nthreads);
+int Set_Filter_Params_Exact(int kmer, int suppress, int nthreads);
+int Filter_Thread_Count(void);
+
+typedef struct
+  { uint64 kpos_read_ns;
+    uint64 forward_prepare_ns;
+    uint64 reverse_complement_ns;
+    uint64 reverse_sort_ns;
+    uint64 filter_setup_ns;
+    uint64 count_ns;
+    uint64 histogram_ns;
+    uint64 hit_allocate_ns;
+    uint64 hit_materialize_ns;
+    uint64 hit_sort_ns;
+    uint64 chain_ns;
+    uint64 alignment_ns;
+    uint64 las_write_ns;
+    uint64 reporter_ns;
+    uint64 match_calls;
+    uint64 materialized_hits;
+    uint64 reporter_calls;
+    uint64 alignment_calls;
+    uint64 overlaps_written;
+    uint64 histogram_fast_calls;
+    uint64 histogram_fallback_calls;
+    uint64 histogram_legacy_calls;
+  } Map_Phase_Stats;
+
+void Set_Map_Phase_Timing(int enabled);
+const Map_Phase_Stats *Get_Map_Phase_Stats(void);
+void Print_Map_Phase_Stats(FILE *out);
 
 // Filter setup and dispatch are a single-control-thread API.  Set environment
 // configuration before Set_Filter_Params, then start/stop the fixed-lane
@@ -48,6 +85,12 @@ void Close_Kpos_Index(Kpos_Index *index);
 // The returned array has the same +2-sentinel contract as Sort_Kmers.
 void *Load_Kpos_Block(Kpos_Index *index, int block_no, int comp,
                       DAZZ_DB *block, int *len);
+
+// Prepare an already resident raw KPOS block for mapping.  The caller must
+// provide storage for n_entries+2 records; raw rpos values use minimaxmer's
+// start-of-k-mer convention.  The returned pointer is the input pointer.
+void *Prepare_Kpos_Block(void *entries, size_t n_entries, int comp,
+                         DAZZ_DB *block, int *len);
 
 // Memory retained by the caller in addition to the current read/reference
 // block pair (for example the whole reference DB and cached KPOS arrays).

@@ -9,6 +9,8 @@
 
 #include "libfastk.h"
 
+#include <time.h>
+
 #ifndef SKIP_GENE_CORE
 #include "gene_core.c"
 #endif
@@ -1498,8 +1500,42 @@ typedef struct
 
 #define PROF_BUF0 4096
 #define PROF_BUF1 4095
+#define PROF_SEQ_BUF 65536
 
 #define PROFILE(P) ((_Profile_Index *) P)
+
+struct Profile_Reader
+  { _Profile_Index *profile;
+    int             cfile;
+    int             cpart;
+    int64           next_id;
+    int64           part_end;
+    int64           buffer_start;
+    size_t          buffer_pos;
+    size_t          buffer_len;
+    char           *name;
+    uint8           buffer[PROF_SEQ_BUF];
+    Profile_Reader_Timing *timing;
+  };
+
+static uint64_t profile_reader_now_ns(void)
+{ struct timespec ts;
+
+  if (clock_gettime(CLOCK_MONOTONIC,&ts) != 0)
+    return (0);
+  return ((uint64_t) ts.tv_sec * UINT64_C(1000000000) +
+          (uint64_t) ts.tv_nsec);
+}
+
+static inline void profile_reader_add_elapsed(uint64_t *total, uint64_t start)
+{ uint64_t end;
+
+  if (start == 0)
+    return;
+  end = profile_reader_now_ns();
+  if (end >= start)
+    *total += end-start;
+}
 
 
 /****************************************************************************************
@@ -1650,6 +1686,408 @@ void Free_Profiles(Profile_Index *_P)
   free(P->name);
   free(P->count);
   free(P);
+}
+
+static inline int64 profile_reader_offset(Profile_Reader *R)
+{ return (R->buffer_start + (int64) R->buffer_pos); }
+
+static void profile_reader_open_part(Profile_Reader *R, int part)
+{ _Profile_Index *P = R->profile;
+  Profile_Reader_Timing *timing = R->timing;
+  int             f;
+
+  if (R->cfile >= 0)
+    close(R->cfile);
+
+  sprintf(R->name+P->nlen,"prof.%d",part+1);
+  if (timing == NULL)
+    { do
+        f = open(R->name,O_RDONLY);
+      while (f < 0 && errno == EINTR);
+    }
+  else
+    { uint64_t start = profile_reader_now_ns();
+      do
+        { timing->open_calls += 1;
+          f = open(R->name,O_RDONLY);
+        }
+      while (f < 0 && errno == EINTR);
+      profile_reader_add_elapsed(&timing->open_ns,start);
+    }
+  if (f < 0)
+    { fprintf(stderr,"Cannot open profile part %s: %s\n",R->name,strerror(errno));
+      exit (1);
+    }
+
+  R->cfile       = f;
+  R->cpart       = part;
+  R->part_end    = P->index[P->nbase[part]];
+  R->buffer_start = 0;
+  R->buffer_pos   = 0;
+  R->buffer_len   = 0;
+  if (R->part_end < 0)
+    { fprintf(stderr,"Profile part %s has a negative indexed size\n",R->name);
+      exit (1);
+    }
+}
+
+static void profile_reader_seek(Profile_Reader *R, int64 offset)
+{ Profile_Reader_Timing *timing = R->timing;
+  off_t target, result;
+
+  if (offset < 0 || offset > R->part_end)
+    { fprintf(stderr,"Profile offset %lld is outside part %s [0,%lld]\n",
+              offset,R->name,R->part_end);
+      exit (1);
+    }
+  target = (off_t) offset;
+  if ((int64) target != offset)
+    { fprintf(stderr,"Profile offset %lld cannot be represented by off_t\n",offset);
+      exit (1);
+    }
+
+  if (timing == NULL)
+    { do
+        result = lseek(R->cfile,target,SEEK_SET);
+      while (result < 0 && errno == EINTR);
+    }
+  else
+    { uint64_t start = profile_reader_now_ns();
+      do
+        { timing->seek_calls += 1;
+          result = lseek(R->cfile,target,SEEK_SET);
+        }
+      while (result < 0 && errno == EINTR);
+      profile_reader_add_elapsed(&timing->seek_ns,start);
+    }
+  if (result != target)
+    { if (result < 0)
+        fprintf(stderr,"Cannot seek profile part %s: %s\n",R->name,strerror(errno));
+      else
+        fprintf(stderr,"Seek in profile part %s stopped at an unexpected offset\n",R->name);
+      exit (1);
+    }
+
+  R->buffer_start = offset;
+  R->buffer_pos   = 0;
+  R->buffer_len   = 0;
+}
+
+static void profile_reader_refill(Profile_Reader *R)
+{ int64   offset, remain;
+  Profile_Reader_Timing *timing = R->timing;
+  size_t  want, have;
+  ssize_t got;
+
+  offset = profile_reader_offset(R);
+  remain = R->part_end-offset;
+  if (R->buffer_pos != R->buffer_len || remain <= 0)
+    { fprintf(stderr,"Compressed profile in %s exceeds its indexed part boundary\n",R->name);
+      exit (1);
+    }
+  if (remain < PROF_SEQ_BUF)
+    want = (size_t) remain;
+  else
+    want = PROF_SEQ_BUF;
+
+  have = 0;
+  if (timing == NULL)
+    while (have < want)
+      { do
+          got = read(R->cfile,R->buffer+have,want-have);
+        while (got < 0 && errno == EINTR);
+        if (got < 0)
+          { fprintf(stderr,"Cannot read profile part %s: %s\n",R->name,strerror(errno));
+            exit (1);
+          }
+        if (got == 0)
+          { fprintf(stderr,
+                    "Short read in profile part %s at offset %lld: expected %zu more bytes\n",
+                    R->name,offset+(int64) have,want-have);
+            exit (1);
+          }
+        have += (size_t) got;
+      }
+  else
+    { uint64_t start = profile_reader_now_ns();
+      timing->refill_calls += 1;
+      while (have < want)
+        { do
+            { timing->read_calls += 1;
+              got = read(R->cfile,R->buffer+have,want-have);
+            }
+          while (got < 0 && errno == EINTR);
+          if (got < 0)
+            { fprintf(stderr,"Cannot read profile part %s: %s\n",R->name,strerror(errno));
+              exit (1);
+            }
+          if (got == 0)
+            { fprintf(stderr,
+                      "Short read in profile part %s at offset %lld: expected %zu more bytes\n",
+                      R->name,offset+(int64) have,want-have);
+              exit (1);
+            }
+          have += (size_t) got;
+        }
+      timing->read_bytes += (uint64_t) have;
+      profile_reader_add_elapsed(&timing->read_ns,start);
+    }
+
+  R->buffer_start = offset;
+  R->buffer_pos   = 0;
+  R->buffer_len   = want;
+}
+
+typedef struct
+  { Profile_Reader *reader;
+    int64           end;
+    uint8          *ptr;
+    uint8          *top;
+  } Profile_Cursor;
+
+static inline int64 profile_cursor_offset(Profile_Cursor *C)
+{ Profile_Reader *R = C->reader;
+  return (R->buffer_start + (int64) (C->ptr-R->buffer));
+}
+
+static inline void profile_cursor_set_top(Profile_Cursor *C)
+{ Profile_Reader *R = C->reader;
+  int64           limit = C->end-R->buffer_start;
+
+  if (limit < 0)
+    { fprintf(stderr,"Profile cursor passed its indexed boundary in %s\n",R->name);
+      exit (1);
+    }
+  if (limit > (int64) R->buffer_len)
+    limit = (int64) R->buffer_len;
+  C->top = R->buffer+(size_t) limit;
+}
+
+static inline void profile_cursor_refill(Profile_Cursor *C)
+{ Profile_Reader *R = C->reader;
+
+  R->buffer_pos = (size_t) (C->ptr-R->buffer);
+  profile_reader_refill(R);
+  C->ptr = R->buffer+R->buffer_pos;
+  profile_cursor_set_top(C);
+}
+
+static inline int profile_cursor_done(Profile_Cursor *C)
+{ if (C->ptr < C->top)
+    return (0);
+  if (profile_cursor_offset(C) == C->end)
+    return (1);
+  profile_cursor_refill(C);
+  return (0);
+}
+
+static inline uint8 profile_cursor_required(Profile_Cursor *C)
+{ if (C->ptr == C->top && profile_cursor_done(C))
+    { fprintf(stderr,"Truncated compressed profile at offset %lld in %s\n",
+              profile_cursor_offset(C),C->reader->name);
+      exit (1);
+    }
+  return (*C->ptr++);
+}
+
+static inline void profile_cursor_commit(Profile_Cursor *C)
+{ Profile_Reader *R = C->reader;
+
+  R->buffer_pos = (size_t) (C->ptr-R->buffer);
+}
+
+Profile_Reader *Open_Profile_Reader(Profile_Index *_P)
+{ _Profile_Index *P = PROFILE(_P);
+  Profile_Reader *R;
+  char           *name;
+
+  if (P == NULL)
+    return (NULL);
+
+  R    = Malloc(sizeof(Profile_Reader),"Allocating sequential profile reader");
+  name = Malloc(P->nlen+20,"Allocating sequential profile reader name");
+  if (R == NULL || name == NULL)
+    exit (1);
+  memcpy(name,P->name,P->nlen);
+
+  R->profile      = P;
+  R->cfile        = -1;
+  R->cpart        = -1;
+  R->next_id      = -1;
+  R->part_end     = 0;
+  R->buffer_start = 0;
+  R->buffer_pos   = 0;
+  R->buffer_len   = 0;
+  R->name         = name;
+  R->timing       = NULL;
+
+  return (R);
+}
+
+void Free_Profile_Reader(Profile_Reader *R)
+{ if (R == NULL)
+    return;
+  if (R->cfile >= 0)
+    close(R->cfile);
+  free(R->name);
+  free(R);
+}
+
+  //  As Fetch_Profile, but retain unread bytes when ids are fetched in increasing,
+  //    consecutive order.  A non-consecutive id or part transition resets the stream.
+
+int64 Fetch_Profile_Sequential(Profile_Reader *R, int64 id, int64 plen, uint16 *profile)
+{ _Profile_Index *P;
+  int             w;
+  int64           first, start, end, part_end;
+  uint8           byte;
+  uint16          x, d, i;
+  int64           n;
+  int             same_part;
+  Profile_Cursor  cursor;
+
+  if (R == NULL || (P = R->profile) == NULL)
+    { fprintf(stderr,"Cannot fetch a profile through a null sequential reader\n");
+      exit (1);
+    }
+  if (id < 0 || id >= P->nreads)
+    { fprintf(stderr,"Id %lld is out of range [1,%d]\n",id,P->nreads);
+      exit (1);
+    }
+
+  w = R->cpart;
+  if (w < 0 || id >= P->nbase[w] ||
+      (w > 0 && id < P->nbase[w-1]))
+    { if (w >= 0 && id >= P->nbase[w])
+        w += 1;
+      else
+        w = 0;
+      while (w < P->nparts && id >= P->nbase[w])
+        w += 1;
+    }
+  if (w >= P->nparts)
+    { fprintf(stderr,"Id %lld is out of range [1,%lld]\n",id,P->nbase[P->nparts-1]);
+      exit (1);
+    }
+
+  first    = (w == 0 ? 0 : P->nbase[w-1]);
+  start    = (id == first ? 0 : P->index[id]);
+  end      = P->index[id+1];
+  part_end = P->index[P->nbase[w]];
+  if (start < 0 || end < start || end > part_end)
+    { fprintf(stderr,
+              "Invalid compressed profile interval [%lld,%lld) in part %d (size %lld)\n",
+              start,end,w+1,part_end);
+      exit (1);
+    }
+
+  same_part = (w == R->cpart);
+  if (!same_part)
+    profile_reader_open_part(R,w);
+  if (!same_part || id != R->next_id)
+    profile_reader_seek(R,start);
+  else if (profile_reader_offset(R) != start)
+    { fprintf(stderr,
+              "Sequential profile reader is at %lld, expected indexed offset %lld in %s\n",
+              profile_reader_offset(R),start,R->name);
+      exit (1);
+    }
+
+  R->next_id = id+1;
+  if (end == start)
+    return (0);
+
+  cursor.reader = R;
+  cursor.end    = end;
+  cursor.ptr    = R->buffer+R->buffer_pos;
+  profile_cursor_set_top(&cursor);
+
+  byte = profile_cursor_required(&cursor);
+  x = byte;
+  if ((x & 0x80) != 0)
+    d = ((x & 0x7f) << 8) | profile_cursor_required(&cursor);
+  else
+    d = x;
+  n = 1;
+
+  if (plen > 0)
+    { profile[0] = d;
+
+      while (!profile_cursor_done(&cursor))
+        { x = profile_cursor_required(&cursor);
+          if ((x & 0xc0) == 0)
+            { if (n+x > plen)
+                { n += x;
+                  break;
+                }
+              for (i = 0; i < x; i++)
+                profile[n++] = d;
+            }
+          else
+            { if ((x & 0x80) != 0)
+                { if ((x & 0x40) != 0)
+                    x <<= 8;
+                  else
+                    x = (x << 8) & 0x7fff;
+                  x |= profile_cursor_required(&cursor);
+                  d = (d+x) & 0x7fff;
+                }
+              else
+                { if ((x & 0x20) != 0)
+                    d += (x & 0x1fu) | 0xffe0u;
+                  else
+                    d += (x & 0x1fu);
+                }
+              if (n >= plen)
+                { n += 1;
+                  break;
+                }
+              profile[n++] = d;
+            }
+        }
+    }
+
+  while (!profile_cursor_done(&cursor))
+    { x = profile_cursor_required(&cursor);
+      if ((x & 0xc0) == 0)
+          n += x;
+      else
+        { if ((x & 0x80) != 0)
+            (void) profile_cursor_required(&cursor);
+          n += 1;
+        }
+    }
+
+  profile_cursor_commit(&cursor);
+  if (profile_reader_offset(R) != end)
+    { fprintf(stderr,"Compressed profile did not end at its index boundary in %s\n",R->name);
+      exit (1);
+    }
+  return (n);
+}
+
+int64 Fetch_Profile_Sequential_Timed(Profile_Reader *R, int64 id, int64 plen,
+                                     uint16 *profile,
+                                     Profile_Reader_Timing *timing)
+{ uint64_t start;
+  int64    result;
+
+  if (timing == NULL)
+    return (Fetch_Profile_Sequential(R,id,plen,profile));
+  if (R == NULL)
+    return (Fetch_Profile_Sequential(R,id,plen,profile));
+  if (R->timing != NULL)
+    { fprintf(stderr,"Sequential profile reader timing is already active\n");
+      exit (1);
+    }
+
+  R->timing = timing;
+  start = profile_reader_now_ns();
+  result = Fetch_Profile_Sequential(R,id,plen,profile);
+  R->timing = NULL;
+  timing->fetch_calls += 1;
+  profile_reader_add_elapsed(&timing->fetch_ns,start);
+  return (result);
 }
 
   //  Places uncompressed profile for read id (0-based) in profile of length plen.

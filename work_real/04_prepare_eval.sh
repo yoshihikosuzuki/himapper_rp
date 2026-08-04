@@ -16,15 +16,15 @@ python3 "$SCRIPTS/alignment_strata.py" --threads "$THREADS" --near 2 --med 10 \
   "$REF" "$READS_CONFIDENT_MAPPING_TRUTH" \
   "$D_EVAL/alignment_strata.tsv"
 
-# Hapmer strata
+# Hapmer strata.  Keep trio/truth-discordant reads separate for auditing;
+# downstream sensitivity plots may exclude that stratum from evaluation.
 awk 'BEGIN{OFS="\t"}
  NR==FNR {map_hap[$1]=$2; next}
  !($1 in map_hap) {next}
  {h=$5+$6
-  if(h==0) s="no_hapmer"
-  else if($2!="p" && $2!="m") s="ambiguous"
+  if(h==0 || ($2!="p" && $2!="m")) s="hard"
   else if(($2=="p"?"pat":"mat")!=map_hap[$1]) s="disagree"
-  else s=(h<=40?"vhard":(h<=100?"hard":(h<=350?"med":"easy")))
+  else s=(h<=40?"med":"easy")
   print $1,s}' "$READS_CONFIDENT_MAPPING_TRUTH" \
   "$D_TRIO/$READS_BASE.triobin.tsv" > "$D_EVAL/hapmer_strata.tsv"
 

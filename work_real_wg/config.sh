@@ -69,7 +69,7 @@ MM2_W=19
 DB_BLOCK_SIZE=200
 
 # himapper candidate selection
-CN_UNIQ_W=11.5
+CN_UNIQ_W=8
 CN_TIER_SRC=1
 CN_HASH_TIE=1
 CN_DUMP=0

@@ -44,7 +44,8 @@ run_timed "$D_HIMAPPER/ref-vs-reads-profile.time" \
 
 # Generate seeds
 run_timed "$D_HIMAPPER/ref-seeds.time" \
-  "$REPO/minimaxmer" -T"$THREADS" ref.dam ref.prof ref.reads.prof \
+  "$REPO/minimaxmer" -T"$THREADS" -l10 \
+  ref.dam ref.prof ref.reads.prof \
   "$D_HIMAPPER/.ref.minimax.kpos"
 run_timed "$D_HIMAPPER/read-seeds.time" \
   "$REPO/minimaxmer" -T"$THREADS" reads.dam reads.ref.prof reads.prof \

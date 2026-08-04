@@ -22,12 +22,12 @@ ln -sf "$D_HIMAPPER"/{reads.dam,.reads.bps,.reads.hdr,.reads.idx} .
 NB=$(awk -F'=' '/blocks/{gsub(/ /,"",$2);print $2}' reads.dam)
 REF_LAYOUT="$RUN_DIR/ref.dam.layout"
 "$DAZZ_DB_ROOT/DBshow" -n ref.dam > "$REF_LAYOUT"
-export CN_UNIQ_W=11.5 CN_TIER_SRC=1 CN_HASH_TIE=1 CN_DUMP=0
+export CN_UNIQ_W CN_TIER_SRC CN_HASH_TIE CN_DUMP
 
 run_timed "$RUN_DIR/map.time" \
-  "$HIM" -1 -v -T"$THREADS" \
-  ref.dam all \
-  reads.dam "$D_HIMAPPER/.reads.minimax.kpos"
+  "$HIM" -1 -v -T"$THREADS" -e"$HIMAPPER_E" \
+    ref.dam all \
+    reads.dam "$D_HIMAPPER/.reads.minimax.kpos"
 LAcat "reads.@1-${NB}.ref.las" > "$RUN_DIR/reads.ref.las"
 LAshow reads ref.dam "$RUN_DIR/reads.ref.las" 2>/dev/null \
   | python3 "$SCRIPTS/lashow_to_placement.py" \

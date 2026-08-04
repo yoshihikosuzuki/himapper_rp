@@ -5,7 +5,7 @@
 #SBATCH -c 64
 #SBATCH -n 1
 #SBATCH -N 1
-# Separate candidate/secondary analysis for ref-seed/read-seed at W=11.5.
+# Separate candidate/secondary analysis for ref-seed/read-seed at W=8.
 # This is not part of the primary-only benchmark.
 set -euo pipefail
 source config.sh
@@ -25,8 +25,8 @@ ln -sf "$D_HIMAPPER"/{reads.dam,.reads.bps,.reads.hdr,.reads.idx} .
 NB=$(awk -F'=' '/blocks/{gsub(/ /,"",$2);print $2}' reads.dam)
 REF_LAYOUT="$RUN_DIR/ref.dam.layout"
 "$DAZZ_DB_ROOT/DBshow" -n ref.dam > "$REF_LAYOUT"
-export CN_UNIQ_W=11.5 CN_TIER_SRC=1 CN_HASH_TIE=1 CN_DUMP=0
-"$HIM" -n0.7 -T"$THREADS" \
+export CN_UNIQ_W CN_TIER_SRC CN_HASH_TIE CN_DUMP
+"$HIM" -n0.7 -T"$THREADS" -e"$HIMAPPER_E" \
   ref.dam "$D_HIMAPPER/.ref.minimax.kpos" \
   reads.dam "$D_HIMAPPER/.reads.minimax.kpos"
 LAcat "reads.@1-${NB}.ref.las" > "$RUN_DIR/reads.ref.las"

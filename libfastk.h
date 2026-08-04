@@ -118,4 +118,34 @@ void Free_Profiles(Profile_Index *P);
 
 int64 Fetch_Profile(Profile_Index *P, int64 id, int64 plen, uint16 *profile);
 
+typedef struct Profile_Reader Profile_Reader;
+
+/*
+ * Caller-owned accumulator for the timed sequential-reader API.  The caller
+ * must zero-initialize it before first use.  fetch_ns minus open_ns, seek_ns,
+ * and read_ns is the measured decode+reader-control interval; it is not a
+ * claim that validation and cursor bookkeeping are pure decoder work.
+ */
+typedef struct
+  { uint64_t fetch_ns;
+    uint64_t open_ns;
+    uint64_t seek_ns;
+    uint64_t read_ns;
+    uint64_t fetch_calls;
+    uint64_t open_calls;
+    uint64_t seek_calls;
+    uint64_t refill_calls;
+    uint64_t read_calls;
+    uint64_t read_bytes;
+  } Profile_Reader_Timing;
+
+Profile_Reader *Open_Profile_Reader(Profile_Index *P);
+void            Free_Profile_Reader(Profile_Reader *R);
+
+int64 Fetch_Profile_Sequential(Profile_Reader *R, int64 id, int64 plen,
+                               uint16 *profile);
+int64 Fetch_Profile_Sequential_Timed(Profile_Reader *R, int64 id, int64 plen,
+                                     uint16 *profile,
+                                     Profile_Reader_Timing *timing);
+
 #endif // _LIBFASTK

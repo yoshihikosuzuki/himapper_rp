@@ -28,9 +28,7 @@ STRATIFICATION_FILES = {
 }
 STRATIFICATION_ORDER = {
     "alignment": ("no_map", "dup", "hard", "med", "easy"),
-    "hapmer": (
-        "no_hapmer", "ambiguous", "disagree", "vhard", "hard", "med", "easy"
-    ),
+    "hapmer": ("hard", "med", "easy", "disagree"),
     "variant": ("no_variant", "variant"),
 }
 
@@ -373,6 +371,45 @@ def mapping_family(mapping_path, time_dir):
     return family if family in groups else None
 
 
+def resource_time_paths(mapping_path, time_dir, prep_groups,
+                        fused_read_seed_map_time=None):
+    """Return preprocessing stages plus the final timed mapping stage.
+
+    A fused himapper timing already contains read-seed generation.  In that
+    case retain only reference seeding in the preprocessing `seed` stage so
+    the historical read-seeds.time is not counted a second time.
+    """
+    family = mapping_family(mapping_path, time_dir)
+    stage_paths = dict(prep_groups[family]) if family else {"prep": []}
+    map_label = "map"
+    map_time_path = os.path.join(os.path.dirname(mapping_path), "map.time")
+    if fused_read_seed_map_time is not None:
+        if family != "himapper/ref-seed_read-seed":
+            raise ValueError(
+                "fused read-seed+map timing requires a mapping in "
+                "himapper/ref-seed_read-seed")
+        stage_paths["seed"] = [
+            os.path.join(time_dir, "himapper", "ref-seeds.time")]
+        map_label = "read-seed+map"
+        map_time_path = fused_read_seed_map_time
+    return stage_paths, map_label, map_time_path
+
+
+def parse_named_paths(specifications, option):
+    """Parse unique NAME=PATH values, raising ValueError on ambiguity."""
+    result = {}
+    for specification in specifications:
+        if "=" not in specification:
+            raise ValueError(f"{option} must be TOOL=TIME: {specification}")
+        name, path = specification.split("=", 1)
+        if not name or not path:
+            raise ValueError(f"{option} must be TOOL=TIME: {specification}")
+        if name in result:
+            raise ValueError(f"duplicate {option} tool: {name}")
+        result[name] = path
+    return result
+
+
 def score(categories, population, strata, stratum):
     counts = collections.Counter()
     for name in population:
@@ -408,8 +445,21 @@ def main():
     ap.add_argument(
         "--time-dir", default=WORK_DIR,
         help=f"work directory containing time files [{WORK_DIR}]")
+    ap.add_argument(
+        "--fused-read-seed-map-time", action="append", default=[],
+        metavar="TOOL=TIME",
+        help=(
+            "use one successful fused read-seed+map GNU-time file for TOOL; "
+            "valid only for himapper/ref-seed_read-seed and repeatable by tool"))
     ap.add_argument("tools", nargs="+", help="name=mapping.tsv ...")
     args = ap.parse_args()
+
+    try:
+        fused_read_seed_map_times = parse_named_paths(
+            args.fused_read_seed_map_time,
+            "--fused-read-seed-map-time")
+    except ValueError as error:
+        ap.error(str(error))
 
     exclusion_index, exclusion_records = load_exclusion_beds(
         args.exclude_truth_bed)
@@ -448,9 +498,37 @@ def main():
         stratifications.append((axis, strata_path, strata, ordered_strata))
     lifts = load_liftover(args.liftover_paf)
 
-    tools = []
+    tool_specs = []
     for spec in args.tools:
+        if "=" not in spec:
+            ap.error(f"tool must be NAME=MAPPING: {spec}")
         name, path = spec.split("=", 1)
+        if not name or not path:
+            ap.error(f"tool must be NAME=MAPPING: {spec}")
+        tool_specs.append((name, path))
+
+    tool_names = [name for name, _path in tool_specs]
+    validation_groups = preprocessing_time_groups(args.time_dir)
+    for name, timing_path in fused_read_seed_map_times.items():
+        if tool_names.count(name) != 1:
+            ap.error(
+                "--fused-read-seed-map-time tool must match exactly one "
+                f"mapping tool: {name}")
+        if parse_time(timing_path) is None:
+            ap.error(
+                "--fused-read-seed-map-time is missing or not a successful "
+                f"GNU-time file: {timing_path}")
+        mapping_path = next(
+            path for tool_name, path in tool_specs if tool_name == name)
+        try:
+            resource_time_paths(
+                mapping_path, args.time_dir, validation_groups, timing_path)
+        except ValueError as error:
+            ap.error(
+                f"--fused-read-seed-map-time for {name}: {error}")
+
+    tools = []
+    for name, path in tool_specs:
         mappings = load_mapping(path)
         categories = {
             read: classify(
@@ -586,10 +664,14 @@ def main():
 
         timing_rows = []
         for name, path, _categories in tools:
-            map_timing = parse_time(
-                os.path.join(os.path.dirname(path), "map.time"))
-            family = mapping_family(path, args.time_dir)
-            stage_paths = prep_groups[family] if family else {"prep": []}
+            fused_time = fused_read_seed_map_times.get(name)
+            try:
+                stage_paths, map_label, map_time_path = resource_time_paths(
+                    path, args.time_dir, prep_groups, fused_time)
+            except ValueError as error:
+                ap.error(
+                    f"--fused-read-seed-map-time for {name}: {error}")
+            map_timing = parse_time(map_time_path)
             stage_labels = tuple(stage_paths)
             stage_timings = tuple(
                 aggregate_times(paths) if paths else None
@@ -611,7 +693,7 @@ def main():
                 total_timing = None
             timing_rows.append((
                 name,
-                stage_labels + ("map",),
+                stage_labels + (map_label,),
                 stage_timings + (map_timing,),
                 total_timing,
             ))
@@ -685,7 +767,12 @@ def main():
             for i in range(len(headers))
         ]
         print("=== resources ===")
-        print("# himapper time / memory [FastK/seed/map]")
+        if fused_read_seed_map_times:
+            print(
+                "# Fused himapper time / memory "
+                "[FastK/ref-seed/read-seed+map]")
+        else:
+            print("# himapper time / memory [FastK/seed/map]")
         print("# Other tools time / memory [prep/map]")
         print("# * = lowest total in each resource column")
         print("  ".join(

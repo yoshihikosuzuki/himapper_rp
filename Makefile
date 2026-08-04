@@ -24,11 +24,17 @@ ALL = himapper minimaxmer dump_kpos
 
 all: $(ALL)
 
-minimaxmer: minimaxmer.c nthash.h $(DAZZ_DB_SRC) $(DAZZ_DB_HDR) libfastk.c libfastk.h gene_core.h copynum.h
+minimaxmer: minimaxmer.c minimaxmer.h nthash.h $(DAZZ_DB_SRC) $(DAZZ_DB_HDR) libfastk.c libfastk.h gene_core.h copynum.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(MINIMAX_SELECTOR_FLAGS) -DSKIP_GENE_CORE -o minimaxmer minimaxmer.c $(DAZZ_DB_SRC) libfastk.c -lpthread -lm
 
-himapper: himapper.c map.c map.h align.c align.h $(DAZZ_DB_SRC) $(DAZZ_DB_HDR) copynum.h
-	$(CC) $(CPPFLAGS) $(CFLAGS) -o himapper himapper.c map.c align.c $(DAZZ_DB_SRC) -lpthread -lm
+minimaxmer-lib.o: minimaxmer.c minimaxmer.h nthash.h $(DAZZ_DB_HDR) libfastk.h gene_core.h copynum.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(MINIMAX_SELECTOR_FLAGS) \
+	  -DMINIMAXMER_NO_MAIN -DSKIP_GENE_CORE -c -o $@ minimaxmer.c
+
+himapper: himapper.c map.c map.h align.c align.h minimaxmer.h minimaxmer-lib.o \
+          $(DAZZ_DB_SRC) $(DAZZ_DB_HDR) libfastk.c libfastk.h copynum.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) -DSKIP_GENE_CORE -o himapper himapper.c map.c align.c \
+	  minimaxmer-lib.o $(DAZZ_DB_SRC) libfastk.c -lpthread -lm
 
 dump_kpos: dump_kpos.c copynum.h
 	$(CC) $(CFLAGS) -o dump_kpos dump_kpos.c
@@ -41,13 +47,15 @@ local-tools:
 	$(MAKE) -C $(FASTKDUAL_DIR) FASTK_DIR=$(abspath $(FASTK_DIR))
 
 clean:
-	rm -f $(ALL) HPC.himapper modimizer copy_minimizer
+	rm -f $(ALL) minimaxmer-lib.o HPC.himapper modimizer copy_minimizer
+	rm -f tests/test_minimaxmer_selector
 	$(MAKE) -C $(FASTKDUAL_DIR) clean
 	rm -fr *.dSYM
 	rm -f himapper.tar.gz
 
 package:
 	make clean
-	tar -zcf himapper.tar.gz README.md LICENSE *.h *.c Makefile $(FASTKDUAL_SRC)
+	tar -zcf himapper.tar.gz README.md LICENSE *.h *.c Makefile \
+	  tests/test_minimaxmer_selector.c $(FASTKDUAL_SRC)
 
-.PHONY: all local-tools clean package
+.PHONY: all test-minimaxmer-selector local-tools clean package

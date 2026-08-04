@@ -10,9 +10,9 @@ source config.sh
 for tool in "$DAZZ_DB_ROOT/fasta2DAM" "$DAZZ_DB_ROOT/DBshow" \
             "$DAZZ_DB_ROOT/DBsplit" \
             "$FASTK_ROOT/FastK" "$FASTK_ROOT/Fastrm" \
-            "$REPO/fastkdual/FastKdual"; do
+            "$REPO/fastkdual/FastKdual" "$REPO/minimaxmer"; do
   if [[ ! -x "$tool" ]]; then
-    echo "Missing local tool: $tool; run 'make local-tools' in $REPO" >&2
+    echo "Missing local tool: $tool; run 'make local-tools && make' in $REPO" >&2
     exit 1
   fi
 done
@@ -45,12 +45,9 @@ run_timed "$D_HIMAPPER/ref-vs-reads-profile.time" \
   "$FASTK_ROOT/FastK" -k"$KMER" -v -T"$THREADS" -t1 -p:reads -Nref.reads \
   -P"$FASTK_TMP" ref.dam
 
-# Generate seeds
+# Generate reference seeds.  Read seeds are generated in memory by himapper
+# during stage 07, so no intermediate read KPOS is written here.
 run_timed "$D_HIMAPPER/ref-seeds.time" \
   "$REPO/minimaxmer" -T"$THREADS" -k"$KMER" \
-  -w"$HIMAPPER_WS" -s"$HIMAPPER_WS" \
+  -w"$HIMAPPER_WS" -s"$HIMAPPER_WS" -l10 \
   ref.dam ref.prof ref.reads.prof "$D_HIMAPPER/.ref.minimax.kpos"
-run_timed "$D_HIMAPPER/read-seeds.time" \
-  "$REPO/minimaxmer" -T"$THREADS" -k"$KMER" \
-  -w"$HIMAPPER_WS" -s"$HIMAPPER_WS" \
-  reads.dam reads.ref.prof reads.prof "$D_HIMAPPER/.reads.minimax.kpos"

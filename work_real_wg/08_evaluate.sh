@@ -17,6 +17,14 @@ TOOLS=(
 #   wm2="$D_WM2/mapping.tsv"
 )
 
+RESOURCE_ARGS=()
+FUSED_HIMAPPER_TIME="$D_HIMAPPER/ref-seed_read-seed/seed-map.time"
+if [[ -s "$FUSED_HIMAPPER_TIME" ]]; then
+  RESOURCE_ARGS+=(
+    --fused-read-seed-map-time "himapper=$FUSED_HIMAPPER_TIME"
+  )
+fi
+
 # Rebuild and validate the derived mask so the summary always records the
 # current source annotations. Alignment strata cover the full Q60 truth set
 # and are filtered to the same masked population inside eval.py.
@@ -49,6 +57,7 @@ python3 "$SCRIPTS/eval.py" \
   --liftover-paf "$D_REF/mat_vs_pat.paf" \
   --liftover-paf "$D_REF/pat_vs_mat.paf" \
   --time-dir "$WR" \
+  "${RESOURCE_ARGS[@]}" \
   "${TOOLS[@]}" \
   | tee "$SUMMARY_TMP"
 mv "$SUMMARY_TMP" "$D_EVAL/summary.txt"

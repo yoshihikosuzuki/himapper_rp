@@ -11,6 +11,7 @@ HPC.himapper
 modimizer
 copy_minimizer
 minimaxmer
+minimaxmer-lib.o
 dump_kpos
 fastkdual/FastKdual
 fastkdual/compare_profiles*

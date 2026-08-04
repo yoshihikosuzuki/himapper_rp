@@ -56,12 +56,29 @@ container plus its block-offset sidecar. DB blocks are processed in parallel
 with `-T`, while entries remain block-local and code-sorted within each block.
 
 ```sh
-minimaxmer -T16 ref.dam ref.prof ref.reads.prof .ref.minimax.kpos
+minimaxmer -T16 -l10 ref.dam ref.prof ref.reads.prof .ref.minimax.kpos
 minimaxmer -T16 reads.dam reads.ref.prof reads.prof .reads.minimax.kpos
 ```
 
 These commands also create `.ref.minimax.kpos.idx` and
 `.reads.minimax.kpos.idx`.
+
+Long homopolymer, dinucleotide-satellite, and trinucleotide-satellite tracts
+are excluded from the reference command above.  The option is off by default
+(`-l-1`), as used by the read command.  `minimaxmer` does not infer the DB
+role; the caller decides whether to pass `-l`.  A positive value `N` removes
+selected reference K-mers that overlap any exact period-1, -2, or -3 tract
+whose complete-motif span is strictly greater than `N` bases.  Thus the
+recommended chr6 cutoff of 10 first excludes 11-base homopolymers, 6 complete
+dinucleotide units (12 bases), and 4 complete trinucleotide units (12 bases).
+This cutoff improved the measured chr6 result at `w=s=100`; its whole-genome
+generality has not yet been tested.  Overlap means any of the K bases, not only
+the stored K-mer start.
+Filtering occurs after sparse thinning, so enabled output is an exact subset
+of the corresponding default output and no replacement minimizer is added.
+The `PERIODIC_MASK_V1` counters named `*_mask_bases` report the full maximal
+tract span actually masked, including a possible terminal partial motif unit;
+the cutoff comparison itself always uses complete motif units.
 
 The default seed selector keeps the historical
 `(genome_count, -reads_count, canonical_ntHash % 2003)` priority.  When a
@@ -82,6 +99,81 @@ himapper -1 -T16 \
   ref.dam .ref.minimax.kpos \
   reads.dam .reads.minimax.kpos
 ```
+
+Read seed generation can instead be fused with mapping.  Serial mode gives
+seed generation and mapping the full `-T` thread budget in turn and passes each
+sorted KPOS block directly in memory.  It is the no-overlap control for the
+fused path.  Compared with separate standalone seed and map processes, its
+difference includes removal of intermediate KPOS write/read, duplicate read-DB
+loading, process-boundary overhead, and a small scheduling difference; it must
+not be attributed to file I/O alone:
+
+```sh
+himapper -1 -T16 \
+  --read-seed-profiles reads.ref.prof reads.prof \
+  --seed-mode serial --seed-threads 16 \
+  --seed-window 100 --seed-spacing 100 \
+  ref.dam .ref.minimax.kpos reads.dam generate
+```
+
+Fused/generated read seeds are not periodic-filtered.  To use low-complexity
+masking, create the reference KPOS with standalone `minimaxmer -l10` as shown
+above and pass it with ordinary unfiltered read KPOS or generated read seeds.
+
+Pipeline mode overlaps generation of the next block with mapping of the
+current block while keeping the combined budget at `-T` threads.  If `S` is
+given by `--seed-threads`, seed generation uses `S` workers and mapping uses
+`T-S`.  The measured 16-thread default is 6 seed workers plus 10 map workers:
+
+```sh
+himapper -1 -T16 \
+  --read-seed-profiles reads.ref.prof reads.prof \
+  --seed-mode pipeline --seed-threads 6 \
+  --seed-window 100 --seed-spacing 100 \
+  ref.dam .ref.minimax.kpos reads.dam generate
+```
+
+The generated read KPOS is not written by default.  Add
+`--save-read-kpos .reads.minimax.kpos` only when the same seeds must be reused;
+omit it from timing runs that are intended to measure the no-intermediate-file
+path.  Add `--phase-timing` to either command for seed and map phase records on
+standard error.
+
+The fused path functionally supports serial budgets from `T=1` through 128
+and pipeline budgets from `T=2` through 128.  Serial always uses `T/T` in
+sequence; pipeline accepts any split satisfying `1 <= S < T`.  Only the
+16-thread `S=6`, `T-S=10` pipeline has been measured on the WGS benchmark, so
+performance at other totals or splits is unverified.  Exact map worker counts
+are selected automatically for the fused path.  Standalone mapping from an
+existing read KPOS retains the historical power-of-two thread rounding.
+Serial seed generation keeps up to `T` generated DB/KPOS blocks resident so
+its RSS grows with the thread budget; the T64/T128 WGS memory footprint has not
+been measured.  Pipeline keeps up to `S` generated blocks in flight and is the
+safer default at large thread counts.
+
+The WGS stage-07 script defaults to pipeline mode and chooses the nearest
+integer to `3*T/8` seed workers (6 at `T=16`), clamped to `1..T-1`.  Override
+it with `HIMAPPER_SEED_MODE=serial|pipeline` and, for pipeline mode,
+`HIMAPPER_SEED_THREADS=S`.  Serial rejects a conflicting seed-thread override
+because it uses `T/T`.  Set `HIMAPPER_SAVE_READ_KPOS` to a nonempty output path
+only when the generated read KPOS must be retained; the default timed run
+writes timing to `seed-map.time` and does not save it.
+
+The validated fast paths are enabled by default.  For controlled comparisons,
+their historical implementations remain available through these environment
+variables:
+
+```sh
+MINIMAX_CANDIDATE_RADIX=0  # candidate priority qsort
+MINIMAX_PROFILE_READER=0   # indexed per-read profile fetch
+MINIMAX_SELECTED_CTZ=0     # linear selected-bit scan
+HIMAPPER_HISTOGRAM_FAST=0  # always build the map hit histogram
+```
+
+The rejected block-KPOS radix, K=32 hash-mix, window-run batching, and Splay
+update experiments have been removed from the production source.  Their
+frozen experiment records remain under `work_real/experiments/` and
+`work_real_wg/experiments/` for reproducibility.
 
 A multi-block reads DB produces `reads.1.ref.las`,
 `reads.2.ref.las`, and so on. A single-block DB produces `reads.ref.las`.

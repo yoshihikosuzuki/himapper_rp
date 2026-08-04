@@ -28,7 +28,7 @@ run_cfg() {
   local name=$1 weight=$2
   export CN_UNIQ_W="$weight"
   run_timed "$RUN_DIR/map.$name.time" \
-    "$HIM" -1 -T"$THREADS" \
+    "$HIM" -1 -T"$THREADS" -e"$HIMAPPER_E" \
     ref.dam "$D_HIMAPPER/.ref.minimax.kpos" \
     reads.dam all
   LAcat "reads.@1-${NB}.ref.las" > "$RUN_DIR/reads.ref.$name.las"
@@ -42,24 +42,14 @@ run_cfg() {
   done
 }
 
-run_cfg w0    0
-run_cfg w1p15 1.15
-run_cfg w2p3  2.3
-run_cfg w4p6  4.6
-run_cfg w11p5 11.5
-run_cfg winf  1000000
+run_cfg w8 "$CN_UNIQ_W"
 
-# Stable primary-comparison aliases point to the explicit W=11.5 candidate.
-ln -sfn mapping.w11p5.tsv "$RUN_DIR/mapping.tsv"
-ln -sfn map.w11p5.time "$RUN_DIR/map.time"
+# Stable primary-comparison aliases point to the configured W=8 candidate.
+ln -sfn mapping.w8.tsv "$RUN_DIR/mapping.tsv"
+ln -sfn map.w8.time "$RUN_DIR/map.time"
 
 plot_coverage "$RUN_DIR/coverage.png" \
   --xlo-mb 54 --xhi-mb 68 \
   minimap2="$D_MM2/mapping.tsv" \
   winnowmap2="$D_WM2/mapping.tsv" \
-  w0="$RUN_DIR/mapping.w0.tsv" \
-  w1p15="$RUN_DIR/mapping.w1p15.tsv" \
-  w2p3="$RUN_DIR/mapping.w2p3.tsv" \
-  w4p6="$RUN_DIR/mapping.w4p6.tsv" \
-  w11p5="$RUN_DIR/mapping.w11p5.tsv" \
-  winf="$RUN_DIR/mapping.winf.tsv"
+  w8="$RUN_DIR/mapping.w8.tsv"
