@@ -18,6 +18,9 @@ fastkdual/compare_profiles*
 fastkdual/validation
 fastkdual/*.log
 
+dev/copy_minimizer
+dev/modimizer
+
 memory/
 tests/
 work*/
@@ -25,3 +28,4 @@ work*/
 !work*/scripts/
 !work*/scripts/*.py
 !work*/scripts/*.awk
+CN_UNIQ_W.md

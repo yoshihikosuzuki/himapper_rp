@@ -136,8 +136,7 @@ himapper -1 -T16 \
 The generated read KPOS is not written by default.  Add
 `--save-read-kpos .reads.minimax.kpos` only when the same seeds must be reused;
 omit it from timing runs that are intended to measure the no-intermediate-file
-path.  Add `--phase-timing` to either command for seed and map phase records on
-standard error.
+path.
 
 The fused path functionally supports serial budgets from `T=1` through 128
 and pipeline budgets from `T=2` through 128.  Serial always uses `T/T` in
@@ -158,17 +157,6 @@ it with `HIMAPPER_SEED_MODE=serial|pipeline` and, for pipeline mode,
 because it uses `T/T`.  Set `HIMAPPER_SAVE_READ_KPOS` to a nonempty output path
 only when the generated read KPOS must be retained; the default timed run
 writes timing to `seed-map.time` and does not save it.
-
-The validated fast paths are enabled by default.  For controlled comparisons,
-their historical implementations remain available through these environment
-variables:
-
-```sh
-MINIMAX_CANDIDATE_RADIX=0  # candidate priority qsort
-MINIMAX_PROFILE_READER=0   # indexed per-read profile fetch
-MINIMAX_SELECTED_CTZ=0     # linear selected-bit scan
-HIMAPPER_HISTOGRAM_FAST=0  # always build the map hit histogram
-```
 
 The rejected block-KPOS radix, K=32 hash-mix, window-run batching, and Splay
 update experiments have been removed from the production source.  Their

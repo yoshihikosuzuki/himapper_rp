@@ -33,36 +33,6 @@ extern uint64 MEM_PHYSICAL;
  * pipeline remainders, up to HIMAPPER_MAX_THREADS. */
 int Set_Filter_Params(int kmer, int suppress, int nthreads);
 int Set_Filter_Params_Exact(int kmer, int suppress, int nthreads);
-int Filter_Thread_Count(void);
-
-typedef struct
-  { uint64 kpos_read_ns;
-    uint64 forward_prepare_ns;
-    uint64 reverse_complement_ns;
-    uint64 reverse_sort_ns;
-    uint64 filter_setup_ns;
-    uint64 count_ns;
-    uint64 histogram_ns;
-    uint64 hit_allocate_ns;
-    uint64 hit_materialize_ns;
-    uint64 hit_sort_ns;
-    uint64 chain_ns;
-    uint64 alignment_ns;
-    uint64 las_write_ns;
-    uint64 reporter_ns;
-    uint64 match_calls;
-    uint64 materialized_hits;
-    uint64 reporter_calls;
-    uint64 alignment_calls;
-    uint64 overlaps_written;
-    uint64 histogram_fast_calls;
-    uint64 histogram_fallback_calls;
-    uint64 histogram_legacy_calls;
-  } Map_Phase_Stats;
-
-void Set_Map_Phase_Timing(int enabled);
-const Map_Phase_Stats *Get_Map_Phase_Stats(void);
-void Print_Map_Phase_Stats(FILE *out);
 
 // Filter setup and dispatch are a single-control-thread API.  Set environment
 // configuration before Set_Filter_Params, then start/stop the fixed-lane

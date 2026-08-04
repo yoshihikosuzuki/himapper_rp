@@ -1,9 +1,9 @@
+// Development-only modulo-hash seed-selector variant.
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
-#include <time.h>
 #include <unistd.h>
 
 #include <DB.h>
@@ -16,8 +16,8 @@
 // #define DEBUG_NW
 
 int K = 32;          // k-mer length; maximum 32   [-k]
-int WSIZE  = 100;    // sliding window width for (count, hash) minimizer   [-w]
-int RSPACE = 100;    // minimum spacing between uniformly sparse seeds     [-s]
+int WSIZE  = 100;    // accepted for minimaxmer CLI compatibility; unused [-w]
+int RSPACE = 100;    // accepted for minimaxmer CLI compatibility; unused [-s]
 int EXCLUDE_PERIODIC_BP = -1; // -1 disables long p=1..3 tract exclusion
 
 // Build-time selector controls.  Production keeps the historical h%2003 key,
@@ -85,6 +85,12 @@ int EXCLUDE_PERIODIC_BP = -1; // -1 disables long p=1..3 tract exclusion
 
 static const uint64_t MOD = MINIMAX_HASH_MOD;
 
+// The modimizer selector is deliberately independent of the minimaxmer
+// build-time hash key above.  Selection always uses the full canonical
+// ntHash, before any MINIMAX_HASH_MOD reduction.
+static const uint64_t MODIMIZER_MOD = UINT64_C(101);
+static const uint64_t MODIMIZER_THRESHOLD = UINT64_C(1);
+
 #if MINIMAX_PACK_POSITION_TUPLE
 typedef uint16_t PositionHash;
 #else
@@ -116,16 +122,6 @@ static const uint8_t base_is_acgt[256] = {
 // known (K is capped at 32, so K==32 gives the full uint64 mask).
 static uint64_t KMASK;
 
-static uint64_t minimaxmer_now_ns(void)
-{
-  struct timespec ts;
-
-  if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
-    return 0;
-  return (uint64_t)ts.tv_sec * UINT64_C(1000000000) +
-         (uint64_t)ts.tv_nsec;
-}
-
 static pthread_mutex_t minimaxmer_open_db_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t minimaxmer_context_lock = PTHREAD_MUTEX_INITIALIZER;
 static int minimaxmer_context_active = 0;
@@ -138,17 +134,6 @@ int Minimaxmer_Open_DB_Serialized(char *path, DAZZ_DB *db)
   status = Open_DB(path,db);
   pthread_mutex_unlock(&minimaxmer_open_db_lock);
   return status;
-}
-
-static void minimaxmer_add_elapsed(uint64_t *total, uint64_t start)
-{
-  uint64_t end;
-
-  if (start == 0)
-    return;
-  end = minimaxmer_now_ns();
-  if (end >= start)
-    *total += end - start;
 }
 
 #if MINIMAX_TIE_AUDIT
@@ -252,22 +237,6 @@ static void push_kpos(KposVector *vector, uint64_t code, int32_t rpos, uint32_t 
   vector->len += 1;
 }
 
-static inline void append_selected_kpos(const char *seq, int kmer,
-                                        const uint16_t *prof_genome,
-                                        int read_id, KposVector *out,
-                                        size_t pos)
-{
-  const char *kp = seq - kmer + 1 + pos;
-  uint64_t code = 0;
-  int x;
-
-  for (x = 0; x < kmer; x++)
-    code = (code << 2) | base2bit[(unsigned char)kp[x]];
-  code &= KMASK;
-  push_kpos(out, code, (int32_t)pos,
-            CN_PACK(read_id, cn_tier_of(prof_genome[pos])));
-}
-
 static void reserve_kpos(KposVector *vector, size_t need)
 {
   KposEntry *entry;
@@ -293,47 +262,28 @@ static void reserve_kpos(KposVector *vector, size_t need)
   account_kpos_capacity(vector,next);
 }
 
-static void minimaxmer_stats_add(Minimaxmer_Phase_Stats *dst,
-                                 const Minimaxmer_Phase_Stats *src)
+typedef struct
+  { uint64_t periodic_tracts[3];
+    uint64_t periodic_tract_bases[3];
+    uint64_t periodic_reads;
+    uint64_t periodic_seeds_removed;
+  } Periodic_Stats;
+
+#ifndef MINIMAXMER_NO_MAIN
+static void periodic_stats_add(Periodic_Stats *dst,
+                               const Periodic_Stats *src)
 {
   int period;
 
-#define ADD_STAT(name) dst->name += src->name
-  ADD_STAT(block_load_ns);
-  ADD_STAT(sequence_read_ns);
-  ADD_STAT(profile_fetch_ns);
-  ADD_STAT(hash_ns);
-  ADD_STAT(window_ns);
-  ADD_STAT(candidate_build_ns);
-  ADD_STAT(candidate_sort_ns);
-  ADD_STAT(thinning_ns);
-  ADD_STAT(code_emit_ns);
-  ADD_STAT(block_sort_ns);
-  ADD_STAT(kpos_write_ns);
-  ADD_STAT(generated_blocks);
-  ADD_STAT(generated_reads);
-  ADD_STAT(generated_seeds);
-  ADD_STAT(profile_open_ns);
-  ADD_STAT(profile_seek_ns);
-  ADD_STAT(profile_read_ns);
-  ADD_STAT(profile_decode_control_ns);
-  ADD_STAT(profile_unclassified_ns);
-  ADD_STAT(profile_fetch_calls);
-  ADD_STAT(profile_open_calls);
-  ADD_STAT(profile_seek_calls);
-  ADD_STAT(profile_refill_calls);
-  ADD_STAT(profile_read_calls);
-  ADD_STAT(profile_read_bytes);
-  ADD_STAT(periodic_filter_ns);
-  ADD_STAT(periodic_reads);
-  ADD_STAT(periodic_seeds_removed);
-#undef ADD_STAT
+  dst->periodic_reads += src->periodic_reads;
+  dst->periodic_seeds_removed += src->periodic_seeds_removed;
   for (period = 0; period < 3; period++)
     { dst->periodic_tracts[period] += src->periodic_tracts[period];
       dst->periodic_tract_bases[period] +=
           src->periodic_tract_bases[period];
     }
 }
+#endif
 
 static int cmp_kpos(const void *a, const void *b)
 {
@@ -384,31 +334,34 @@ static int finish_kpos(FILE *out, uint64_t n_entries)
 
 #if MINIMAX_PACK_POSITION_TUPLE
 // Production h%2003 tuples fit in one uint64:
-//   [ genome count:16 ][ unused:16 ][ hash key:16 ]
+//   [ genome count:16 ][ UINT16_MAX-reads count:16 ][ hash key:16 ]
 // The full-length array stores only the 16-bit hash.  The canonical deque
 // caches this packed key for its O(W) live entries, so its hot comparisons
 // remain one integer comparison without paying 8 bytes per sequence position.
 static inline uint64_t pack_position_tuple(uint16_t genome_count,
+                                           uint16_t reads_count,
                                            uint64_t hash)
 {
   return ((uint64_t)genome_count << 32) |
+         ((uint64_t)(UINT16_MAX - reads_count) << 16) |
          (hash & UINT64_C(0xffff));
 }
 
 static inline uint64_t position_tuple_key(
     int pos,
     const uint16_t *prof_genome,
+    const uint16_t *prof_reads,
     const PositionHash *hvals)
 {
-  return pack_position_tuple(prof_genome[pos], (uint64_t)hvals[pos]);
+  return pack_position_tuple(
+      prof_genome[pos], prof_reads[pos], (uint64_t)hvals[pos]);
 }
 #endif
 
-// Compare (ca_g, ha) < (cb_g, hb):
+// Compare (ca_g, ca_r, ha) < (cb_g, cb_r, hb):
 //   primary:   lower genome count  -> more unique in genome -> better seed
-//   secondary: lower hash key      -> stable tiebreaker
-// The reads profile is still fetched for modern CLI/API compatibility, but it
-// is absent from every seed-selection priority, equality, and KPOS metadata.
+//   secondary: higher reads count  -> better covered in reads -> better seed
+//   tertiary:  lower hash key      -> stable tiebreaker
 // In refinement builds only, the full hash is the final collision resolver.
 static inline int position_tuple_lt(int a, int b,
                                     const uint16_t *prof_genome,
@@ -417,15 +370,15 @@ static inline int position_tuple_lt(int a, int b,
                                     const uint64_t *full_hvals)
 #if MINIMAX_PACK_POSITION_TUPLE
 {
-  (void)prof_reads;
   (void)full_hvals;
-  return position_tuple_key(a, prof_genome, hvals) <
-         position_tuple_key(b, prof_genome, hvals);
+  return position_tuple_key(a, prof_genome, prof_reads, hvals) <
+         position_tuple_key(b, prof_genome, prof_reads, hvals);
 }
 #else
-{ (void)prof_reads;
-  if (prof_genome[a] != prof_genome[b])
+{ if (prof_genome[a] != prof_genome[b])
     return prof_genome[a] < prof_genome[b];
+  if (prof_reads[a] != prof_reads[b])
+    return prof_reads[a] > prof_reads[b];
   if (hvals[a] != hvals[b])
     return hvals[a] < hvals[b];
 #if MINIMAX_HASH_REFINE
@@ -444,15 +397,14 @@ static inline int position_tuple_equal(int a, int b,
                                        const uint64_t *full_hvals)
 #if MINIMAX_PACK_POSITION_TUPLE
 {
-  (void)prof_reads;
   (void)full_hvals;
-  return position_tuple_key(a, prof_genome, hvals) ==
-         position_tuple_key(b, prof_genome, hvals);
+  return position_tuple_key(a, prof_genome, prof_reads, hvals) ==
+         position_tuple_key(b, prof_genome, prof_reads, hvals);
 }
 #else
 {
-  (void)prof_reads;
   if (prof_genome[a] != prof_genome[b] ||
+      prof_reads[a] != prof_reads[b] ||
       hvals[a] != hvals[b])
     return 0;
 #if MINIMAX_HASH_REFINE
@@ -469,23 +421,24 @@ static inline int profile_tuple_lt(int a, int b,
                                    const uint16_t *prof_genome,
                                    const uint16_t *prof_reads)
 {
-  (void)prof_reads;
-  return prof_genome[a] < prof_genome[b];
+  if (prof_genome[a] != prof_genome[b])
+    return prof_genome[a] < prof_genome[b];
+  return prof_reads[a] > prof_reads[b];
 }
 
 static inline int profile_tuple_equal(int a, int b,
                                       const uint16_t *prof_genome,
                                       const uint16_t *prof_reads)
 {
-  (void)prof_reads;
-  return prof_genome[a] == prof_genome[b];
+  return prof_genome[a] == prof_genome[b] &&
+         prof_reads[a] == prof_reads[b];
 }
 
 // Exact canonical 2-bit codes distinguish repeated occurrences of the same
 // canonical k-mer from different k-mers that collide after h%2003.  K<=32
 // makes the representation collision-free.
-static void fill_canonical_codes(const char *seq, int plen, int kmer,
-                                 uint64_t *codes)
+static void __attribute__((unused))
+fill_canonical_codes(const char *seq, int plen, int kmer, uint64_t *codes)
 {
   const char *bases = seq - kmer + 1;
   uint64_t forward = 0;
@@ -507,259 +460,6 @@ static void fill_canonical_codes(const char *seq, int plen, int kmer,
                 ((UINT64_C(3) - incoming) << (2 * (kmer - 1)));
       codes[x] = forward < reverse ? forward : reverse;
     }
-}
-#endif
-
-// Candidate for uniformly sparse thinning — stores sort-key fields so the
-// qsort comparator does not need external array access.
-typedef struct {
-  int      pos;
-  int      nw_val;
-#if MINIMAX_PACK_POSITION_TUPLE && MINIMAX_CANONICAL_THINNING
-  uint64_t tuple;
-#else
-  uint16_t g_count;
-  uint64_t hash;
-#endif
-} Candidate;
-
-// Stable radix sorting needs one auxiliary Candidate array.  Production
-// workers retain this grow-only buffer across reads so the fast path does not
-// add a malloc/free pair to every read; direct find_seeds() callers get the
-// same behavior through a call-local scratch object below.
-typedef struct {
-  Candidate *temporary;
-  size_t     capacity;
-} CandidateRadixScratch;
-
-static void init_candidate_radix_scratch(CandidateRadixScratch *scratch)
-{
-  scratch->temporary = NULL;
-  scratch->capacity = 0;
-}
-
-static void free_candidate_radix_scratch(CandidateRadixScratch *scratch)
-{
-  free(scratch->temporary);
-  scratch->temporary = NULL;
-  scratch->capacity = 0;
-}
-
-#if MINIMAX_PACK_POSITION_TUPLE && MINIMAX_CANONICAL_THINNING
-typedef char Candidate_must_be_16_bytes[
-    (sizeof(Candidate) == 16) ? 1 : -1];
-#endif
-
-#if MINIMAX_HASH_REFINE
-// Keep Candidate byte-layout identical to the historical build.  A larger
-// element size can change qsort's ordering inside comparator-equal groups and
-// would confound collision refinement with an unrelated spacing change.
-static _Thread_local const uint64_t *candidate_full_hvals;
-#endif
-
-// Compare candidates by descending h_nw priority:
-//   1. nw      descending (more windows → higher priority)
-//   2. g_count ascending  (rarer in genome → better seed)
-//   3. hash    ascending  (stable tiebreaker)
-static int cand_cmp(const void *a, const void *b)
-{ const Candidate *ca = (const Candidate *)a;
-  const Candidate *cb = (const Candidate *)b;
-  if (ca->nw_val != cb->nw_val)
-    return (cb->nw_val > ca->nw_val) ? 1 : -1;
-#if MINIMAX_PACK_POSITION_TUPLE && MINIMAX_CANONICAL_THINNING
-  if (ca->tuple != cb->tuple)
-    return (ca->tuple > cb->tuple) ? 1 : -1;
-#else
-  if (ca->g_count != cb->g_count)
-    return (ca->g_count > cb->g_count) ? 1 : -1;
-  if (ca->hash != cb->hash)
-    return (ca->hash > cb->hash) ? 1 : -1;
-#if MINIMAX_HASH_REFINE
-  { uint64_t fa = candidate_full_hvals[ca->pos];
-    uint64_t fb = candidate_full_hvals[cb->pos];
-    if (fa != fb)
-      return (fa > fb) ? 1 : -1;
-  }
-#endif
-#endif
-  return 0;
-}
-
-#if MINIMAX_PACK_POSITION_TUPLE && MINIMAX_CANONICAL_THINNING
-static pthread_once_t candidate_radix_once = PTHREAD_ONCE_INIT;
-static int candidate_radix_enabled_value = 1;
-
-static void init_candidate_radix_mode(void)
-{
-  const char *value = getenv("MINIMAX_CANDIDATE_RADIX");
-
-  if (value != NULL && strcmp(value, "0") == 0)
-    candidate_radix_enabled_value = 0;
-}
-
-static int candidate_radix_enabled(void)
-{
-  pthread_once(&candidate_radix_once, init_candidate_radix_mode);
-  return candidate_radix_enabled_value;
-}
-
-static int candidate_radix_usable(void)
-{
-  return WSIZE <= UINT8_MAX && candidate_radix_enabled();
-}
-
-static Candidate *reserve_candidate_radix_scratch(
-    CandidateRadixScratch *scratch, size_t need)
-{
-  Candidate *temporary;
-  size_t capacity;
-
-  if (need <= scratch->capacity)
-    return scratch->temporary;
-  if (need > SIZE_MAX / sizeof(Candidate))
-    { fprintf(stderr, "candidate radix capacity overflow\n");
-      exit(1);
-    }
-  capacity = scratch->capacity == 0 ? 256 : scratch->capacity;
-  while (capacity < need)
-    { if (capacity > SIZE_MAX / 2)
-        { capacity = need;
-          break;
-        }
-      capacity *= 2;
-    }
-  temporary = (Candidate *)realloc(
-      scratch->temporary, capacity * sizeof(Candidate));
-  if (temporary == NULL)
-    { perror("realloc candidate radix scratch");
-      exit(1);
-    }
-  scratch->temporary = temporary;
-  scratch->capacity = capacity;
-  return temporary;
-}
-
-// Production Candidate::tuple occupies exactly 48 bits.  Six stable LSD
-// byte passes therefore order tuple ascending; the final pass maps nw to its
-// reverse byte so larger window counts precede smaller ones.  Input candidates
-// are built in position order, hence equal keys remain position-stable.  The
-// existing group-local position qsort remains in place as the semantic guard.
-static void radix_sort_candidates(Candidate *candidates, size_t length,
-                                  CandidateRadixScratch *scratch)
-{
-  Candidate *source = candidates;
-  Candidate *target =
-      reserve_candidate_radix_scratch(scratch, length);
-  unsigned int pass;
-
-  for (pass = 0; pass < 7; pass++)
-    { size_t offset[256] = {0};
-      size_t total = 0;
-      size_t i;
-
-      if (pass < 6)
-        { unsigned int shift = pass * 8;
-          for (i = 0; i < length; i++)
-            offset[(source[i].tuple >> shift) & UINT64_C(0xff)]++;
-        }
-      else
-        for (i = 0; i < length; i++)
-          offset[UINT8_MAX - (unsigned int)source[i].nw_val]++;
-
-      for (i = 0; i < 256; i++)
-        { size_t count = offset[i];
-          offset[i] = total;
-          total += count;
-        }
-
-      if (pass < 6)
-        { unsigned int shift = pass * 8;
-          for (i = 0; i < length; i++)
-            { unsigned int key = (unsigned int)
-                  ((source[i].tuple >> shift) & UINT64_C(0xff));
-              target[offset[key]++] = source[i];
-            }
-        }
-      else
-        for (i = 0; i < length; i++)
-          { unsigned int key =
-                UINT8_MAX - (unsigned int)source[i].nw_val;
-            target[offset[key]++] = source[i];
-          }
-
-      { Candidate *swap = source;
-        source = target;
-        target = swap;
-      }
-    }
-
-  if (source != candidates)
-    memcpy(candidates, source, length * sizeof(Candidate));
-}
-#endif
-
-static pthread_once_t profile_reader_once = PTHREAD_ONCE_INIT;
-static int profile_reader_enabled_value = 1;
-
-static void init_profile_reader_mode(void)
-{
-  const char *value = getenv("MINIMAX_PROFILE_READER");
-
-  if (value != NULL && strcmp(value, "0") == 0)
-    profile_reader_enabled_value = 0;
-}
-
-static int profile_reader_enabled(void)
-{
-  pthread_once(&profile_reader_once, init_profile_reader_mode);
-  return profile_reader_enabled_value;
-}
-
-static pthread_once_t selected_ctz_once = PTHREAD_ONCE_INIT;
-static int selected_ctz_enabled_value = 1;
-
-static void init_selected_ctz_mode(void)
-{
-  const char *value = getenv("MINIMAX_SELECTED_CTZ");
-
-  if (value != NULL && strcmp(value, "0") == 0)
-    selected_ctz_enabled_value = 0;
-}
-
-static int selected_ctz_enabled(void)
-{
-  pthread_once(&selected_ctz_once, init_selected_ctz_mode);
-  return selected_ctz_enabled_value;
-}
-
-#if MINIMAX_CANONICAL_THINNING
-static int cand_pos_cmp(const void *a, const void *b)
-{
-  const Candidate *ca = (const Candidate *)a;
-  const Candidate *cb = (const Candidate *)b;
-  return (ca->pos > cb->pos) - (ca->pos < cb->pos);
-}
-
-static int candidate_priority_equal(const Candidate *a, const Candidate *b,
-                                    const uint64_t *full_hvals)
-{
-  if (a->nw_val != b->nw_val)
-    return 0;
-#if MINIMAX_PACK_POSITION_TUPLE && MINIMAX_CANONICAL_THINNING
-  (void)full_hvals;
-  return a->tuple == b->tuple;
-#else
-  if (
-      a->g_count != b->g_count ||
-      a->hash != b->hash)
-    return 0;
-#if MINIMAX_HASH_REFINE
-  return full_hvals[a->pos] == full_hvals[b->pos];
-#else
-  (void)full_hvals;
-  return 1;
-#endif
-#endif
 }
 #endif
 
@@ -846,10 +546,10 @@ static inline int periodic_base_code(unsigned char base)
 // strictly greater than EXCLUDE_PERIODIC_BP.  Period-2 and period-3 tracts
 // that are homopolymers are left to the period-1 pass so the diagnostics are
 // disjoint.  The selected seeds that remain are an exact subset of the
-// baseline thinning result.
+// baseline modimizer result.
 static void exclude_long_periodic_seeds(
     const char *bases, int nbase, int kmer, int plen,
-    uint64_t *selected, Minimaxmer_Phase_Stats *stats)
+    uint64_t *selected, Periodic_Stats *stats)
 {
   uint64_t removed = 0;
   int found_tract = 0;
@@ -1058,8 +758,7 @@ static inline CanonicalMinimum canonical_minimum_at(
 
   result.pos = pos;
 #if MINIMAX_PACK_POSITION_TUPLE
-  result.key = position_tuple_key(pos, prof_genome, hvals);
-  (void)prof_reads;
+  result.key = position_tuple_key(pos, prof_genome, prof_reads, hvals);
 #else
   (void)prof_genome;
   (void)prof_reads;
@@ -1889,11 +1588,16 @@ void count_window_minima(const char *seq,
 #endif
 }
 
-// Select seeds using a sliding-window (genome_count, hash) minimizer.
+// Select seeds using the historical canonical-hash modulo rule.
 //
-// For every window of WSIZE consecutive k-mers the one with the lexicographically
-// smallest (prof_genome[i], hVal[i]) tuple is selected.
-// The result is the union of all per-window selections.
+// Select every k-mer whose full canonical ntHash satisfies
+//
+//     hash % 101 < 1
+//
+// This is the historical modimizer selection rule.  The surrounding modern
+// implementation (parallel block processing, profiles/copy tiers, KPOS v2,
+// and optional periodic filtering) is retained, but window minimization and
+// RSPACE thinning are intentionally bypassed.
 //
 //   seq         – pointer to position (K-1) in the read
 //   plen        – number of k-mers (rlen - K + 1)
@@ -1903,10 +1607,8 @@ void count_window_minima(const char *seq,
 //   read_id     – 0-based read index
 //   out         – block-local KPOS vector
 //
-// Returns the number of entries appended.  Production workers pass a reusable
-// canonical scratch buffer; the public wrapper below preserves the historical
-// find_seeds() interface for direct callers and selector tests.
-static int find_seeds_with_scratch(
+// Returns the number of entries appended.
+static int find_seeds_impl(
                const char    *seq,
                const int      plen,
                const int      K,
@@ -1914,58 +1616,56 @@ static int find_seeds_with_scratch(
                const uint16  *prof_reads,
                const int      read_id,
                KposVector    *out,
-               Minimaxmer_Phase_Stats *phase_stats,
-               Minimaxmer_Phase_Stats *periodic_stats,
-               CandidateRadixScratch *candidate_scratch
-#if MINIMAX_CANONICAL_WINNOW
-               , CanonicalWindowScratch *window_scratch
-#endif
+               Periodic_Stats *periodic_stats
 #if MINIMAX_TIE_AUDIT
                , TieStats    *tie_stats
 #endif
                )
 {
-  uint64_t phase_start;
-
-#if !(MINIMAX_PACK_POSITION_TUPLE && MINIMAX_CANONICAL_THINNING)
-  (void)candidate_scratch;
+  (void)prof_reads;
+#if MINIMAX_TIE_AUDIT
+  // Window-tie auditing is minimaxmer-specific and has no event to record
+  // when window selection is bypassed.
+  (void)tie_stats;
 #endif
   if (plen <= 0) return 0;
 
+  size_t seed_nwords = ((size_t)plen + 63) >> 6;
+  uint64_t *selected = (uint64_t *)calloc(seed_nwords, sizeof(uint64_t));
+  if (!selected) { perror("calloc seed bitset"); exit(1); }
+
   // Step 1: compute all canonical hash values and derive the configured key.
-  phase_start = phase_stats == NULL ? 0 : minimaxmer_now_ns();
   PositionHash *hvals =
       (PositionHash *)malloc((size_t)plen * sizeof(PositionHash));
   uint64_t *full_hvals = NULL;
-#if MINIMAX_TIE_AUDIT
-  uint64_t *canonical_codes =
-      (uint64_t *)malloc((size_t)plen * sizeof(uint64_t));
-  int *profile_dq = (int *)malloc((size_t)plen * sizeof(int));
-#endif
   if (!hvals) { perror("malloc hvals"); exit(1); }
-#if MINIMAX_TIE_AUDIT
-  if (!canonical_codes || !profile_dq)
-    { perror("malloc tie audit arrays");
-      exit(1);
-    }
-  fill_canonical_codes(seq, plen, K, canonical_codes);
-#endif
   { uint64_t fhVal = 0, rhVal = 0;
 #if MINIMAX_PACK_POSITION_TUPLE
-    uint64_t hash = NTC64_b(seq - K + 1, K, &fhVal, &rhVal) % MOD;
-    hvals[0] = (PositionHash)hash;
+    uint64_t hash = NTC64_b(seq - K + 1, K, &fhVal, &rhVal);
+    if (hash % MODIMIZER_MOD < MODIMIZER_THRESHOLD)
+      seed_bit_set(selected, 0);
+    hvals[0] = (PositionHash)(hash % MOD);
     for (int i = 1; i < plen; i++)
       { hash = NTC64_c(
                    (unsigned char)seq[i - K],
-                   (unsigned char)seq[i], K, &fhVal, &rhVal) % MOD;
-        hvals[i] = (PositionHash)hash;
+                   (unsigned char)seq[i], K, &fhVal, &rhVal);
+        if (hash % MODIMIZER_MOD < MODIMIZER_THRESHOLD)
+          seed_bit_set(selected, (size_t)i);
+        hvals[i] = (PositionHash)(hash % MOD);
       }
 #else
-    hvals[0] = NTC64_b(seq - K + 1, K, &fhVal, &rhVal);
+    uint64_t hash = NTC64_b(seq - K + 1, K, &fhVal, &rhVal);
+    hvals[0] = hash;
+    if (hash % MODIMIZER_MOD < MODIMIZER_THRESHOLD)
+      seed_bit_set(selected, 0);
     for (int i = 1; i < plen; i++)
-      hvals[i] = NTC64_c(
+      { hash = NTC64_c(
           (unsigned char)seq[i - K], (unsigned char)seq[i],
           K, &fhVal, &rhVal);
+        hvals[i] = hash;
+        if (hash % MODIMIZER_MOD < MODIMIZER_THRESHOLD)
+          seed_bit_set(selected, (size_t)i);
+      }
 #if MINIMAX_HASH_REFINE
     full_hvals = (uint64_t *)malloc((size_t)plen * sizeof(uint64_t));
     if (!full_hvals) { perror("malloc full_hvals"); exit(1); }
@@ -1979,185 +1679,14 @@ static int find_seeds_with_scratch(
 #endif
 #endif
   }
-  if (phase_stats != NULL)
-    minimaxmer_add_elapsed(&phase_stats->hash_ns, phase_start);
-
-  // Step 2: sliding-window minimum with a monotone deque.
-  //   The deque stores indices in increasing position order.
-  //   Front = index with the minimum (count, hash) in the current window.
-  //   Canonical mode retains the equal-minimum prefix so D-oriented robust
-  //   traversal can choose either extreme; historical modes use their
-  //   original strict/non-strict pop policy.
-#if MINIMAX_CANONICAL_WINNOW
-  WindowCounts nw;
-
-  phase_start = phase_stats == NULL ? 0 : minimaxmer_now_ns();
-  init_window_counts(&nw, plen);
-  count_window_minima_with_scratch(
-      seq, plen, K, prof_genome, prof_reads,
-      hvals, full_hvals, read_id, &nw, window_scratch);
-#define NW_AT(pos) get_window_count(&nw, (pos))
-#else
-  int *dq = (int *)malloc((size_t)plen * sizeof(int));
-  int *nw = (int *)calloc((size_t)plen, sizeof(int));
-
-  if (!dq || !nw) { perror("malloc deque/nw"); exit(1); }
-  count_window_minima(seq, plen, K, prof_genome, prof_reads,
-                      hvals, full_hvals, read_id, dq, nw
-#if MINIMAX_TIE_AUDIT
-                      , canonical_codes, profile_dq, tie_stats
-#endif
-                      );
-#define NW_AT(pos) ((unsigned int)nw[(pos)])
-#endif
-  if (phase_stats != NULL)
-    minimaxmer_add_elapsed(&phase_stats->window_ns, phase_start);
-
-  // Step 3: Uniformly sparse thinning.
-  // Sort candidates by descending h_nw = (NW, -h_minimax) priority, then
-  // greedily accept only those whose position is ≥ RSPACE from every
-  // already-accepted seed.
-  size_t seed_nwords = ((size_t)plen + 63) >> 6;
-  phase_start = phase_stats == NULL ? 0 : minimaxmer_now_ns();
-  uint64_t *selected = (uint64_t *) calloc(seed_nwords, sizeof(uint64_t));
-  uint64_t *blocked  = (uint64_t *) calloc(seed_nwords, sizeof(uint64_t));
-  if (!selected || !blocked) { perror("calloc seed bitsets"); exit(1); }
-
-  { int ncand = 0;
-    for (int i = 0; i < plen; i++)
-      if (NW_AT(i) > 0) ncand++;
-
-    if (ncand > 0)
-      { Candidate *cands = (Candidate *) malloc((size_t)ncand * sizeof(Candidate));
-        if (!cands) { perror("malloc cands"); exit(1); }
-        { int ci = 0;
-          for (int i = 0; i < plen; i++)
-            if (NW_AT(i) > 0)
-              { cands[ci].pos     = i;
-                cands[ci].nw_val  = (int)NW_AT(i);
-#if MINIMAX_PACK_POSITION_TUPLE && MINIMAX_CANONICAL_THINNING
-                cands[ci].tuple =
-                    position_tuple_key(i, prof_genome, hvals);
-#else
-                cands[ci].g_count = prof_genome[i];
-                cands[ci].hash    = (uint64_t)hvals[i];
-#endif
-                ci++;
-              }
-        }
-        if (phase_stats != NULL)
-          minimaxmer_add_elapsed(&phase_stats->candidate_build_ns,
-                                 phase_start);
-        if (ncand > 1)
-          {
-            phase_start = phase_stats == NULL ? 0 : minimaxmer_now_ns();
-#if MINIMAX_HASH_REFINE
-            candidate_full_hvals = full_hvals;
-#endif
-#if MINIMAX_PACK_POSITION_TUPLE && MINIMAX_CANONICAL_THINNING
-            if (candidate_radix_usable() && candidate_scratch != NULL)
-              radix_sort_candidates(
-                  cands, (size_t)ncand, candidate_scratch);
-            else
-#endif
-              qsort(cands, (size_t)ncand, sizeof(Candidate), cand_cmp);
-#if MINIMAX_HASH_REFINE
-            candidate_full_hvals = NULL;
-#endif
-            if (phase_stats != NULL)
-              minimaxmer_add_elapsed(&phase_stats->candidate_sort_ns,
-                                     phase_start);
-          }
-
-        phase_start = phase_stats == NULL ? 0 : minimaxmer_now_ns();
-#if MINIMAX_CANONICAL_THINNING
-        {
-          // Within each priority-equal group, order by position and visit the
-          // two extremes as a pair.  Keeping the positional key out of the
-          // primary qsort is intentional: reads contain many duplicate
-          // priorities, and forcing a total order there costs more than these
-          // small group-local sorts.  Accept both extremes when mutually
-          // compatible, then move inward past candidates blocked by that
-          // pair.  Left and right exchange under RC, so every decision is
-          // strand-safe.
-          int begin = 0;
-
-          while (begin < ncand)
-            {
-              int end = begin + 1;
-              int left;
-              int right;
-
-              while (end < ncand &&
-                     candidate_priority_equal(cands + begin, cands + end,
-                                              full_hvals))
-                end++;
-              if (end - begin > 1)
-                qsort(cands + begin, (size_t)(end - begin),
-                      sizeof(Candidate), cand_pos_cmp);
-              left = begin;
-              right = end - 1;
-              while (left <= right)
-                {
-                  int left_pos;
-                  int right_pos;
-
-                  while (left <= right &&
-                         seed_bit_is_set(
-                             blocked, (size_t)cands[left].pos))
-                    left++;
-                  if (left > right)
-                    break;
-                  while (left < right &&
-                         seed_bit_is_set(
-                             blocked, (size_t)cands[right].pos))
-                    right--;
-
-                  left_pos = cands[left].pos;
-                  right_pos = cands[right].pos;
-                  if (left == right)
-                    {
-                      accept_sparse_seed(selected, blocked, (size_t)plen,
-                                         (size_t)left_pos);
-                      break;
-                    }
-
-                  if (right_pos - left_pos >= RSPACE)
-                    {
-                      accept_sparse_seed(selected, blocked, (size_t)plen,
-                                         (size_t)left_pos);
-                      accept_sparse_seed(selected, blocked, (size_t)plen,
-                                         (size_t)right_pos);
-                    }
-                  left++;
-                  right--;
-                }
-              begin = end;
-            }
-        }
-#else
-        for (int ci = 0; ci < ncand; ci++)
-          { size_t p = (size_t)cands[ci].pos;
-            if (seed_bit_is_set(blocked, p))
-              continue;
-            accept_sparse_seed(selected, blocked, (size_t)plen, p);
-          }
-#endif
-        if (phase_stats != NULL)
-          minimaxmer_add_elapsed(&phase_stats->thinning_ns, phase_start);
-        free(cands);
-      }
-    else if (phase_stats != NULL)
-      minimaxmer_add_elapsed(&phase_stats->candidate_build_ns, phase_start);
-  }
+  // Steps 2 and 3 of minimaxmer are deliberately absent.  `selected` was
+  // populated directly from the full canonical hash above, so neither window
+  // minimization nor RSPACE thinning can alter the modimizer seed set.
+#define NW_AT(pos) ((unsigned int)seed_bit_is_set(selected, (size_t)(pos)))
 
   if (EXCLUDE_PERIODIC_BP > 0)
-    { phase_start = phase_stats == NULL ? 0 : minimaxmer_now_ns();
-      exclude_long_periodic_seeds(
+    { exclude_long_periodic_seeds(
           seq-K+1, plen+K-1, K, plen, selected, periodic_stats);
-      if (phase_stats != NULL)
-        minimaxmer_add_elapsed(&phase_stats->periodic_filter_ns,
-                               phase_start);
     }
 
 #ifdef DEBUG_NW
@@ -2178,10 +1707,8 @@ static int find_seeds_with_scratch(
 #endif
 
   // Step 4: append selected seeds to this block's KPOS run.
-  phase_start = phase_stats == NULL ? 0 : minimaxmer_now_ns();
   int written = 0;
-  if (selected_ctz_enabled())
-    { size_t word_index;
+  { size_t word_index;
 
       // selected only contains valid positions.  Ascending words followed by
       // least-significant-set-bit removal therefore emits the exact same
@@ -2193,38 +1720,22 @@ static int find_seeds_with_scratch(
             { unsigned int bit = (unsigned int)__builtin_ctzll(word);
               size_t pos = (word_index << 6) + bit;
 
-              append_selected_kpos(seq, K, prof_genome, read_id, out, pos);
+              { const char *kp = seq - K + 1 + pos;
+                uint64_t code = 0;
+                int x;
+
+                for (x = 0; x < K; x++)
+                  code = (code << 2) | base2bit[(unsigned char)kp[x]];
+                code &= KMASK;
+                push_kpos(out, code, (int32_t)pos,
+                          CN_PACK(read_id, cn_tier_of(prof_genome[pos])));
+              }
               written++;
               word &= word - 1;
             }
         }
     }
-  else
-    { int i;
-
-      for (i = 0; i < plen; i++)
-        { if (!seed_bit_is_set(selected, (size_t)i))
-            continue;
-          append_selected_kpos(seq, K, prof_genome, read_id, out,
-                               (size_t)i);
-          written++;
-        }
-    }
-  if (phase_stats != NULL)
-    minimaxmer_add_elapsed(&phase_stats->code_emit_ns, phase_start);
-
-  free(blocked);
   free(selected);
-#if MINIMAX_CANONICAL_WINNOW
-  free_window_counts(&nw);
-#else
-  free(nw);
-  free(dq);
-#endif
-#if MINIMAX_TIE_AUDIT
-  free(profile_dq);
-  free(canonical_codes);
-#endif
   free(full_hvals);
   free(hvals);
 #undef NW_AT
@@ -2243,33 +1754,12 @@ int find_seeds(const char    *seq,
 #endif
                )
 {
-  CandidateRadixScratch candidate_scratch;
-#if MINIMAX_CANONICAL_WINNOW
-  CanonicalWindowScratch scratch;
-  int written;
-
-  init_candidate_radix_scratch(&candidate_scratch);
-  init_canonical_window_scratch(&scratch);
-  written = find_seeds_with_scratch(
-      seq, plen, K, prof_genome, prof_reads, read_id, out, NULL,
-      NULL, &candidate_scratch, &scratch);
-  free_canonical_window_scratch(&scratch);
-  free_candidate_radix_scratch(&candidate_scratch);
-  return written;
-#else
-  int written;
-
-  init_candidate_radix_scratch(&candidate_scratch);
-  written = find_seeds_with_scratch(
-      seq, plen, K, prof_genome, prof_reads, read_id, out, NULL,
-      NULL, &candidate_scratch
+  return find_seeds_impl(
+      seq, plen, K, prof_genome, prof_reads, read_id, out, NULL
 #if MINIMAX_TIE_AUDIT
       , tie_stats
 #endif
       );
-  free_candidate_radix_scratch(&candidate_scratch);
-  return written;
-#endif
 }
 
 typedef struct
@@ -2279,7 +1769,7 @@ typedef struct
     DAZZ_DB   *loaded_db;
     uint64_t   loaded_db_bytes;
     int        ready;
-    Minimaxmer_Phase_Stats phase_stats;
+    Periodic_Stats periodic_stats;
 #if MINIMAX_TIE_AUDIT
     TieStats   tie_stats;
 #endif
@@ -2296,7 +1786,6 @@ typedef struct
     int            end_block;
     int            wait_for_consumption;
     int            retain_loaded_db;
-    int            phase_timing;
     int            stopping;
     uint64_t       resident_bytes;
     uint64_t       resident_db_bytes;
@@ -2345,11 +1834,9 @@ static FILE *open_worker_bases(const DAZZ_DB *db)
 }
 
 static DAZZ_DB *load_worker_block(WorkQueue *queue, int block,
-                                  Minimaxmer_Phase_Stats *phase_stats,
                                   uint64_t *resident_bytes)
 {
   DAZZ_DB *loaded = (DAZZ_DB *)calloc(1,sizeof(*loaded));
-  uint64_t phase_start = phase_stats == NULL ? 0 : minimaxmer_now_ns();
   int first = queue->stub->ublocks[block];
   int last = queue->stub->ublocks[block+1];
   int i;
@@ -2382,8 +1869,6 @@ static DAZZ_DB *load_worker_block(WorkQueue *queue, int block,
   pthread_mutex_lock(&queue->lock);
   queue->resident_db_bytes += *resident_bytes;
   pthread_mutex_unlock(&queue->lock);
-  if (phase_stats != NULL)
-    minimaxmer_add_elapsed(&phase_stats->block_load_ns,phase_start);
   return loaded;
 
 fail:
@@ -2393,83 +1878,10 @@ fail:
   return NULL;
 }
 
-static __attribute__((noinline))
-void fetch_seed_profiles_timed(Profile_Reader *genome_reader,
-                               Profile_Reader *reads_reader,
-                               int64 id,
-                               int *capacity,
-                               uint16 **genome_profile,
-                               uint16 **reads_profile,
-                               Profile_Reader_Timing *timing)
-{
-  int64 fetched;
-
-  fetched = Fetch_Profile_Sequential_Timed(
-      genome_reader,id,*capacity,*genome_profile,timing);
-  if (fetched > *capacity)
-    { grow_profiles((int)fetched,capacity,genome_profile,reads_profile);
-      Fetch_Profile_Sequential_Timed(
-          genome_reader,id,*capacity,*genome_profile,timing);
-    }
-
-  fetched = Fetch_Profile_Sequential_Timed(
-      reads_reader,id,*capacity,*reads_profile,timing);
-  if (fetched > *capacity)
-    { grow_profiles((int)fetched,capacity,genome_profile,reads_profile);
-      Fetch_Profile_Sequential_Timed(
-          reads_reader,id,*capacity,*reads_profile,timing);
-    }
-}
-
-static __attribute__((noinline))
-void finish_profile_timing(Minimaxmer_Phase_Stats *stats,
-                           int use_profile_reader,
-                           const Profile_Reader_Timing *timing)
-{
-  uint64_t io_ns;
-
-  if (!use_profile_reader)
-    {
-      // The indexed rollback has no internal instrumentation.  Preserve its
-      // combined measurement without presenting any part of it as decode.
-      stats->profile_unclassified_ns += stats->profile_fetch_ns;
-      return;
-    }
-
-  io_ns = timing->open_ns + timing->seek_ns + timing->read_ns;
-  if (io_ns > timing->fetch_ns || timing->fetch_ns > stats->profile_fetch_ns)
-    {
-      fprintf(stderr,
-              "minimaxmer: inconsistent profile timing "
-              "(io=%llu fetch=%llu combined=%llu)\n",
-              (unsigned long long)io_ns,
-              (unsigned long long)timing->fetch_ns,
-              (unsigned long long)stats->profile_fetch_ns);
-      exit(1);
-    }
-
-  stats->profile_open_ns += timing->open_ns;
-  stats->profile_seek_ns += timing->seek_ns;
-  stats->profile_read_ns += timing->read_ns;
-  // This is all non-I/O time inside Fetch_Profile_Sequential, including
-  // validation and cursor control as well as the compressed-profile decoder.
-  stats->profile_decode_control_ns += timing->fetch_ns-io_ns;
-  stats->profile_unclassified_ns += stats->profile_fetch_ns-timing->fetch_ns;
-  stats->profile_fetch_calls += timing->fetch_calls;
-  stats->profile_open_calls += timing->open_calls;
-  stats->profile_seek_calls += timing->seek_calls;
-  stats->profile_refill_calls += timing->refill_calls;
-  stats->profile_read_calls += timing->read_calls;
-  stats->profile_read_bytes += timing->read_bytes;
-}
-
 static void *seed_worker(void *arg)
 {
   WorkQueue *queue = (WorkQueue *)arg;
   DAZZ_DB db = *queue->db;
-  int use_profile_reader = profile_reader_enabled();
-  Profile_Index *Pg = NULL;
-  Profile_Index *Pr = NULL;
   Profile_Reader *Pg_reader = NULL;
   Profile_Reader *Pr_reader = NULL;
   char *seq;
@@ -2477,30 +1889,16 @@ static void *seed_worker(void *arg)
   uint16 *prof_reads;
   int pmax = 20000;
   KposVector vector = {0};
-  CandidateRadixScratch candidate_scratch;
-#if MINIMAX_CANONICAL_WINNOW
-  CanonicalWindowScratch window_scratch;
-#endif
 
   if (queue->retain_loaded_db)
     db.bases = NULL;
   else
     db.bases = open_worker_bases(queue->db);
-  if (use_profile_reader)
-    { Pg_reader = Open_Profile_Reader(queue->genome);
-      Pr_reader = Open_Profile_Reader(queue->reads);
-      if (Pg_reader == NULL || Pr_reader == NULL)
-        { fprintf(stderr,"minimaxmer: cannot open sequential profile readers\n");
-          exit(1);
-        }
-    }
-  else
-    { Pg = Clone_Profiles(queue->genome);
-      Pr = Clone_Profiles(queue->reads);
-      if (Pg == NULL || Pr == NULL)
-        { fprintf(stderr,"minimaxmer: cannot clone profile indexes\n");
-          exit(1);
-        }
+  Pg_reader = Open_Profile_Reader(queue->genome);
+  Pr_reader = Open_Profile_Reader(queue->reads);
+  if (Pg_reader == NULL || Pr_reader == NULL)
+    { fprintf(stderr,"minimaxmer: cannot open sequential profile readers\n");
+      exit(1);
     }
   seq = New_Read_Buffer(&db);
   prof_genome = (uint16 *)malloc((size_t)pmax * sizeof(uint16));
@@ -2509,10 +1907,6 @@ static void *seed_worker(void *arg)
     { perror("malloc profile");
       exit(1);
     }
-  init_candidate_radix_scratch(&candidate_scratch);
-#if MINIMAX_CANONICAL_WINNOW
-  init_canonical_window_scratch(&window_scratch);
-#endif
   vector.memory_lock = &queue->lock;
   vector.resident_bytes = &queue->resident_bytes;
 
@@ -2523,13 +1917,7 @@ static void *seed_worker(void *arg)
       BlockResult *result;
       DAZZ_DB *loaded_db = NULL;
       uint64_t loaded_db_bytes = 0;
-      Minimaxmer_Phase_Stats block_stats = {0};
-      Minimaxmer_Phase_Stats *phase_stats =
-          queue->phase_timing ? &block_stats : NULL;
-      Profile_Reader_Timing profile_timing = {0};
-      Profile_Reader_Timing *profile_timing_ptr =
-          phase_stats != NULL && use_profile_reader ?
-              &profile_timing : NULL;
+      Periodic_Stats block_stats = {0};
 #if MINIMAX_TIE_AUDIT
       TieStats block_tie_stats = {0};
 #endif
@@ -2548,8 +1936,7 @@ static void *seed_worker(void *arg)
       last  = queue->stub->ublocks[block + 1];
       vector.len = 0;
       if (queue->retain_loaded_db)
-        { loaded_db = load_worker_block(queue,block,phase_stats,
-                                        &loaded_db_bytes);
+        { loaded_db = load_worker_block(queue,block,&loaded_db_bytes);
           if (loaded_db == NULL)
             { fprintf(stderr,"minimaxmer: cannot load DB block %d\n",
                              block+1);
@@ -2563,9 +1950,6 @@ static void *seed_worker(void *arg)
                          loaded_db->reads+local_id : db.reads+id;
           int plen = r->rlen - K + 1;
           int64 fetched;
-          uint64_t phase_start;
-
-          phase_start = phase_stats == NULL ? 0 : minimaxmer_now_ns();
           if (queue->retain_loaded_db)
             { memcpy(seq,(char *)loaded_db->bases+r->boff,
                      (size_t)r->rlen);
@@ -2575,86 +1959,39 @@ static void *seed_worker(void *arg)
             }
           else
             Load_Read(&db,id,seq,2);
-          if (phase_stats != NULL)
-            minimaxmer_add_elapsed(&phase_stats->sequence_read_ns,
-                                   phase_start);
-
-          phase_start = phase_stats == NULL ? 0 : minimaxmer_now_ns();
-          if (__builtin_expect(profile_timing_ptr == NULL,1))
-            {
-              // Keep timing OFF on the original direct reader/indexed path.
-              if (use_profile_reader)
-                fetched = Fetch_Profile_Sequential(
-                    Pg_reader, (int64)id, pmax, prof_genome);
-              else
-                fetched = Fetch_Profile(Pg, (int64)id, pmax, prof_genome);
-              if (fetched > pmax)
-                { grow_profiles((int)fetched, &pmax,
-                                &prof_genome, &prof_reads);
-                  if (use_profile_reader)
-                    Fetch_Profile_Sequential(
-                        Pg_reader, (int64)id, pmax, prof_genome);
-                  else
-                    Fetch_Profile(Pg, (int64)id, pmax, prof_genome);
-                }
-
-              if (use_profile_reader)
-                fetched = Fetch_Profile_Sequential(
-                    Pr_reader, (int64)id, pmax, prof_reads);
-              else
-                fetched = Fetch_Profile(Pr, (int64)id, pmax, prof_reads);
-              if (fetched > pmax)
-                { grow_profiles((int)fetched, &pmax,
-                                &prof_genome, &prof_reads);
-                  if (use_profile_reader)
-                    Fetch_Profile_Sequential(
-                        Pr_reader, (int64)id, pmax, prof_reads);
-                  else
-                    Fetch_Profile(Pr, (int64)id, pmax, prof_reads);
-                }
+          fetched = Fetch_Profile_Sequential(
+              Pg_reader, (int64)id, pmax, prof_genome);
+          if (fetched > pmax)
+            { grow_profiles((int)fetched, &pmax,
+                            &prof_genome, &prof_reads);
+              Fetch_Profile_Sequential(
+                  Pg_reader, (int64)id, pmax, prof_genome);
             }
-          else
-            fetch_seed_profiles_timed(
-                Pg_reader,Pr_reader,(int64)id,&pmax,
-                &prof_genome,&prof_reads,profile_timing_ptr);
-          if (phase_stats != NULL)
-            minimaxmer_add_elapsed(&phase_stats->profile_fetch_ns,
-                                   phase_start);
+
+          fetched = Fetch_Profile_Sequential(
+              Pr_reader, (int64)id, pmax, prof_reads);
+          if (fetched > pmax)
+            { grow_profiles((int)fetched, &pmax,
+                            &prof_genome, &prof_reads);
+              Fetch_Profile_Sequential(
+                  Pr_reader, (int64)id, pmax, prof_reads);
+            }
 
           if (plen > 0)
             {
-              find_seeds_with_scratch(
+              find_seeds_impl(
                   seq + K - 1, plen, K, prof_genome, prof_reads,
-                  local_id, &vector, phase_stats, &block_stats,
-                  &candidate_scratch
-#if MINIMAX_CANONICAL_WINNOW
-                  , &window_scratch
-#endif
+                  local_id, &vector, &block_stats
 #if MINIMAX_TIE_AUDIT
                   , &block_tie_stats
 #endif
                   );
             }
-          if (phase_stats != NULL)
-            phase_stats->generated_reads += 1;
         }
 
-      if (phase_stats != NULL)
-        finish_profile_timing(
-            phase_stats,use_profile_reader,&profile_timing);
-
-      { uint64_t phase_start =
-            phase_stats == NULL ? 0 : minimaxmer_now_ns();
-        if (vector.len > 1)
-          qsort(vector.entry, vector.len, sizeof(KposEntry), cmp_kpos);
-        if (phase_stats != NULL)
-          minimaxmer_add_elapsed(&phase_stats->block_sort_ns, phase_start);
-      }
+      if (vector.len > 1)
+        qsort(vector.entry, vector.len, sizeof(KposEntry), cmp_kpos);
       reserve_kpos(&vector, vector.len + 2);
-      if (phase_stats != NULL)
-        { phase_stats->generated_blocks = 1;
-          phase_stats->generated_seeds = vector.len;
-        }
 
       result = queue->result + block;
       pthread_mutex_lock(&queue->lock);
@@ -2663,7 +2000,7 @@ static void *seed_worker(void *arg)
       result->cap   = vector.cap;
       result->loaded_db = loaded_db;
       result->loaded_db_bytes = loaded_db_bytes;
-      result->phase_stats = block_stats;
+      result->periodic_stats = block_stats;
 #if MINIMAX_TIE_AUDIT
       result->tie_stats = block_tie_stats;
 #endif
@@ -2705,10 +2042,6 @@ static void *seed_worker(void *arg)
 
   account_kpos_capacity(&vector,0);
   free(vector.entry);
-  free_candidate_radix_scratch(&candidate_scratch);
-#if MINIMAX_CANONICAL_WINNOW
-  free_canonical_window_scratch(&window_scratch);
-#endif
   free(prof_genome);
   free(prof_reads);
   free(seq - 1);
@@ -2716,10 +2049,6 @@ static void *seed_worker(void *arg)
     fclose((FILE *)db.bases);
   Free_Profile_Reader(Pg_reader);
   Free_Profile_Reader(Pr_reader);
-  if (Pg != NULL)
-    Free_Profiles(Pg);
-  if (Pr != NULL)
-    Free_Profiles(Pr);
   return NULL;
 }
 
@@ -2748,10 +2077,8 @@ struct Minimaxmer_Context
     int kmer;
     int window;
     int spacing;
-    int phase_timing;
     int retain_loaded_db;
     int owns_global_config;
-    Minimaxmer_Phase_Stats phase_stats;
 
     WorkQueue stream_queue;
     BlockResult *stream_result;
@@ -2778,7 +2105,7 @@ static int minimaxmer_init_queue(WorkQueue *queue, DAZZ_DB *db,
                                 Profile_Index *reads, char **block_path,
                                 int retain_loaded_db, BlockResult *result,
                                 int first_block, int end_block,
-                                int wait_for_consumption, int phase_timing)
+                                int wait_for_consumption)
 {
   memset(queue, 0, sizeof(*queue));
   queue->db = db;
@@ -2791,7 +2118,6 @@ static int minimaxmer_init_queue(WorkQueue *queue, DAZZ_DB *db,
   queue->next_block = first_block;
   queue->end_block = end_block;
   queue->wait_for_consumption = wait_for_consumption;
-  queue->phase_timing = phase_timing;
   if (pthread_mutex_init(&queue->lock, NULL) != 0)
     return -1;
   if (pthread_cond_init(&queue->ready, NULL) != 0)
@@ -2936,8 +2262,7 @@ fail:
 Minimaxmer_Context *Minimaxmer_Open(const char *db_path,
                                     const char *genome_profile,
                                     const char *reads_profile,
-                                    int kmer, int window, int spacing,
-                                    int phase_timing)
+                                    int kmer, int window, int spacing)
 {
   Minimaxmer_Context *context;
   int db_type;
@@ -2968,7 +2293,6 @@ Minimaxmer_Context *Minimaxmer_Open(const char *db_path,
   context->kmer = kmer;
   context->window = window;
   context->spacing = spacing;
-  context->phase_timing = phase_timing != 0;
 
   db_type = Minimaxmer_Open_DB_Serialized((char *)db_path,&context->db);
   if (db_type < 0)
@@ -3099,7 +2423,7 @@ int Minimaxmer_Generate_Batch(Minimaxmer_Context *context,
                             context->genome, context->reads,
                             context->block_path,context->retain_loaded_db,
                             result,
-                            first, end, 0, context->phase_timing) != 0)
+                            first, end, 0) != 0)
     { free(result);
       free(threads);
       return -1;
@@ -3135,7 +2459,6 @@ int Minimaxmer_Generate_Batch(Minimaxmer_Context *context,
           (uint64_t)source->cap*sizeof(KposEntry);
       target->block = b + 1;
       target->streaming = 0;
-      minimaxmer_stats_add(&context->phase_stats, &source->phase_stats);
     }
   minimaxmer_destroy_queue(&queue);
   free(result);
@@ -3172,8 +2495,7 @@ int Minimaxmer_Start_Stream(Minimaxmer_Context *context, int nthreads)
                             context->stub, context->genome, context->reads,
                             context->block_path,context->retain_loaded_db,
                             context->stream_result, 0,
-                            context->stub->nblocks, 1,
-                            context->phase_timing) != 0)
+                            context->stub->nblocks, 1) != 0)
     goto fail;
   context->stream_nthreads = nthreads;
   context->stream_next_block = 0;
@@ -3221,8 +2543,6 @@ int Minimaxmer_Next_Block(Minimaxmer_Context *context,
       (uint64_t)source->cap*sizeof(KposEntry);
   block->block = b + 1;
   block->streaming = 1;
-  minimaxmer_stats_add(&context->phase_stats, &source->phase_stats);
-  memset(&source->phase_stats, 0, sizeof(source->phase_stats));
   return 1;
 }
 
@@ -3286,74 +2606,9 @@ uint64_t Minimaxmer_Resident_Bytes(Minimaxmer_Context *context)
   return bytes;
 }
 
-const Minimaxmer_Phase_Stats *Minimaxmer_Get_Phase_Stats(
-    const Minimaxmer_Context *context)
-{
-  return context == NULL ? NULL : &context->phase_stats;
-}
-
-static void minimaxmer_print_phase_stats_impl(
-    const Minimaxmer_Phase_Stats *s, FILE *out, const char *prefix,
-    int include_periodic)
-{
-  const char *name = prefix == NULL ? "seed" : prefix;
-
-  if (s == NULL || out == NULL)
-    return;
-#define PRINT_PHASE(field) \
-  fprintf(out, "PHASE_V1\tminimaxmer\t%s.%s\tworker_sum\t%.9f\t%llu\t%llu\t%llu\n", \
-          name, #field, (double)s->field##_ns / 1e9, \
-          (unsigned long long)s->generated_blocks, \
-          (unsigned long long)s->generated_reads, \
-          (unsigned long long)s->generated_seeds)
-  PRINT_PHASE(block_load);
-  PRINT_PHASE(sequence_read);
-  PRINT_PHASE(profile_fetch);
-  PRINT_PHASE(profile_open);
-  PRINT_PHASE(profile_seek);
-  PRINT_PHASE(profile_read);
-  PRINT_PHASE(profile_decode_control);
-  PRINT_PHASE(profile_unclassified);
-  PRINT_PHASE(hash);
-  PRINT_PHASE(window);
-  PRINT_PHASE(candidate_build);
-  PRINT_PHASE(candidate_sort);
-  PRINT_PHASE(thinning);
-  if (include_periodic)
-    PRINT_PHASE(periodic_filter);
-  PRINT_PHASE(code_emit);
-  PRINT_PHASE(block_sort);
-#undef PRINT_PHASE
-  fprintf(out,
-          "PHASE_V1\tminimaxmer\t%s.kpos_write\tserial_sum\t%.9f\t%llu\t%llu\t%llu\n",
-          name, (double)s->kpos_write_ns / 1e9,
-          (unsigned long long)s->generated_blocks,
-          (unsigned long long)s->generated_reads,
-          (unsigned long long)s->generated_seeds);
-#define PRINT_PROFILE_COUNTER(field) \
-  fprintf(out, \
-          "PHASE_COUNTER_V1\tminimaxmer\t%s.%s\t%llu\n", \
-          name, #field, (unsigned long long)s->field)
-  PRINT_PROFILE_COUNTER(profile_fetch_calls);
-  PRINT_PROFILE_COUNTER(profile_open_calls);
-  PRINT_PROFILE_COUNTER(profile_seek_calls);
-  PRINT_PROFILE_COUNTER(profile_refill_calls);
-  PRINT_PROFILE_COUNTER(profile_read_calls);
-  PRINT_PROFILE_COUNTER(profile_read_bytes);
-#undef PRINT_PROFILE_COUNTER
-}
-
-void Minimaxmer_Print_Phase_Stats(const Minimaxmer_Context *context,
-                                  FILE *out, const char *prefix)
-{
-  if (context == NULL || !context->phase_timing)
-    return;
-  minimaxmer_print_phase_stats_impl(&context->phase_stats,out,prefix,0);
-}
-
 #ifndef MINIMAXMER_NO_MAIN
 static void minimaxmer_print_periodic_stats_impl(
-    const Minimaxmer_Phase_Stats *stats, FILE *out, const char *prefix,
+    const Periodic_Stats *stats, FILE *out, const char *prefix,
     int cutoff)
 {
   const char *name = prefix == NULL ? "seed" : prefix;
@@ -3362,7 +2617,7 @@ static void minimaxmer_print_periodic_stats_impl(
     return;
   fprintf(out,
           "PERIODIC_MASK_V1\t%s\tcomplete_motif_bp_gt=%d\t"
-          "overlap=any\tstage=post_thinning\t"
+          "overlap=any\tstage=post_modimizer_selection\t"
           "hp_tracts=%llu\thp_mask_bases=%llu\t"
           "ds_tracts=%llu\tds_mask_bases=%llu\t"
           "ts_tracts=%llu\tts_mask_bases=%llu\t"
@@ -3418,12 +2673,8 @@ fail:
 }
 
 int Minimaxmer_Write_Kpos_Block(Minimaxmer_Kpos_Writer *writer,
-                                const Minimaxmer_Block *block,
-                                Minimaxmer_Context *context)
+                                const Minimaxmer_Block *block)
 {
-  uint64_t start = context == NULL || !context->phase_timing ?
-                   0 : minimaxmer_now_ns();
-
   if (writer == NULL || block == NULL || writer->failed ||
       block->block != writer->next_block)
     return -1;
@@ -3437,20 +2688,15 @@ int Minimaxmer_Write_Kpos_Block(Minimaxmer_Kpos_Writer *writer,
       if (fwrite(&writer->total, sizeof(writer->total), 1, writer->idx) != 1)
         writer->failed = 1;
     }
-  if (context != NULL && context->phase_timing)
-    minimaxmer_add_elapsed(&context->phase_stats.kpos_write_ns, start);
   if (writer->failed)
     return -1;
   writer->next_block++;
   return 0;
 }
 
-int Minimaxmer_Close_Kpos_Writer(Minimaxmer_Kpos_Writer *writer,
-                                 Minimaxmer_Context *context)
+int Minimaxmer_Close_Kpos_Writer(Minimaxmer_Kpos_Writer *writer)
 {
   int status = 0;
-  uint64_t start = context == NULL || !context->phase_timing ?
-                   0 : minimaxmer_now_ns();
 
   if (writer == NULL)
     return 0;
@@ -3476,8 +2722,6 @@ int Minimaxmer_Close_Kpos_Writer(Minimaxmer_Kpos_Writer *writer,
     { unlink(writer->output_tmp);
       unlink(writer->index_tmp);
     }
-  if (context != NULL && context->phase_timing)
-    minimaxmer_add_elapsed(&context->phase_stats.kpos_write_ns, start);
   free(writer->path);
   free(writer->index_path);
   free(writer->output_tmp);
@@ -3550,11 +2794,6 @@ static void write_tie_audit(const char *output_path, const TieStats *stats)
 int main(int argc, char *argv[]) {
   DAZZ_DB _db, *db = &_db;
   int NTHREADS = 1;
-  const char *candidate_sort_mode = "qsort";
-  const char *profile_fetch_mode =
-      profile_reader_enabled() ? "sequential" : "indexed";
-  const char *selected_emit_mode =
-      selected_ctz_enabled() ? "ctz" : "scan";
   // Optional flags precede the 4 positional args.
   { int i, j = 1;
     for (i = 1; i < argc; i++) {
@@ -3592,8 +2831,8 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "Usage: %s [-T<int>] [-k<32>] [-w<100>] [-s<100>] [-l<int(-1)>] <db> <ref.prof> <ref.reads.prof> <out.kpos>\n", argv[0]);
     fprintf(stderr, "  -T<N>           : number of DB blocks processed in parallel (default 1)\n");
     fprintf(stderr, "  -k<N>           : k-mer length (<= 32)\n");
-    fprintf(stderr, "  -w<N>           : minimizer window width  (larger => sparser seeds)\n");
-    fprintf(stderr, "  -s<N>           : min spacing of uniform sparse seeds (larger => sparser)\n");
+    fprintf(stderr, "  -w<N>           : accepted for CLI compatibility; ignored in modimizer mode\n");
+    fprintf(stderr, "  -s<N>           : accepted for CLI compatibility; ignored in modimizer mode\n");
     fprintf(stderr, "  -l<N>           : exclude selected K-mers overlapping exact period-1/2/3 tracts whose complete-motif length is >N bp (-1 disables; default -1)\n");
     fprintf(stderr, "  <db>            : whole, partitioned DAZZLER dam/db\n");
     fprintf(stderr, "  <ref.prof>      : FastK genome k-mer count profile\n");
@@ -3608,37 +2847,24 @@ int main(int argc, char *argv[]) {
       return 1;
     }
 #endif
-#if MINIMAX_PACK_POSITION_TUPLE && MINIMAX_CANONICAL_THINNING
-  if (candidate_radix_usable())
-    candidate_sort_mode = "radix";
-#endif
 #if MINIMAX_TIE_AUDIT
   fprintf(stderr,
-          "Seed selector: mode=copy_minimizer hash_mod=%llu hash_refine=%d robust_winnow=%d "
-          "canonical_winnow=%d canonical_thinning=%d packed_tuple=%d "
-          "hash_bytes=%zu candidate_bytes=%zu candidate_sort=%s "
-          "profile_fetch=%s selected_emit=%s tie_audit=1\n",
-          (unsigned long long)MOD, MINIMAX_HASH_REFINE,
-          MINIMAX_ROBUST_WINNOW, MINIMAX_CANONICAL_WINNOW,
-          MINIMAX_CANONICAL_THINNING, MINIMAX_PACK_POSITION_TUPLE,
-          sizeof(PositionHash), sizeof(Candidate), candidate_sort_mode,
-          profile_fetch_mode, selected_emit_mode);
+          "Seed selector: mode=modimizer mod=%llu threshold=%llu "
+          "window=disabled thinning=disabled tie_audit=1\n",
+          (unsigned long long)MODIMIZER_MOD,
+          (unsigned long long)MODIMIZER_THRESHOLD);
 #else
   fprintf(stderr,
-          "Seed selector: mode=copy_minimizer hash_mod=%llu hash_refine=%d robust_winnow=%d "
-          "canonical_winnow=%d canonical_thinning=%d packed_tuple=%d "
-          "hash_bytes=%zu candidate_bytes=%zu candidate_sort=%s "
-          "profile_fetch=%s selected_emit=%s\n",
-          (unsigned long long)MOD, MINIMAX_HASH_REFINE,
-          MINIMAX_ROBUST_WINNOW, MINIMAX_CANONICAL_WINNOW,
-          MINIMAX_CANONICAL_THINNING, MINIMAX_PACK_POSITION_TUPLE,
-          sizeof(PositionHash), sizeof(Candidate), candidate_sort_mode,
-          profile_fetch_mode, selected_emit_mode);
+          "Seed selector: mode=modimizer mod=%llu threshold=%llu "
+          "window=disabled thinning=disabled\n",
+          (unsigned long long)MODIMIZER_MOD,
+          (unsigned long long)MODIMIZER_THRESHOLD);
 #endif
   if (EXCLUDE_PERIODIC_BP > 0)
     fprintf(stderr,
             "Periodic seed exclusion: periods=1,2,3 "
-            "complete_motif_bp>%d overlap=any stage=post_thinning\n",
+            "complete_motif_bp>%d overlap=any "
+            "stage=post_modimizer_selection\n",
             EXCLUDE_PERIODIC_BP);
   KMASK = (K >= 32) ? UINT64_MAX : ((UINT64_C(1) << (2 * K)) - 1);
   int db_type = Open_DB(argv[1], db);
@@ -3765,7 +2991,7 @@ int main(int argc, char *argv[]) {
     BlockResult *result;
     pthread_t *thread;
     uint64_t total_written = 0;
-    Minimaxmer_Phase_Stats total_phase_stats = {0};
+    Periodic_Stats total_periodic_stats = {0};
 #if MINIMAX_TIE_AUDIT
     TieStats total_tie_stats = {0};
 #endif
@@ -3805,9 +3031,6 @@ int main(int argc, char *argv[]) {
     queue.next_block = 0;
     queue.end_block  = stub->nblocks;
     queue.wait_for_consumption = 1;
-    queue.phase_timing =
-        getenv("HIMAPPER_PHASE_TIMING") != NULL &&
-        strcmp(getenv("HIMAPPER_PHASE_TIMING"), "0") != 0;
     pthread_mutex_init(&queue.lock, NULL);
     pthread_cond_init(&queue.ready, NULL);
     pthread_cond_init(&queue.consumed, NULL);
@@ -3821,15 +3044,13 @@ int main(int argc, char *argv[]) {
 
     for (b = 0; b < stub->nblocks; b++)
       { BlockResult *block = result + b;
-        uint64_t write_start;
 
         pthread_mutex_lock(&queue.lock);
         while (!block->ready)
           pthread_cond_wait(&queue.ready, &queue.lock);
         pthread_mutex_unlock(&queue.lock);
 
-        minimaxmer_stats_add(&total_phase_stats,&block->phase_stats);
-        write_start = queue.phase_timing ? minimaxmer_now_ns() : 0;
+        periodic_stats_add(&total_periodic_stats,&block->periodic_stats);
         if (block->len > 0 &&
             fwrite(block->entry, sizeof(KposEntry), block->len, out) !=
                 block->len)
@@ -3846,9 +3067,6 @@ int main(int argc, char *argv[]) {
                     argv[0], index_tmp);
             exit(1);
           }
-        if (queue.phase_timing)
-          minimaxmer_add_elapsed(&total_phase_stats.kpos_write_ns,
-                                 write_start);
         fprintf(stderr, "Block %d seeds written: %llu\n", b + 1,
                 (unsigned long long)block->len);
 
@@ -3877,12 +3095,8 @@ int main(int argc, char *argv[]) {
 
     fprintf(stderr, "Seeds written: %llu (%s, %s)\n",
             (unsigned long long)total_written, output_path, index_path);
-    if (queue.phase_timing)
-      minimaxmer_print_phase_stats_impl(&total_phase_stats,stderr,
-                                        "standalone_seed",
-                                        EXCLUDE_PERIODIC_BP > 0);
     minimaxmer_print_periodic_stats_impl(
-        &total_phase_stats,stderr,"standalone_seed",EXCLUDE_PERIODIC_BP);
+        &total_periodic_stats,stderr,"standalone_seed",EXCLUDE_PERIODIC_BP);
 #if MINIMAX_TIE_AUDIT
     write_tie_audit(output_path, &total_tie_stats);
 #endif

@@ -9,8 +9,6 @@
 
 #include "libfastk.h"
 
-#include <time.h>
-
 #ifndef SKIP_GENE_CORE
 #include "gene_core.c"
 #endif
@@ -1515,27 +1513,7 @@ struct Profile_Reader
     size_t          buffer_len;
     char           *name;
     uint8           buffer[PROF_SEQ_BUF];
-    Profile_Reader_Timing *timing;
   };
-
-static uint64_t profile_reader_now_ns(void)
-{ struct timespec ts;
-
-  if (clock_gettime(CLOCK_MONOTONIC,&ts) != 0)
-    return (0);
-  return ((uint64_t) ts.tv_sec * UINT64_C(1000000000) +
-          (uint64_t) ts.tv_nsec);
-}
-
-static inline void profile_reader_add_elapsed(uint64_t *total, uint64_t start)
-{ uint64_t end;
-
-  if (start == 0)
-    return;
-  end = profile_reader_now_ns();
-  if (end >= start)
-    *total += end-start;
-}
 
 
 /****************************************************************************************
@@ -1693,27 +1671,15 @@ static inline int64 profile_reader_offset(Profile_Reader *R)
 
 static void profile_reader_open_part(Profile_Reader *R, int part)
 { _Profile_Index *P = R->profile;
-  Profile_Reader_Timing *timing = R->timing;
   int             f;
 
   if (R->cfile >= 0)
     close(R->cfile);
 
   sprintf(R->name+P->nlen,"prof.%d",part+1);
-  if (timing == NULL)
-    { do
-        f = open(R->name,O_RDONLY);
-      while (f < 0 && errno == EINTR);
-    }
-  else
-    { uint64_t start = profile_reader_now_ns();
-      do
-        { timing->open_calls += 1;
-          f = open(R->name,O_RDONLY);
-        }
-      while (f < 0 && errno == EINTR);
-      profile_reader_add_elapsed(&timing->open_ns,start);
-    }
+  do
+    f = open(R->name,O_RDONLY);
+  while (f < 0 && errno == EINTR);
   if (f < 0)
     { fprintf(stderr,"Cannot open profile part %s: %s\n",R->name,strerror(errno));
       exit (1);
@@ -1732,8 +1698,7 @@ static void profile_reader_open_part(Profile_Reader *R, int part)
 }
 
 static void profile_reader_seek(Profile_Reader *R, int64 offset)
-{ Profile_Reader_Timing *timing = R->timing;
-  off_t target, result;
+{ off_t target, result;
 
   if (offset < 0 || offset > R->part_end)
     { fprintf(stderr,"Profile offset %lld is outside part %s [0,%lld]\n",
@@ -1746,20 +1711,9 @@ static void profile_reader_seek(Profile_Reader *R, int64 offset)
       exit (1);
     }
 
-  if (timing == NULL)
-    { do
-        result = lseek(R->cfile,target,SEEK_SET);
-      while (result < 0 && errno == EINTR);
-    }
-  else
-    { uint64_t start = profile_reader_now_ns();
-      do
-        { timing->seek_calls += 1;
-          result = lseek(R->cfile,target,SEEK_SET);
-        }
-      while (result < 0 && errno == EINTR);
-      profile_reader_add_elapsed(&timing->seek_ns,start);
-    }
+  do
+    result = lseek(R->cfile,target,SEEK_SET);
+  while (result < 0 && errno == EINTR);
   if (result != target)
     { if (result < 0)
         fprintf(stderr,"Cannot seek profile part %s: %s\n",R->name,strerror(errno));
@@ -1775,7 +1729,6 @@ static void profile_reader_seek(Profile_Reader *R, int64 offset)
 
 static void profile_reader_refill(Profile_Reader *R)
 { int64   offset, remain;
-  Profile_Reader_Timing *timing = R->timing;
   size_t  want, have;
   ssize_t got;
 
@@ -1791,46 +1744,21 @@ static void profile_reader_refill(Profile_Reader *R)
     want = PROF_SEQ_BUF;
 
   have = 0;
-  if (timing == NULL)
-    while (have < want)
-      { do
-          got = read(R->cfile,R->buffer+have,want-have);
-        while (got < 0 && errno == EINTR);
-        if (got < 0)
-          { fprintf(stderr,"Cannot read profile part %s: %s\n",R->name,strerror(errno));
-            exit (1);
-          }
-        if (got == 0)
-          { fprintf(stderr,
-                    "Short read in profile part %s at offset %lld: expected %zu more bytes\n",
-                    R->name,offset+(int64) have,want-have);
-            exit (1);
-          }
-        have += (size_t) got;
-      }
-  else
-    { uint64_t start = profile_reader_now_ns();
-      timing->refill_calls += 1;
-      while (have < want)
-        { do
-            { timing->read_calls += 1;
-              got = read(R->cfile,R->buffer+have,want-have);
-            }
-          while (got < 0 && errno == EINTR);
-          if (got < 0)
-            { fprintf(stderr,"Cannot read profile part %s: %s\n",R->name,strerror(errno));
-              exit (1);
-            }
-          if (got == 0)
-            { fprintf(stderr,
-                      "Short read in profile part %s at offset %lld: expected %zu more bytes\n",
-                      R->name,offset+(int64) have,want-have);
-              exit (1);
-            }
-          have += (size_t) got;
+  while (have < want)
+    { do
+        got = read(R->cfile,R->buffer+have,want-have);
+      while (got < 0 && errno == EINTR);
+      if (got < 0)
+        { fprintf(stderr,"Cannot read profile part %s: %s\n",R->name,strerror(errno));
+          exit (1);
         }
-      timing->read_bytes += (uint64_t) have;
-      profile_reader_add_elapsed(&timing->read_ns,start);
+      if (got == 0)
+        { fprintf(stderr,
+                  "Short read in profile part %s at offset %lld: expected %zu more bytes\n",
+                  R->name,offset+(int64) have,want-have);
+          exit (1);
+        }
+      have += (size_t) got;
     }
 
   R->buffer_start = offset;
@@ -1919,7 +1847,6 @@ Profile_Reader *Open_Profile_Reader(Profile_Index *_P)
   R->buffer_pos   = 0;
   R->buffer_len   = 0;
   R->name         = name;
-  R->timing       = NULL;
 
   return (R);
 }
@@ -2064,30 +1991,6 @@ int64 Fetch_Profile_Sequential(Profile_Reader *R, int64 id, int64 plen, uint16 *
       exit (1);
     }
   return (n);
-}
-
-int64 Fetch_Profile_Sequential_Timed(Profile_Reader *R, int64 id, int64 plen,
-                                     uint16 *profile,
-                                     Profile_Reader_Timing *timing)
-{ uint64_t start;
-  int64    result;
-
-  if (timing == NULL)
-    return (Fetch_Profile_Sequential(R,id,plen,profile));
-  if (R == NULL)
-    return (Fetch_Profile_Sequential(R,id,plen,profile));
-  if (R->timing != NULL)
-    { fprintf(stderr,"Sequential profile reader timing is already active\n");
-      exit (1);
-    }
-
-  R->timing = timing;
-  start = profile_reader_now_ns();
-  result = Fetch_Profile_Sequential(R,id,plen,profile);
-  R->timing = NULL;
-  timing->fetch_calls += 1;
-  profile_reader_add_elapsed(&timing->fetch_ns,start);
-  return (result);
 }
 
   //  Places uncompressed profile for read id (0-based) in profile of length plen.

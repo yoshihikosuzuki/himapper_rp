@@ -27,7 +27,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 #include <unistd.h>
 
 #include <DB.h>
@@ -43,69 +42,6 @@
 //  are equivalent when both are tagged; pick whichever side actually carries tiers.
 static int CN_TIER_SRC = 0;
 static uint64 FILTER_EXTRA_MEMORY = 0;
-static int MAP_PHASE_TIMING = 0;
-static int HISTOGRAM_FAST = 1;
-static Map_Phase_Stats MAP_PHASE_STATS;
-
-static uint64 map_now_ns(void) {
-  struct timespec ts;
-
-  if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
-  return (uint64)ts.tv_sec * 1000000000llu + (uint64)ts.tv_nsec;
-}
-
-static void map_add_elapsed(uint64* total, uint64 start) {
-  uint64 end;
-
-  if (start == 0) return;
-  end = map_now_ns();
-  if (end >= start) *total += end - start;
-}
-
-void Set_Map_Phase_Timing(int enabled) {
-  MAP_PHASE_TIMING = enabled != 0;
-  memset(&MAP_PHASE_STATS, 0, sizeof(MAP_PHASE_STATS));
-}
-
-const Map_Phase_Stats* Get_Map_Phase_Stats(void) {
-  return &MAP_PHASE_STATS;
-}
-
-void Print_Map_Phase_Stats(FILE* out) {
-  if (!MAP_PHASE_TIMING || out == NULL) return;
-#define PRINT_MAP_PHASE(field, scope)                                      \
-  fprintf(out, "PHASE_V1\thimapper\tmap.%s\t%s\t%.9f\t%llu\t%llu\t%llu\t%llu\t%llu\n", \
-          #field, scope, (double)MAP_PHASE_STATS.field##_ns / 1e9,         \
-          (unsigned long long)MAP_PHASE_STATS.match_calls,                 \
-          (unsigned long long)MAP_PHASE_STATS.materialized_hits,           \
-          (unsigned long long)MAP_PHASE_STATS.reporter_calls,              \
-          (unsigned long long)MAP_PHASE_STATS.alignment_calls,             \
-          (unsigned long long)MAP_PHASE_STATS.overlaps_written)
-  PRINT_MAP_PHASE(kpos_read, "serial");
-  PRINT_MAP_PHASE(forward_prepare, "serial");
-  PRINT_MAP_PHASE(reverse_complement, "serial");
-  PRINT_MAP_PHASE(reverse_sort, "serial");
-  PRINT_MAP_PHASE(filter_setup, "serial_sum");
-  PRINT_MAP_PHASE(count, "parallel_critical_sum");
-  PRINT_MAP_PHASE(histogram, "serial_sum");
-  PRINT_MAP_PHASE(hit_allocate, "serial_sum");
-  PRINT_MAP_PHASE(hit_materialize, "parallel_critical_sum");
-  PRINT_MAP_PHASE(hit_sort, "parallel_critical_sum");
-  PRINT_MAP_PHASE(chain, "parallel_critical_sum");
-  PRINT_MAP_PHASE(alignment, "worker_sum");
-  PRINT_MAP_PHASE(las_write, "worker_sum");
-  PRINT_MAP_PHASE(reporter, "parallel_critical_sum");
-#undef PRINT_MAP_PHASE
-  fprintf(out,
-          "PHASE_COUNTER_V1\thimapper\tmap.histogram_fast_calls\t%llu\n",
-          (unsigned long long)MAP_PHASE_STATS.histogram_fast_calls);
-  fprintf(out,
-          "PHASE_COUNTER_V1\thimapper\tmap.histogram_fallback_calls\t%llu\n",
-          (unsigned long long)MAP_PHASE_STATS.histogram_fallback_calls);
-  fprintf(out,
-          "PHASE_COUNTER_V1\thimapper\tmap.histogram_legacy_calls\t%llu\n",
-          (unsigned long long)MAP_PHASE_STATS.histogram_legacy_calls);
-}
 
 //  CN_UNIQ_W: selection bonus per unique (copy-1) seed.  sel = score + CN_UNIQ_W*nuniq.
 //  0 => sel==score (no nuniq override; exact ties fall through to HASH_TIE).
@@ -338,8 +274,6 @@ static int set_filter_params(int kmer, int suppress, int nthreads,
   }
   if ((e = getenv("CN_HASH_TIE")) != NULL) HASH_TIE = atoi(e);
   if ((e = getenv("CN_DUMP")) != NULL) CN_DUMP = atoi(e);
-  e = getenv("HIMAPPER_HISTOGRAM_FAST");
-  HISTOGRAM_FAST = (e == NULL || strcmp(e, "0") != 0);
 
   for (i = 0; i <= 40; i++)
     SPECIAL_LOG_POWERS[i] = pow(10., i / 10.);
@@ -354,8 +288,6 @@ int Set_Filter_Params(int kmer, int suppress, int nthreads) {
 int Set_Filter_Params_Exact(int kmer, int suppress, int nthreads) {
   return set_filter_params(kmer, suppress, nthreads, 1);
 }
-
-int Filter_Thread_Count(void) { return NTHREADS; }
 
 void Set_Filter_Extra_Memory(uint64 bytes) {
   FILTER_EXTRA_MEMORY = bytes;
@@ -1558,7 +1490,6 @@ void* Prepare_Kpos_Block(void* entries, size_t n_entries, int comp,
                          DAZZ_DB* block, int* len) {
   KmerPos* arr = (KmerPos*)entries;
   size_t i;
-  uint64 phase_start = 0;
 
   if (n_entries > INT32_MAX) {
     fprintf(stderr, "%s: in-memory KPOS block has too many entries\n",
@@ -1575,7 +1506,6 @@ void* Prepare_Kpos_Block(void* entries, size_t n_entries, int comp,
     // Also convert rpos from minimaxmer's start-of-kmer convention to
     // tuple_thread's last-base convention in the RC sequence:
     //   rpos_RC = rlen - 1 - rpos_start
-    if (MAP_PHASE_TIMING) phase_start = map_now_ns();
     for (i = 0; i < n_entries; i++) {
       uint64 c = arr[i].code, r = 0;
       int b;
@@ -1619,17 +1549,9 @@ void* Prepare_Kpos_Block(void* entries, size_t n_entries, int comp,
       }
 #endif
     }
-    if (MAP_PHASE_TIMING)
-      map_add_elapsed(&MAP_PHASE_STATS.reverse_complement_ns, phase_start);
-    if (MAP_PHASE_TIMING) phase_start = map_now_ns();
     qsort(arr, n_entries, sizeof(KmerPos), cmp_kmerpos);
-    if (MAP_PHASE_TIMING)
-      map_add_elapsed(&MAP_PHASE_STATS.reverse_sort_ns, phase_start);
   } else {
-    if (MAP_PHASE_TIMING) phase_start = map_now_ns();
     for (i = 0; i < n_entries; i++) arr[i].rpos += (Kmer - 1);
-    if (MAP_PHASE_TIMING)
-      map_add_elapsed(&MAP_PHASE_STATS.forward_prepare_ns, phase_start);
   }
 
   arr[n_entries].code = 0xffffffffffffffffllu;
@@ -1665,7 +1587,6 @@ void* Load_Kpos_Block(Kpos_Index* index, int block_no, int comp,
   arr = (KmerPos*)Malloc(sizeof(KmerPos) * (n_entries + 2),
                          "Allocating Kpos block");
   byte_offset = (off_t)(24 + first * sizeof(KmerPos));
-  { uint64 phase_start = MAP_PHASE_TIMING ? map_now_ns() : 0;
   if (fseeko(index->data, byte_offset, SEEK_SET) != 0 ||
       fread(arr, sizeof(KmerPos), (size_t)n_entries, index->data) !=
           (size_t)n_entries) {
@@ -1673,9 +1594,6 @@ void* Load_Kpos_Block(Kpos_Index* index, int block_no, int comp,
             block_no, index->path);
     free(arr);
     Clean_Exit(1);
-  }
-    if (MAP_PHASE_TIMING)
-      map_add_elapsed(&MAP_PHASE_STATS.kpos_read_ns, phase_start);
   }
 
   Prepare_Kpos_Block(arr, (size_t)n_entries, comp, block, len);
@@ -2439,22 +2357,7 @@ typedef struct {
   Work_Data* work;
   FILE* afile;
   FILE* bfile;
-  uint64 alignment_ns;
-  uint64 las_write_ns;
-  uint64 alignment_calls;
-  uint64 overlaps_written;
 } Report_Arg;
-
-static void timed_write_overlap(FILE* file, Overlap* overlap, int tbytes,
-                                Report_Arg* data) {
-  uint64 start = MAP_PHASE_TIMING ? map_now_ns() : 0;
-
-  Write_Overlap(file, overlap, tbytes);
-  if (MAP_PHASE_TIMING) {
-    map_add_elapsed(&data->las_write_ns, start);
-    data->overlaps_written += 1;
-  }
-}
 
 static void* chain_thread(void* arg) {
   Report_Arg* data = (Report_Arg*)arg;
@@ -3467,12 +3370,6 @@ static void* report_thread(void* arg) {
   Zones* part;
 
   Trace_Buffer _tbuf, *tbuf = &_tbuf;
-  uint64 phase_start;
-
-  data->alignment_ns = 0;
-  data->las_write_ns = 0;
-  data->alignment_calls = 0;
-  data->overlaps_written = 0;
   ahits = 0;
   bhits = 0;
   align->path = apath;
@@ -3487,7 +3384,6 @@ static void* report_thread(void* arg) {
   }
   hithr = HITMIN * Kmer;
 
-  phase_start = MAP_PHASE_TIMING ? map_now_ns() : 0;
   if (MR_doA) {
     fwrite(&ahits, sizeof(int64), 1, afile);
     fwrite(&SPACING, sizeof(int), 1, afile);
@@ -3496,8 +3392,6 @@ static void* report_thread(void* arg) {
     fwrite(&bhits, sizeof(int64), 1, bfile);
     fwrite(&SPACING, sizeof(int), 1, bfile);
   }
-  if (MAP_PHASE_TIMING)
-    map_add_elapsed(&data->las_write_ns, phase_start);
 
   Omax = COmax = MATCH_CHUNK;
   amatch = Malloc(sizeof(Overlap) * Omax, "Allocating match vector");
@@ -3583,17 +3477,11 @@ static void* report_thread(void* arg) {
               ad = apos + bpos;
             }
 #ifdef BAND_ALIGN
-            phase_start = MAP_PHASE_TIMING ? map_now_ns() : 0;
             bpath = Local_Alignment(align, work, MR_spec, dg - BAND_RADIUS,
                                     dg + BAND_RADIUS, ad, -1, -1);
 #else
-            phase_start = MAP_PHASE_TIMING ? map_now_ns() : 0;
             bpath = Local_Alignment(align, work, MR_spec, dg, dg, ad, -1, -1);
 #endif
-            if (MAP_PHASE_TIMING) {
-              map_add_elapsed(&data->alignment_ns, phase_start);
-              data->alignment_calls += 1;
-            }
             if (apath->aepos - apath->abpos >= hithr) {
               alast = apath->abpos;
 #ifdef TEST_ALIGN
@@ -3904,7 +3792,7 @@ static void* report_thread(void* arg) {
               if (best) amatch[p].flags |= BEST_FLAG;
             } else
               amatch[p].flags |= NEXT_FLAG;
-            timed_write_overlap(afile, amatch + p, tbytes, data);
+            Write_Overlap(afile, amatch + p, tbytes);
             ahits += 1;
           }
           n = linker[p].link;
@@ -3921,7 +3809,7 @@ static void* report_thread(void* arg) {
                 if (best) bmatch[p].flags |= BEST_FLAG;
               } else
                 bmatch[p].flags |= NEXT_FLAG;
-              timed_write_overlap(bfile, bmatch + p, tbytes, data);
+              Write_Overlap(bfile, bmatch + p, tbytes);
               bhits += 1;
             }
           }
@@ -3954,7 +3842,7 @@ static void* report_thread(void* arg) {
               if (best) bmatch[p].flags |= BEST_FLAG;
             } else
               bmatch[p].flags |= NEXT_FLAG;
-            timed_write_overlap(bfile, bmatch + p, tbytes, data);
+            Write_Overlap(bfile, bmatch + p, tbytes);
             bhits += 1;
             if (p == e) break;
           }
@@ -4002,7 +3890,6 @@ static void* report_thread(void* arg) {
   free(amatch);
   free(acomp - 1);
 
-  phase_start = MAP_PHASE_TIMING ? map_now_ns() : 0;
   if (MR_doA) {
     rewind(afile);
     fwrite(&ahits, sizeof(int64), 1, afile);
@@ -4014,8 +3901,6 @@ static void* report_thread(void* arg) {
     rewind(bfile);
     fwrite(&bhits, sizeof(int64), 1, bfile);
   }
-  if (MAP_PHASE_TIMING)
-    map_add_elapsed(&data->las_write_ns, phase_start);
 
   return (NULL);
 }
@@ -4087,7 +3972,6 @@ void Match_Filter(DAZZ_DB* ablock, DAZZ_DB* bblock, void* vasort, int alen,
 
   KmerPos *asort, *bsort;
   int64 atot, btot;
-  uint64 phase_start = 0;
 
   asort = (KmerPos*)vasort;
   bsort = (KmerPos*)vbsort;
@@ -4131,13 +4015,10 @@ void Match_Filter(DAZZ_DB* ablock, DAZZ_DB* bblock, void* vasort, int alen,
   ensure_report_args();
 
   nfilt = nhits = 0;
-  if (MAP_PHASE_TIMING) MAP_PHASE_STATS.match_calls += 1;
-
   if (alen == 0 || blen == 0) goto epilogue;
 
   parmx = allocate_lex_args();
 
-  if (MAP_PHASE_TIMING) phase_start = map_now_ns();
   {
     int i, j, p;
     uint64 c;
@@ -4166,18 +4047,11 @@ void Match_Filter(DAZZ_DB* ablock, DAZZ_DB* bblock, void* vasort, int alen,
 
     hitgrams = NULL;
     for (i = 0; i < NTHREADS; i++) parmm[i].hitgram = NULL;
-    use_histogram = !HISTOGRAM_FAST;
-    if (use_histogram) hitgrams = allocate_hitgrams(parmm);
+    use_histogram = 0;
 
-    if (MAP_PHASE_TIMING)
-      map_add_elapsed(&MAP_PHASE_STATS.filter_setup_ns, phase_start);
-    if (MAP_PHASE_TIMING) phase_start = map_now_ns();
     run_parallel(count_thread, parmm, sizeof(Merge_Arg));
-    if (MAP_PHASE_TIMING)
-      map_add_elapsed(&MAP_PHASE_STATS.count_ns, phase_start);
 
     if (VERBOSE) printf("\n");
-    if (MAP_PHASE_TIMING) phase_start = map_now_ns();
     eligible = parmm[0].nhits;
     for (i = 1; i < NTHREADS; i++) eligible += parmm[i].nhits;
     limit = MAXGRAM;
@@ -4196,7 +4070,7 @@ void Match_Filter(DAZZ_DB* ablock, DAZZ_DB* bblock, void* vasort, int alen,
       if (avail < 0) avail = 0;
       avail *= .98;
 
-      if (HISTOGRAM_FAST && eligible > avail) {
+      if (eligible > avail) {
         hitgrams = allocate_hitgrams(parmm);
         use_histogram = 1;
         run_parallel(count_thread, parmm, sizeof(Merge_Arg));
@@ -4241,14 +4115,6 @@ void Match_Filter(DAZZ_DB* ablock, DAZZ_DB* bblock, void* vasort, int alen,
         }
       }
     }
-    if (MAP_PHASE_TIMING) {
-      if (!HISTOGRAM_FAST)
-        MAP_PHASE_STATS.histogram_legacy_calls += 1;
-      else if (use_histogram)
-        MAP_PHASE_STATS.histogram_fallback_calls += 1;
-      else
-        MAP_PHASE_STATS.histogram_fast_calls += 1;
-    }
     if (VERBOSE) {
       printf("   Capping mutual k-mer matches over %d (effectively -t%d)\n",
              limit, (int)sqrt(1. * limit));
@@ -4266,8 +4132,6 @@ void Match_Filter(DAZZ_DB* ablock, DAZZ_DB* bblock, void* vasort, int alen,
 
     nhits = parmm[0].nhits;
     for (i = 1; i < NTHREADS; i++) parmm[i].nhits = nhits += parmm[i].nhits;
-    if (MAP_PHASE_TIMING)
-      map_add_elapsed(&MAP_PHASE_STATS.histogram_ns, phase_start);
 
     if (VERBOSE) {
       printf("   Hit count = ");
@@ -4277,14 +4141,11 @@ void Match_Filter(DAZZ_DB* ablock, DAZZ_DB* bblock, void* vasort, int alen,
       fflush(stdout);
     }
 
-    if (MAP_PHASE_TIMING) phase_start = map_now_ns();
     hhit = work1 = (SeedPair*)Malloc(sizeof(SeedPair) * (nhits + 1),
                                      "Allocating damapper hit vectors");
     khit = work2 = (SeedPair*)Malloc(sizeof(SeedPair) * (nhits + 1),
                                      "Allocating damapper hit vectors");
     if (hhit == NULL || khit == NULL) Clean_Exit(1);
-    if (MAP_PHASE_TIMING)
-      map_add_elapsed(&MAP_PHASE_STATS.hit_allocate_ns, phase_start);
 
     MG_blist = bsort;
     MG_hits = khit;
@@ -4297,10 +4158,7 @@ void Match_Filter(DAZZ_DB* ablock, DAZZ_DB* bblock, void* vasort, int alen,
       for (p = 0; p < BPOWR; p++) parmm[i].kptr[p] = 0;
     }
 
-    if (MAP_PHASE_TIMING) phase_start = map_now_ns();
     run_parallel(merge_thread, parmm, sizeof(Merge_Arg));
-    if (MAP_PHASE_TIMING)
-      map_add_elapsed(&MAP_PHASE_STATS.hit_materialize_ns, phase_start);
 
 #ifdef TEST_PAIRS
     printf("\nSETUP SORT:\n");
@@ -4324,12 +4182,9 @@ void Match_Filter(DAZZ_DB* ablock, DAZZ_DB* bblock, void* vasort, int alen,
     parmx[NTHREADS - 1].beg = x;
     parmx[NTHREADS - 1].end = nhits;
 
-    if (MAP_PHASE_TIMING) phase_start = map_now_ns();
     khit = (SeedPair*)lex_sort(pairsort, (Double*)khit, (Double*)hhit, parmx);
     free_lex_args(parmx);
     parmx = NULL;
-    if (MAP_PHASE_TIMING)
-      map_add_elapsed(&MAP_PHASE_STATS.hit_sort_ns, phase_start);
 
     khit[nhits].aread = 0x7fffffff;
     khit[nhits].bread = 0x7fffffff;
@@ -4375,10 +4230,7 @@ void Match_Filter(DAZZ_DB* ablock, DAZZ_DB* bblock, void* vasort, int alen,
 
 #else
 
-    if (MAP_PHASE_TIMING) phase_start = map_now_ns();
     run_parallel(chain_thread, parmr, sizeof(Report_Arg));
-    if (MAP_PHASE_TIMING)
-      map_add_elapsed(&MAP_PHASE_STATS.chain_ns, phase_start);
 
 #endif
 
@@ -4445,8 +4297,6 @@ void Match_Filter(DAZZ_DB* ablock, DAZZ_DB* bblock, void* vasort, int alen,
 
 epilogue:
   free_lex_args(parmx);
-  if (MAP_PHASE_TIMING)
-    MAP_PHASE_STATS.materialized_hits += (uint64)nhits;
   if (VERBOSE) {
     int width;
 
@@ -4495,10 +4345,6 @@ void Reporter(char* aname, DAZZ_DB* ablock, char* bname, DAZZ_DB* bblock,
   int i;
   int ncheck;
   char* fname;
-  uint64 phase_start = MAP_PHASE_TIMING ? map_now_ns() : 0;
-
-  if (MAP_PHASE_TIMING) MAP_PHASE_STATS.reporter_calls += 1;
-
   ncheck = 0;
   fname = NameBuffer(aname, bname);
 
@@ -4535,12 +4381,6 @@ void Reporter(char* aname, DAZZ_DB* ablock, char* bname, DAZZ_DB* bblock,
 #endif
 
   for (i = 0; i < NTHREADS; i++) {
-    if (MAP_PHASE_TIMING) {
-      MAP_PHASE_STATS.alignment_ns += parmr[i].alignment_ns;
-      MAP_PHASE_STATS.las_write_ns += parmr[i].las_write_ns;
-      MAP_PHASE_STATS.alignment_calls += parmr[i].alignment_calls;
-      MAP_PHASE_STATS.overlaps_written += parmr[i].overlaps_written;
-    }
     Free_Work_Data(parmr[i].work);
     if (mflag & 0x1) fclose(parmr[i].afile);
     if (mflag & 0x2) fclose(parmr[i].bfile);
@@ -4553,11 +4393,7 @@ void Reporter(char* aname, DAZZ_DB* ablock, char* bname, DAZZ_DB* bblock,
     printf(" mapped segments\n");
   }
 
-  if (!PROFILE) {
-    if (MAP_PHASE_TIMING)
-      map_add_elapsed(&MAP_PHASE_STATS.reporter_ns, phase_start);
-    return;
-  }
+  if (!PROFILE) return;
 
   {
     int i, a, size;
@@ -4582,6 +4418,4 @@ void Reporter(char* aname, DAZZ_DB* ablock, char* bname, DAZZ_DB* bblock,
     }
     fwrite(&cnt, sizeof(int64), 1, afile);
   }
-  if (MAP_PHASE_TIMING)
-    map_add_elapsed(&MAP_PHASE_STATS.reporter_ns, phase_start);
 }

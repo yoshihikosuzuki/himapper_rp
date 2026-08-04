@@ -16,7 +16,6 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <dirent.h>
-#include <time.h>
 
 #include <sys/param.h>
 #if defined(BSD)
@@ -50,69 +49,6 @@ char   *SORT_PATH;
 
 uint64  MEM_LIMIT;
 uint64  MEM_PHYSICAL;
-
-typedef struct
-  { uint64 reference_db_load_ns;
-    uint64 reference_kpos_cache_ns;
-    uint64 serial_seed_batch_ns;
-    uint64 pipeline_seed_wait_ns;
-    uint64 read_db_load_ns;
-    uint64 read_kpos_write_ns;
-    uint64 read_seed_prepare_ns;
-    uint64 filter_workers_ns;
-    uint64 match_filter_ns;
-    uint64 reporter_ns;
-    uint64 lasort_ns;
-    uint64 lacat_ns;
-    uint64 lamerge_ns;
-    uint64 read_blocks;
-  } Himapper_Phase_Stats;
-
-static Himapper_Phase_Stats HIMAPPER_PHASE_STATS;
-
-static uint64 himapper_now_ns(void)
-{
-  struct timespec ts;
-
-  if (clock_gettime(CLOCK_MONOTONIC,&ts) != 0)
-    return 0;
-  return (uint64)ts.tv_sec * 1000000000llu + (uint64)ts.tv_nsec;
-}
-
-static void himapper_add_elapsed(uint64 *total, uint64 start)
-{
-  uint64 end;
-
-  if (start == 0)
-    return;
-  end = himapper_now_ns();
-  if (end >= start)
-    *total += end-start;
-}
-
-static void print_himapper_phase_stats(FILE *out, int enabled)
-{
-  if (!enabled || out == NULL)
-    return;
-#define PRINT_OUTER_PHASE(field)                                        \
-  fprintf(out,"PHASE_V1\thimapper\touter.%s\tserial_sum\t%.9f\t%llu\n", \
-          #field,(double)HIMAPPER_PHASE_STATS.field##_ns/1e9,           \
-          (unsigned long long)HIMAPPER_PHASE_STATS.read_blocks)
-  PRINT_OUTER_PHASE(reference_db_load);
-  PRINT_OUTER_PHASE(reference_kpos_cache);
-  PRINT_OUTER_PHASE(serial_seed_batch);
-  PRINT_OUTER_PHASE(pipeline_seed_wait);
-  PRINT_OUTER_PHASE(read_db_load);
-  PRINT_OUTER_PHASE(read_kpos_write);
-  PRINT_OUTER_PHASE(read_seed_prepare);
-  PRINT_OUTER_PHASE(filter_workers);
-  PRINT_OUTER_PHASE(match_filter);
-  PRINT_OUTER_PHASE(reporter);
-  PRINT_OUTER_PHASE(lasort);
-  PRINT_OUTER_PHASE(lacat);
-  PRINT_OUTER_PHASE(lamerge);
-#undef PRINT_OUTER_PHASE
-}
 
 typedef struct
   { DAZZ_DB view;
@@ -665,7 +601,6 @@ int main(int argc, char *argv[])
   int         seed_spacing = 100;
   int         seed_window_explicit = 0;
   int         seed_spacing_explicit = 0;
-  int         phase_timing = 0;
   int         integrated_seed = 0;
   int         memory_limit_explicit = 0;
   int         map_threads;
@@ -768,8 +703,6 @@ int main(int argc, char *argv[])
               }
             seed_save_path = argv[i];
           }
-        else if (strcmp(argv[i],"--phase-timing") == 0)
-          phase_timing = 1;
         else
           argv[j++] = argv[i];
       }
@@ -925,7 +858,6 @@ int main(int argc, char *argv[])
         fprintf(stderr,"          --seed-mode <serial|pipeline>\n");
         fprintf(stderr,"          --seed-threads <N> --seed-window <W>\n");
         fprintf(stderr,"          --seed-spacing <S> [--save-read-kpos <path>]\n");
-        fprintf(stderr,"          [--phase-timing]\n");
         exit (1);
       }
 
@@ -935,9 +867,6 @@ int main(int argc, char *argv[])
       bkpos_path = argv[4];
 
     integrated_seed = strcmp(bkpos_path,"generate") == 0;
-    if (getenv("HIMAPPER_PHASE_TIMING") != NULL &&
-        strcmp(getenv("HIMAPPER_PHASE_TIMING"),"0") != 0)
-      phase_timing = 1;
     if (integrated_seed)
       { if (seed_genome_profile == NULL || seed_reads_profile == NULL ||
             seed_mode == SEED_MODE_NONE)
@@ -1105,7 +1034,6 @@ int main(int argc, char *argv[])
   }
   // TODO: ここまでmapper-specific
 
-  Set_Map_Phase_Timing(phase_timing);
   if ((integrated_seed ?
        Set_Filter_Params_Exact(KMER_LEN,MAX_REPS,map_threads) :
        Set_Filter_Params(KMER_LEN,MAX_REPS,map_threads)))
@@ -1115,13 +1043,12 @@ int main(int argc, char *argv[])
   if (integrated_seed)
     { fprintf(stderr,
               "Integrated read seeds: mode=%s total_threads=%d "
-              "seed_threads=%d map_thread_budget=%d map_threads=%d "
-              "window=%d spacing=%d "
-              "save_kpos=%s phase_timing=%d\n",
+              "seed_threads=%d map_threads=%d "
+              "window=%d spacing=%d save_kpos=%s\n",
               seed_mode == SEED_MODE_SERIAL ? "serial" : "pipeline",
-              NTHREADS,seed_threads,map_threads,Filter_Thread_Count(),
+              NTHREADS,seed_threads,map_threads,
               seed_window,seed_spacing,
-              seed_save_path == NULL ? "off" : seed_save_path,phase_timing);
+              seed_save_path == NULL ? "off" : seed_save_path);
     }
 
   // Create directory in SORT_PATH for file operations
@@ -1152,13 +1079,8 @@ int main(int argc, char *argv[])
     int seed_batch_count = 0;
     Minimaxmer_Block *seed_batch = NULL;
     uint64 ref_bytes, cache_bytes;
-    uint64 phase_start;
 
-    phase_start = phase_timing ? himapper_now_ns() : 0;
     read_DB(refdb,argv[1],MASK,MSTAT,0,KMER_LEN);
-    if (phase_timing)
-      himapper_add_elapsed(&HIMAPPER_PHASE_STATS.reference_db_load_ns,
-                           phase_start);
     ref_bytes = sizeof_DB(refdb);
 
     ref_cache = (Ref_Block_Cache *)
@@ -1167,8 +1089,7 @@ int main(int argc, char *argv[])
       Clean_Exit(1);
 
     if (strcmp(kpos_path,"all") != 0)
-      { phase_start = phase_timing ? himapper_now_ns() : 0;
-        ref_kpos = Open_Kpos_Index(kpos_path,nblocks);
+      { ref_kpos = Open_Kpos_Index(kpos_path,nblocks);
         for (k = 0; k < nblocks; k++)
           { Ref_Block_Cache *cache = ref_cache+k;
             reference_block_view(&cache->view,refdb,k+1,
@@ -1181,9 +1102,6 @@ int main(int argc, char *argv[])
                 Load_Kpos_Block(ref_kpos,k+1,1,&cache->view,
                                 &cache->reverse_len);
           }
-        if (phase_timing)
-          himapper_add_elapsed(&HIMAPPER_PHASE_STATS.reference_kpos_cache_ns,
-                               phase_start);
       }
 
     bdam = Open_DB(argv[3],&probe);
@@ -1213,7 +1131,7 @@ int main(int argc, char *argv[])
     if (integrated_seed)
       { seed_context = Minimaxmer_Open(argv[3],seed_genome_profile,
                                        seed_reads_profile,KMER_LEN,
-                                       seed_window,seed_spacing,phase_timing);
+                                       seed_window,seed_spacing);
         if (seed_context == NULL ||
             Minimaxmer_Block_Count(seed_context) != read_blocks ||
             Minimaxmer_Set_Retain_Loaded_DB(seed_context,1) != 0)
@@ -1271,7 +1189,6 @@ int main(int argc, char *argv[])
                 free(seed_batch);
                 seed_batch = (Minimaxmer_Block *)
                     calloc((size_t)count,sizeof(*seed_batch));
-                phase_start = phase_timing ? himapper_now_ns() : 0;
                 if (seed_batch == NULL ||
                     Minimaxmer_Generate_Batch(seed_context,b,count,
                                               seed_threads,seed_batch) != count)
@@ -1280,10 +1197,6 @@ int main(int argc, char *argv[])
                             Prog_Name,b);
                     Clean_Exit(1);
                   }
-                if (phase_timing)
-                  himapper_add_elapsed(
-                      &HIMAPPER_PHASE_STATS.serial_seed_batch_ns,
-                      phase_start);
                 seed_batch_first = b;
                 seed_batch_count = count;
               }
@@ -1293,17 +1206,13 @@ int main(int argc, char *argv[])
           }
 
         if (seed_mode == SEED_MODE_PIPELINE)
-          { phase_start = phase_timing ? himapper_now_ns() : 0;
-            if (Minimaxmer_Next_Block(seed_context,&stream_block) != 1 ||
+          { if (Minimaxmer_Next_Block(seed_context,&stream_block) != 1 ||
                 stream_block.block != b)
               { fprintf(stderr,
                         "%s: failed to receive generated seed block %d\n",
                         Prog_Name,b);
                 Clean_Exit(1);
               }
-            if (phase_timing)
-              himapper_add_elapsed(
-                  &HIMAPPER_PHASE_STATS.pipeline_seed_wait_ns,phase_start);
             generated_block = &stream_block;
             seed_resident_bytes = Minimaxmer_Resident_Bytes(seed_context);
           }
@@ -1327,57 +1236,39 @@ int main(int argc, char *argv[])
           }
         else
           { bblock = &_bblock;
-            phase_start = phase_timing ? himapper_now_ns() : 0;
             if (read_DB(bblock,bfile,MASK,MSTAT,MTOP,KMER_LEN))
               broot = Root(bfile,".dam");
             else
               broot = Root(bfile,".db");
-            if (phase_timing)
-              himapper_add_elapsed(&HIMAPPER_PHASE_STATS.read_db_load_ns,
-                                   phase_start);
           }
         free(bfile);
 
-        phase_start = phase_timing ? himapper_now_ns() : 0;
         Start_Filter_Workers();
-        if (phase_timing)
-          himapper_add_elapsed(&HIMAPPER_PHASE_STATS.filter_workers_ns,
-                               phase_start);
 
         if (VERBOSE)
           printf("\nBuilding index for %s\n",broot);
         if (integrated_seed)
           { if (seed_writer != NULL)
-              { phase_start = phase_timing ? himapper_now_ns() : 0;
-                if (Minimaxmer_Write_Kpos_Block(seed_writer,generated_block,
-                                                seed_context) != 0)
+              { if (Minimaxmer_Write_Kpos_Block(seed_writer,
+                                                generated_block) != 0)
                   { fprintf(stderr,
                             "%s: failed to write generated seed block %d\n",
                             Prog_Name,b);
                     Clean_Exit(1);
                   }
-                if (phase_timing)
-                  himapper_add_elapsed(
-                      &HIMAPPER_PHASE_STATS.read_kpos_write_ns,phase_start);
               }
-            phase_start = phase_timing ? himapper_now_ns() : 0;
             bindex = Prepare_Kpos_Block(generated_block->entry,
                                         generated_block->len,0,bblock,&blen);
           }
         else
-          { phase_start = phase_timing ? himapper_now_ns() : 0;
-            if (strcmp(bkpos_path,"all") == 0)
+          { if (strcmp(bkpos_path,"all") == 0)
               bindex = Sort_Kmers(bblock,&blen);
             else
               bindex = Load_Kpos_Block(read_kpos,b,0,bblock,&blen);
           }
-        if (phase_timing)
-          himapper_add_elapsed(&HIMAPPER_PHASE_STATS.read_seed_prepare_ns,
-                               phase_start);
 
         Begin_Mapping_Block(bblock);
         started = 0;
-        phase_start = phase_timing ? himapper_now_ns() : 0;
         for (k = 1; k <= nblocks; k++)
           { uint64 active_seed_source_bytes =
                 sizeof_DB(bblock)+
@@ -1469,23 +1360,10 @@ int main(int argc, char *argv[])
                   }
               }
           }
-        if (phase_timing)
-          himapper_add_elapsed(&HIMAPPER_PHASE_STATS.match_filter_ns,
-                               phase_start);
-
         if (VERBOSE)
           printf("\nFinding best matches for block %s\n",broot);
-        phase_start = phase_timing ? himapper_now_ns() : 0;
         Reporter(broot,bblock,aroot,refdb,settings,mflag);
-        if (phase_timing)
-          himapper_add_elapsed(&HIMAPPER_PHASE_STATS.reporter_ns,
-                               phase_start);
-        phase_start = phase_timing ? himapper_now_ns() : 0;
         Stop_Filter_Workers();
-        if (phase_timing)
-          himapper_add_elapsed(&HIMAPPER_PHASE_STATS.filter_workers_ns,
-                               phase_start);
-        HIMAPPER_PHASE_STATS.read_blocks += 1;
 
         if (integrated_seed)
           { if (seed_mode == SEED_MODE_PIPELINE)
@@ -1501,39 +1379,21 @@ int main(int argc, char *argv[])
         command = CommandBuffer(aroot,broot,SORT_PATH);
 
         if ((mflag & FLAG_DOA) != 0)
-          { phase_start = phase_timing ? himapper_now_ns() : 0;
-            sprintf(command,"LAsort %s %s %s/%s.%s.M%c.las",VERBOSE?"-v":"",
+          { sprintf(command,"LAsort %s %s %s/%s.%s.M%c.las",VERBOSE?"-v":"",
                             MAP_ORDER?"-a":"",SORT_PATH,broot,aroot,BLOCK_SYMBOL);
             SYSTEM_CHECK(command)
-            if (phase_timing)
-              himapper_add_elapsed(&HIMAPPER_PHASE_STATS.lasort_ns,
-                                   phase_start);
-
-            phase_start = phase_timing ? himapper_now_ns() : 0;
             sprintf(command,"LAcat %s %s/%s.%s.M%c.S >%s.%s.las",VERBOSE?"-v":"",
                             SORT_PATH,broot,aroot,BLOCK_SYMBOL,broot,aroot);
             SYSTEM_CHECK(command)
-            if (phase_timing)
-              himapper_add_elapsed(&HIMAPPER_PHASE_STATS.lacat_ns,
-                                   phase_start);
           }
 
         if ((mflag & FLAG_DOB) != 0)
-          { phase_start = phase_timing ? himapper_now_ns() : 0;
-            sprintf(command,"LAsort %s %s %s/%s.%s.R%c.las",VERBOSE?"-v":"",
+          { sprintf(command,"LAsort %s %s %s/%s.%s.R%c.las",VERBOSE?"-v":"",
                             MAP_ORDER?"-a":"",SORT_PATH,aroot,broot,BLOCK_SYMBOL);
             SYSTEM_CHECK(command)
-            if (phase_timing)
-              himapper_add_elapsed(&HIMAPPER_PHASE_STATS.lasort_ns,
-                                   phase_start);
-
-            phase_start = phase_timing ? himapper_now_ns() : 0;
             sprintf(command,"LAmerge %s %s %s.%s %s/%s.%s.R%c.S.las",VERBOSE?"-v":"",
                             MAP_ORDER?"-a":"",aroot,broot,SORT_PATH,aroot,broot,BLOCK_SYMBOL);
             SYSTEM_CHECK(command)
-            if (phase_timing)
-              himapper_add_elapsed(&HIMAPPER_PHASE_STATS.lamerge_ns,
-                                   phase_start);
           }
 
         free(broot);
@@ -1546,25 +1406,17 @@ int main(int argc, char *argv[])
         Clean_Exit(1);
       }
     if (seed_writer != NULL)
-      { phase_start = phase_timing ? himapper_now_ns() : 0;
-        if (Minimaxmer_Close_Kpos_Writer(seed_writer,seed_context) != 0)
+      { if (Minimaxmer_Close_Kpos_Writer(seed_writer) != 0)
           { fprintf(stderr,"%s: failed to finalize optional read KPOS\n",
                            Prog_Name);
             Clean_Exit(1);
           }
-        if (phase_timing)
-          himapper_add_elapsed(&HIMAPPER_PHASE_STATS.read_kpos_write_ns,
-                               phase_start);
         seed_writer = NULL;
       }
     if (seed_context != NULL)
-      { Minimaxmer_Print_Phase_Stats(seed_context,stderr,
-                                     "integrated_read_seed");
-        Minimaxmer_Close(seed_context);
+      { Minimaxmer_Close(seed_context);
         seed_context = NULL;
       }
-    Print_Map_Phase_Stats(stderr);
-    print_himapper_phase_stats(stderr,phase_timing);
     free(seed_batch);
     Close_Kpos_Index(read_kpos);
     Close_Kpos_Index(ref_kpos);
