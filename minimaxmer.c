@@ -2822,7 +2822,6 @@ int Minimaxmer_Generate_Batch(Minimaxmer_Context *context,
           source->loaded_db_bytes+
           (uint64_t)source->cap*sizeof(KposEntry);
       target->block = b + 1;
-      target->streaming = 0;
     }
   minimaxmer_destroy_queue(&queue);
   free(result);
@@ -2832,7 +2831,7 @@ int Minimaxmer_Generate_Batch(Minimaxmer_Context *context,
 
 void Minimaxmer_Free_Block(Minimaxmer_Block *block)
 {
-  if (block == NULL || block->streaming)
+  if (block == NULL)
     return;
   if (block->loaded_db != NULL)
     { Close_DB(block->loaded_db);
@@ -2905,7 +2904,6 @@ int Minimaxmer_Next_Block(Minimaxmer_Context *context,
       source->loaded_db_bytes+
       (uint64_t)source->cap*sizeof(KposEntry);
   block->block = b + 1;
-  block->streaming = 1;
   return 1;
 }
 
@@ -2917,7 +2915,7 @@ void Minimaxmer_Release_Block(Minimaxmer_Context *context,
   uint64_t loaded_db_bytes;
 
   if (context == NULL || block == NULL || !context->stream_active ||
-      !block->streaming || block->block != context->stream_next_block + 1)
+      block->block != context->stream_next_block + 1)
     return;
   source = context->stream_result + context->stream_next_block;
   loaded_db = source->loaded_db;

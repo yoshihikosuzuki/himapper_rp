@@ -602,7 +602,6 @@ int main(int argc, char *argv[])
   int         seed_window_explicit = 0;
   int         seed_spacing_explicit = 0;
   int         integrated_seed = 0;
-  int         memory_limit_explicit = 0;
   int         map_threads;
 
   Align_Spec *settings;
@@ -795,7 +794,6 @@ int main(int argc, char *argv[])
 
               ARG_NON_NEGATIVE(limit,"Memory allocation (in Gb)")
               MEM_LIMIT = limit * 0x40000000ll;
-              memory_limit_explicit = 1;
               break;
             }
           case 'P':
@@ -909,12 +907,6 @@ int main(int argc, char *argv[])
                     "-T budget (%d)\n",Prog_Name,seed_threads,NTHREADS);
             exit (1);
           }
-        if (memory_limit_explicit)
-          fprintf(stderr,
-                  "%s: warning: integrated seed DB/KPOS memory is included "
-                  "in hit-cap planning, but -M does not strictly bound "
-                  "profile indexes, worker scratch, or concurrent growth\n",
-                  Prog_Name);
       }
     else if (seed_genome_profile != NULL || seed_reads_profile != NULL ||
              seed_mode != SEED_MODE_NONE || seed_threads != 0 ||
@@ -1034,17 +1026,6 @@ int main(int argc, char *argv[])
     { fprintf(stderr,"Illegal combination of filter parameters\n");
       exit (1);
     }
-  if (integrated_seed)
-    { fprintf(stderr,
-              "Integrated read seeds: mode=%s total_threads=%d "
-              "seed_threads=%d map_threads=%d "
-              "window=%d spacing=%d save_kpos=%s\n",
-              seed_mode == SEED_MODE_SERIAL ? "serial" : "pipeline",
-              NTHREADS,seed_threads,map_threads,
-              seed_window,seed_spacing,
-              seed_save_path == NULL ? "off" : seed_save_path);
-    }
-
   // Create directory in SORT_PATH for file operations
 
   { char *newpath;

@@ -17,7 +17,6 @@ typedef struct
     size_t           len;
     uint64_t         resident_bytes;
     int              block;
-    int              streaming;
   } Minimaxmer_Block;
 
 typedef struct Minimaxmer_Context Minimaxmer_Context;
