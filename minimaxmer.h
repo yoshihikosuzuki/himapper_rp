@@ -15,7 +15,6 @@ typedef struct
   { Minimaxmer_Kpos *entry;
     DAZZ_DB          *loaded_db;
     size_t           len;
-    size_t           capacity;
     uint64_t         resident_bytes;
     int              block;
     int              streaming;
@@ -49,7 +48,6 @@ void Minimaxmer_Free_Block(Minimaxmer_Block *block);
 /* Retain each decoded DB block with its KPOS block for direct mapping. */
 int Minimaxmer_Set_Retain_Loaded_DB(Minimaxmer_Context *context,
                                     int enabled);
-DAZZ_DB *Minimaxmer_Block_DB(Minimaxmer_Block *block);
 
 /*
  * Streaming mode keeps at most nthreads block vectors in flight.  Next must

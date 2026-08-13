@@ -1225,7 +1225,7 @@ int main(int argc, char *argv[])
                          "Allocating reads block name");
 
         if (integrated_seed)
-          { bblock = Minimaxmer_Block_DB(generated_block);
+          { bblock = generated_block->loaded_db;
             if (bblock == NULL)
               { fprintf(stderr,
                         "%s: generated block %d has no loaded DB\n",

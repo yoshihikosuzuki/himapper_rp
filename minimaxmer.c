@@ -2461,11 +2461,7 @@ struct Minimaxmer_Context
     char **block_path;
     Profile_Index *genome;
     Profile_Index *reads;
-    int kmer;
-    int window;
-    int spacing;
     int retain_loaded_db;
-    int owns_global_config;
 
     WorkQueue stream_queue;
     BlockResult *stream_result;
@@ -2670,16 +2666,12 @@ Minimaxmer_Context *Minimaxmer_Open(const char *db_path,
       return NULL;
     }
   minimaxmer_context_active = 1;
-  context->owns_global_config = 1;
   K = kmer;
   WSIZE = window;
   RSPACE = spacing;
   EXCLUDE_PERIODIC_BP = -1;
   KMASK = K >= 32 ? UINT64_MAX : ((UINT64_C(1) << (2 * K)) - 1);
   pthread_mutex_unlock(&minimaxmer_context_lock);
-  context->kmer = kmer;
-  context->window = window;
-  context->spacing = spacing;
 
   db_type = Minimaxmer_Open_DB_Serialized((char *)db_path,&context->db);
   if (db_type < 0)
@@ -2749,11 +2741,9 @@ void Minimaxmer_Close(Minimaxmer_Context *context)
     Free_Profiles(context->reads);
   if (context->db_open)
     Close_DB(&context->db);
-  if (context->owns_global_config)
-    { pthread_mutex_lock(&minimaxmer_context_lock);
-      minimaxmer_context_active = 0;
-      pthread_mutex_unlock(&minimaxmer_context_lock);
-    }
+  pthread_mutex_lock(&minimaxmer_context_lock);
+  minimaxmer_context_active = 0;
+  pthread_mutex_unlock(&minimaxmer_context_lock);
   free(context);
 }
 
@@ -2770,11 +2760,6 @@ int Minimaxmer_Set_Retain_Loaded_DB(Minimaxmer_Context *context,
     return -1;
   context->retain_loaded_db = enabled != 0;
   return 0;
-}
-
-DAZZ_DB *Minimaxmer_Block_DB(Minimaxmer_Block *block)
-{
-  return block == NULL ? NULL : block->loaded_db;
 }
 
 int Minimaxmer_Generate_Batch(Minimaxmer_Context *context,
@@ -2840,7 +2825,6 @@ int Minimaxmer_Generate_Batch(Minimaxmer_Context *context,
       target->entry = source->entry;
       target->loaded_db = source->loaded_db;
       target->len = source->len;
-      target->capacity = source->cap;
       target->resident_bytes =
           source->loaded_db_bytes+
           (uint64_t)source->cap*sizeof(KposEntry);
@@ -2924,7 +2908,6 @@ int Minimaxmer_Next_Block(Minimaxmer_Context *context,
   block->entry = source->entry;
   block->loaded_db = source->loaded_db;
   block->len = source->len;
-  block->capacity = source->cap;
   block->resident_bytes =
       source->loaded_db_bytes+
       (uint64_t)source->cap*sizeof(KposEntry);
