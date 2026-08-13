@@ -24,7 +24,7 @@ copy_minimizer: copy_minimizer.c $(COMMON_DEP)
 	  -DSKIP_GENE_CORE -o $@ copy_minimizer.c $(COMMON_SRC) -lpthread -lm
 
 modimizer: modimizer.c $(COMMON_DEP)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(MINIMAX_SELECTOR_FLAGS) \
+	$(CC) $(CPPFLAGS) $(CFLAGS) \
 	  -DSKIP_GENE_CORE -o $@ modimizer.c $(COMMON_SRC) -lpthread -lm
 
 clean:

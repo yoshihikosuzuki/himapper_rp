@@ -4,7 +4,6 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
-#include <unistd.h>
 
 #include <DB.h>
 #include "nthash.h"
@@ -116,20 +115,6 @@ static const uint8_t base_is_acgt[256] = {
 // known (K is capped at 32, so K==32 gives the full uint64 mask).
 static uint64_t KMASK;
 
-static pthread_mutex_t minimaxmer_open_db_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t minimaxmer_context_lock = PTHREAD_MUTEX_INITIALIZER;
-static int minimaxmer_context_active = 0;
-
-int Minimaxmer_Open_DB_Serialized(char *path, DAZZ_DB *db)
-{
-  int status;
-
-  pthread_mutex_lock(&minimaxmer_open_db_lock);
-  status = Open_DB(path,db);
-  pthread_mutex_unlock(&minimaxmer_open_db_lock);
-  return status;
-}
-
 #if MINIMAX_TIE_AUDIT
 #define TIE_AUDIT_MAX_W 100
 
@@ -185,30 +170,7 @@ typedef struct
   { KposEntry *entry;
     size_t     len;
     size_t     cap;
-    pthread_mutex_t *memory_lock;
-    uint64_t        *resident_bytes;
-    size_t           accounted_cap;
   } KposVector;
-
-static void account_kpos_capacity(KposVector *vector, size_t new_cap)
-{
-  uint64_t old_bytes;
-  uint64_t new_bytes;
-
-  if (vector->resident_bytes == NULL || vector->memory_lock == NULL)
-    { vector->accounted_cap = new_cap;
-      return;
-    }
-  old_bytes = (uint64_t)vector->accounted_cap * sizeof(KposEntry);
-  new_bytes = (uint64_t)new_cap * sizeof(KposEntry);
-  pthread_mutex_lock(vector->memory_lock);
-  if (new_bytes >= old_bytes)
-    *vector->resident_bytes += new_bytes-old_bytes;
-  else
-    *vector->resident_bytes -= old_bytes-new_bytes;
-  pthread_mutex_unlock(vector->memory_lock);
-  vector->accounted_cap = new_cap;
-}
 
 static void push_kpos(KposVector *vector, uint64_t code, int32_t rpos, uint32_t rid)
 {
@@ -222,38 +184,12 @@ static void push_kpos(KposVector *vector, uint64_t code, int32_t rpos, uint32_t 
         }
       vector->entry = entry;
       vector->cap   = next;
-      account_kpos_capacity(vector,next);
     }
 
   vector->entry[vector->len].code = code;
   vector->entry[vector->len].rpos = rpos;
   vector->entry[vector->len].rid  = rid;
   vector->len += 1;
-}
-
-static void reserve_kpos(KposVector *vector, size_t need)
-{
-  KposEntry *entry;
-  size_t next;
-
-  if (need <= vector->cap)
-    return;
-  next = vector->cap == 0 ? 65536 : vector->cap;
-  while (next < need)
-    { if (next > SIZE_MAX / 2)
-        { fprintf(stderr, "KPOS block capacity overflow\n");
-          exit(1);
-        }
-      next *= 2;
-    }
-  entry = (KposEntry *)realloc(vector->entry, next * sizeof(KposEntry));
-  if (entry == NULL)
-    { perror("realloc KPOS block");
-      exit(1);
-    }
-  vector->entry = entry;
-  vector->cap = next;
-  account_kpos_capacity(vector,next);
 }
 
 typedef struct
@@ -263,7 +199,6 @@ typedef struct
     uint64_t periodic_seeds_removed;
   } Periodic_Stats;
 
-#ifndef MINIMAXMER_NO_MAIN
 static void periodic_stats_add(Periodic_Stats *dst,
                                const Periodic_Stats *src)
 {
@@ -277,7 +212,6 @@ static void periodic_stats_add(Periodic_Stats *dst,
           src->periodic_tract_bases[period];
     }
 }
-#endif
 
 static int cmp_kpos(const void *a, const void *b)
 {
@@ -344,23 +278,19 @@ static inline uint64_t position_tuple_key(
 // Compare (ca_g, ha) < (cb_g, hb):
 //   primary:   lower genome count  -> more unique in genome -> better seed
 //   secondary: lower hash key      -> stable tiebreaker
-// The reads profile is still fetched for modern CLI/API compatibility, but it
-// is absent from every seed-selection priority, equality, and KPOS metadata.
 // In refinement builds only, the full hash is the final collision resolver.
 static inline int position_tuple_lt(int a, int b,
                                     const uint16_t *prof_genome,
-                                    const uint16_t *prof_reads,
                                     const PositionHash *hvals,
                                     const uint64_t *full_hvals)
 #if MINIMAX_PACK_POSITION_TUPLE
 {
-  (void)prof_reads;
   (void)full_hvals;
   return position_tuple_key(a, prof_genome, hvals) <
          position_tuple_key(b, prof_genome, hvals);
 }
 #else
-{ (void)prof_reads;
+{
   if (prof_genome[a] != prof_genome[b])
     return prof_genome[a] < prof_genome[b];
   if (hvals[a] != hvals[b])
@@ -376,19 +306,16 @@ static inline int position_tuple_lt(int a, int b,
 
 static inline int position_tuple_equal(int a, int b,
                                        const uint16_t *prof_genome,
-                                       const uint16_t *prof_reads,
                                        const PositionHash *hvals,
                                        const uint64_t *full_hvals)
 #if MINIMAX_PACK_POSITION_TUPLE
 {
-  (void)prof_reads;
   (void)full_hvals;
   return position_tuple_key(a, prof_genome, hvals) ==
          position_tuple_key(b, prof_genome, hvals);
 }
 #else
 {
-  (void)prof_reads;
   if (prof_genome[a] != prof_genome[b] ||
       hvals[a] != hvals[b])
     return 0;
@@ -403,18 +330,14 @@ static inline int position_tuple_equal(int a, int b,
 
 #if MINIMAX_TIE_AUDIT
 static inline int profile_tuple_lt(int a, int b,
-                                   const uint16_t *prof_genome,
-                                   const uint16_t *prof_reads)
+                                   const uint16_t *prof_genome)
 {
-  (void)prof_reads;
   return prof_genome[a] < prof_genome[b];
 }
 
 static inline int profile_tuple_equal(int a, int b,
-                                      const uint16_t *prof_genome,
-                                      const uint16_t *prof_reads)
+                                      const uint16_t *prof_genome)
 {
-  (void)prof_reads;
   return prof_genome[a] == prof_genome[b];
 }
 
@@ -932,7 +855,6 @@ static inline CanonicalMinimum invalid_canonical_minimum(void)
 static inline CanonicalMinimum canonical_minimum_at(
     int pos,
     const uint16_t *prof_genome,
-    const uint16_t *prof_reads,
     const PositionHash *hvals)
 {
   CanonicalMinimum result;
@@ -940,10 +862,8 @@ static inline CanonicalMinimum canonical_minimum_at(
   result.pos = pos;
 #if MINIMAX_PACK_POSITION_TUPLE
   result.key = position_tuple_key(pos, prof_genome, hvals);
-  (void)prof_reads;
 #else
   (void)prof_genome;
-  (void)prof_reads;
   (void)hvals;
 #endif
   return result;
@@ -953,19 +873,17 @@ static inline int canonical_minimum_lt(
     CanonicalMinimum a,
     CanonicalMinimum b,
     const uint16_t *prof_genome,
-    const uint16_t *prof_reads,
     const PositionHash *hvals,
     const uint64_t *full_hvals)
 {
 #if MINIMAX_PACK_POSITION_TUPLE
   (void)prof_genome;
-  (void)prof_reads;
   (void)hvals;
   (void)full_hvals;
   return a.key < b.key;
 #else
   return position_tuple_lt(
-      a.pos, b.pos, prof_genome, prof_reads, hvals, full_hvals);
+      a.pos, b.pos, prof_genome, hvals, full_hvals);
 #endif
 }
 
@@ -973,19 +891,17 @@ static inline int canonical_minimum_equal(
     CanonicalMinimum a,
     CanonicalMinimum b,
     const uint16_t *prof_genome,
-    const uint16_t *prof_reads,
     const PositionHash *hvals,
     const uint64_t *full_hvals)
 {
 #if MINIMAX_PACK_POSITION_TUPLE
   (void)prof_genome;
-  (void)prof_reads;
   (void)hvals;
   (void)full_hvals;
   return a.key == b.key;
 #else
   return position_tuple_equal(
-      a.pos, b.pos, prof_genome, prof_reads, hvals, full_hvals);
+      a.pos, b.pos, prof_genome, hvals, full_hvals);
 #endif
 }
 
@@ -1037,7 +953,6 @@ static CanonicalMinimum cached_rightmost_equal_minimum(
     size_t tail,
     size_t *equal_end,
     const uint16_t *prof_genome,
-    const uint16_t *prof_reads,
     const PositionHash *hvals,
     const uint64_t *full_hvals)
 {
@@ -1049,7 +964,7 @@ static CanonicalMinimum cached_rightmost_equal_minimum(
       while (q + 1 < tail &&
              canonical_minimum_equal(
                  dq[(q + 1) & mask], dq[head & mask],
-                 prof_genome, prof_reads, hvals, full_hvals))
+                 prof_genome, hvals, full_hvals))
         q++;
     }
   *equal_end = q;
@@ -1135,7 +1050,6 @@ static __attribute__((cold, noinline))
 void assign_reverse_tie_subrun(int run_start, int run_end,
                                CanonicalMinimum right_anchor,
                                const uint16_t *prof_genome,
-                               const uint16_t *prof_reads,
                                const PositionHash *hvals,
                                const uint64_t *full_hvals,
                                CanonicalWindowScratch *scratch,
@@ -1154,14 +1068,13 @@ void assign_reverse_tie_subrun(int run_start, int run_end,
         {
           CanonicalMinimum incoming =
               canonical_minimum_at(
-                  pos, prof_genome, prof_reads, hvals);
+                  pos, prof_genome, hvals);
 
           while (head < tail)
             { CanonicalMinimum back =
                   scratch->leftmost[(tail - 1) & scratch->mask];
               if (canonical_minimum_lt(
-                      back, incoming, prof_genome, prof_reads,
-                      hvals, full_hvals))
+                      back, incoming, prof_genome, hvals, full_hvals))
                 break;
               tail--;
             }
@@ -1188,8 +1101,7 @@ void assign_reverse_tie_subrun(int run_start, int run_end,
           minimum = scratch->leftmost[head & scratch->mask];
           if (previous.pos >= pos && previous.pos <= window_end &&
               canonical_minimum_equal(
-                  previous, minimum, prof_genome, prof_reads,
-                  hvals, full_hvals))
+                  previous, minimum, prof_genome, hvals, full_hvals))
             winner = previous;
           else
             winner = minimum;
@@ -1208,7 +1120,6 @@ static void assign_buffered_reverse_tie_subrun(
     size_t run_length,
     CanonicalMinimum right_anchor,
     const uint16_t *prof_genome,
-    const uint16_t *prof_reads,
     const PositionHash *hvals,
     const uint64_t *full_hvals,
     const CanonicalMinimum *leftmost,
@@ -1229,8 +1140,7 @@ static void assign_buffered_reverse_tie_subrun(
       minimum = leftmost[j];
       if (previous.pos >= start && previous.pos < start + WSIZE &&
           canonical_minimum_equal(
-              previous, minimum, prof_genome, prof_reads,
-              hvals, full_hvals))
+              previous, minimum, prof_genome, hvals, full_hvals))
         winner = previous;
       else
         winner = minimum;
@@ -1245,7 +1155,6 @@ static void assign_positive_tie_subrun(
     size_t run_length,
     CanonicalMinimum right_anchor,
     const uint16_t *prof_genome,
-    const uint16_t *prof_reads,
     const PositionHash *hvals,
     const uint64_t *full_hvals,
     CanonicalWindowScratch *scratch,
@@ -1263,12 +1172,12 @@ static void assign_positive_tie_subrun(
   if (run_length <= scratch->capacity)
     assign_buffered_reverse_tie_subrun(
         run_start, run_length, right_anchor,
-        prof_genome, prof_reads, hvals, full_hvals,
+        prof_genome, hvals, full_hvals,
         scratch->leftmost, nw, nw_narrow);
   else
     assign_reverse_tie_subrun(
         run_start, run_end, right_anchor,
-        prof_genome, prof_reads, hvals, full_hvals,
+        prof_genome, hvals, full_hvals,
         scratch, nw, nw_narrow);
 }
 
@@ -1285,7 +1194,6 @@ void count_canonical_robust_minima(const char *seq,
                                    int plen,
                                    int kmer,
                                    const uint16_t *prof_genome,
-                                   const uint16_t *prof_reads,
                                    const PositionHash *hvals,
                                    const uint64_t *full_hvals,
                                    int read_id,
@@ -1320,7 +1228,7 @@ void count_canonical_robust_minima(const char *seq,
         {
           CanonicalMinimum incoming =
               canonical_minimum_at(
-                  i, prof_genome, prof_reads, hvals);
+                  i, prof_genome, hvals);
 
           // Retain equal tuples.  The front is therefore the leftmost
           // minimum.  Keep the historical boolean comparator in this hot
@@ -1329,7 +1237,7 @@ void count_canonical_robust_minima(const char *seq,
           while (dq_head < dq_tail &&
                  canonical_minimum_lt(
                      incoming, dq[(dq_tail - 1) & dq_mask],
-                     prof_genome, prof_reads, hvals, full_hvals))
+                     prof_genome, hvals, full_hvals))
             dq_tail--;
           // A tail contraction can invalidate the cached equal-prefix end,
           // including the one-element case where its slot is now overwritten.
@@ -1340,7 +1248,7 @@ void count_canonical_robust_minima(const char *seq,
               equal_end == dq_tail - 1 &&
               canonical_minimum_equal(
                   incoming, dq[dq_head & dq_mask],
-                  prof_genome, prof_reads, hvals, full_hvals))
+                  prof_genome, hvals, full_hvals))
             equal_end = dq_tail;
           dq[dq_tail & dq_mask] = incoming;
           dq_tail++;
@@ -1359,7 +1267,7 @@ void count_canonical_robust_minima(const char *seq,
             assign_positive_tie_subrun(
                 positive_start, start - 1, positive_length,
                 invalid_canonical_minimum(),
-                prof_genome, prof_reads, hvals, full_hvals,
+                prof_genome, hvals, full_hvals,
                 scratch, nw, nw_narrow);
           positive_start = -1;
           positive_length = 0;
@@ -1374,7 +1282,7 @@ void count_canonical_robust_minima(const char *seq,
         CanonicalMinimum rightmost =
             cached_rightmost_equal_minimum(
                 dq, dq_mask, dq_head, dq_tail, &equal_end,
-                prof_genome, prof_reads, hvals, full_hvals);
+                prof_genome, hvals, full_hvals);
         int tied = equal_end > dq_head;
 
         if (!tied)
@@ -1383,7 +1291,7 @@ void count_canonical_robust_minima(const char *seq,
               {
                 assign_positive_tie_subrun(
                     positive_start, start - 1, positive_length, leftmost,
-                    prof_genome, prof_reads, hvals, full_hvals,
+                    prof_genome, hvals, full_hvals,
                     scratch, nw, nw_narrow);
                 positive_start = -1;
                 positive_length = 0;
@@ -1438,7 +1346,7 @@ void count_canonical_robust_minima(const char *seq,
                 assign_positive_tie_subrun(
                     positive_start, start - 1, positive_length,
                     invalid_canonical_minimum(),
-                    prof_genome, prof_reads, hvals, full_hvals,
+                    prof_genome, hvals, full_hvals,
                     scratch, nw, nw_narrow);
               positive_start = -1;
               positive_length = 0;
@@ -1449,7 +1357,7 @@ void count_canonical_robust_minima(const char *seq,
                   forward_previous.pos <= i &&
                   canonical_minimum_equal(
                       forward_previous, leftmost,
-                      prof_genome, prof_reads, hvals, full_hvals))
+                      prof_genome, hvals, full_hvals))
                 winner = forward_previous;
               else
                 winner = rightmost;
@@ -1475,7 +1383,7 @@ void count_canonical_robust_minima(const char *seq,
                 assign_positive_tie_subrun(
                     positive_start, start - 1, positive_length,
                     invalid_canonical_minimum(),
-                    prof_genome, prof_reads, hvals, full_hvals,
+                    prof_genome, hvals, full_hvals,
                     scratch, nw, nw_narrow);
               positive_start = -1;
               positive_length = 0;
@@ -1493,7 +1401,7 @@ void count_canonical_robust_minima(const char *seq,
     assign_positive_tie_subrun(
         positive_start, plen - WSIZE, positive_length,
         invalid_canonical_minimum(),
-        prof_genome, prof_reads, hvals, full_hvals,
+        prof_genome, hvals, full_hvals,
         scratch, nw, nw_narrow);
 }
 #endif
@@ -1504,7 +1412,6 @@ static void count_window_minima_with_scratch(
     int plen,
     int kmer,
     const uint16_t *prof_genome,
-    const uint16_t *prof_reads,
     const PositionHash *hvals,
     const uint64_t *full_hvals,
     int read_id,
@@ -1515,11 +1422,11 @@ static void count_window_minima_with_scratch(
   // storage width in each arm, so assigned windows do not pay this test.
   if (__builtin_expect(nw->narrow, 1))
     count_canonical_robust_minima(
-        seq, plen, kmer, prof_genome, prof_reads,
+        seq, plen, kmer, prof_genome,
         hvals, full_hvals, read_id, nw->value, 1, scratch);
   else
     count_canonical_robust_minima(
-        seq, plen, kmer, prof_genome, prof_reads,
+        seq, plen, kmer, prof_genome,
         hvals, full_hvals, read_id, nw->value, 0, scratch);
 }
 #endif
@@ -1532,7 +1439,6 @@ void count_window_minima(const char *seq,
                                 int plen,
                                 int kmer,
                                 const uint16_t *prof_genome,
-                                const uint16_t *prof_reads,
                                 const uint64_t *hvals,
                                 const uint64_t *full_hvals,
                                 int read_id,
@@ -1583,7 +1489,7 @@ void count_window_minima(const char *seq,
   init_canonical_window_scratch(&scratch);
   init_window_counts(&compact_nw, plen);
   count_window_minima_with_scratch(
-      seq, plen, kmer, prof_genome, prof_reads,
+      seq, plen, kmer, prof_genome,
       selector_hvals, full_hvals, read_id, &compact_nw, &scratch);
   for (i = 0; i < plen; i++)
     nw[i] += (int)get_window_count(&compact_nw, i);
@@ -1619,7 +1525,7 @@ void count_window_minima(const char *seq,
 #if MINIMAX_TIE_AUDIT
           while (profile_head < profile_tail &&
                  profile_tuple_lt(i, profile_dq[profile_tail-1],
-                                  prof_genome, prof_reads))
+                                  prof_genome))
             profile_tail--;
           profile_dq[profile_tail++] = i;
 #endif
@@ -1630,16 +1536,14 @@ void count_window_minima(const char *seq,
           // tuple does not dislodge it while that winner remains active.
           while (dq_head < dq_tail &&
                  !position_tuple_lt(dq[dq_tail-1], i,
-                                    prof_genome, prof_reads,
-                                    hvals, full_hvals))
+                                    prof_genome, hvals, full_hvals))
             dq_tail--;
 #else
           // Historical selector: discard only strictly greater back elements,
           // retaining every equal tuple so the deque front is the leftmost.
           while (dq_head < dq_tail &&
                  position_tuple_lt(i, dq[dq_tail-1],
-                                   prof_genome, prof_reads,
-                                   hvals, full_hvals))
+                                   prof_genome, hvals, full_hvals))
             dq_tail--;
 #endif
           dq[dq_tail++] = i;
@@ -1671,14 +1575,13 @@ void count_window_minima(const char *seq,
           tie_stats->eligible_windows++;
           for (q = profile_head + 1; q < profile_tail; q++)
             { if (!profile_tuple_equal(profile_dq[q], profile_min_pos,
-                                       prof_genome, prof_reads))
+                                       prof_genome))
                 break;
               profile_multiplicity++;
             }
           for (q = dq_head + 1; q < dq_tail; q++)
             { if (!position_tuple_equal(dq[q], min_pos,
-                                        prof_genome, prof_reads,
-                                        hvals, full_hvals))
+                                        prof_genome, hvals, full_hvals))
                 break;
               full_multiplicity++;
             }
@@ -1717,8 +1620,7 @@ void count_window_minima(const char *seq,
           int win_start = i - WSIZE + 1;
           if (previous_min >= win_start &&
               position_tuple_equal(previous_min, min_pos,
-                                   prof_genome, prof_reads,
-                                   hvals, full_hvals))
+                                   prof_genome, hvals, full_hvals))
             min_pos = previous_min;
           previous_min = min_pos;
 #endif
@@ -1741,23 +1643,20 @@ void count_window_minima(const char *seq,
 #if MINIMAX_ROBUST_WINNOW
         if (previous_min >= win_start &&
             position_tuple_equal(previous_min, min_pos,
-                                 prof_genome, prof_reads,
-                                 hvals, full_hvals))
+                                 prof_genome, hvals, full_hvals))
           min_pos = previous_min;
 #endif
-        fprintf(stderr, "WINDOW read=%d [%d..%d]  minimizer=@%d g=%u r=%u h=%lu\n",
+        fprintf(stderr, "WINDOW read=%d [%d..%d]  minimizer=@%d g=%u h=%lu\n",
                 read_id, win_start, i, min_pos,
-                (unsigned)prof_genome[min_pos],
-                (unsigned)prof_reads[min_pos], hvals[min_pos]);
+                (unsigned)prof_genome[min_pos], hvals[min_pos]);
         for (int j = win_start; j <= i; j++) {
           const char *wkp = seq - kmer + 1 + j;
           char wkstr[65];
           for (int b2 = 0; b2 < kmer; b2++) wkstr[b2] = wkp[b2];
           wkstr[kmer] = '\0';
-          fprintf(stderr, "  j=%-6d g=%-5u r=%-5u h=%-4lu  %s%s\n",
+          fprintf(stderr, "  j=%-6d g=%-5u h=%-4lu  %s%s\n",
                   j,
-                  (unsigned)prof_genome[j],
-                  (unsigned)prof_reads[j], hvals[j],
+                  (unsigned)prof_genome[j], hvals[j],
                   wkstr, (j == min_pos) ? "  <-- MIN" : "");
         }
       }
@@ -1780,7 +1679,6 @@ void count_window_minima(const char *seq,
 //   plen        – number of k-mers (rlen - K + 1)
 //   K           – k-mer length
 //   prof_genome – FastK uint16 genome k-mer counts, positions 0..plen-1
-//   prof_reads  – FastK uint16 reads  k-mer counts, positions 0..plen-1
 //   read_id     – 0-based read index
 //   out         – block-local KPOS vector
 //
@@ -1792,7 +1690,6 @@ static int find_seeds_with_scratch(
                const int      plen,
                const int      K,
                const uint16  *prof_genome,
-               const uint16  *prof_reads,
                const int      read_id,
                KposVector    *out,
                Periodic_Stats *periodic_stats,
@@ -1867,7 +1764,7 @@ static int find_seeds_with_scratch(
 
   init_window_counts(&nw, plen);
   count_window_minima_with_scratch(
-      seq, plen, K, prof_genome, prof_reads,
+      seq, plen, K, prof_genome,
       hvals, full_hvals, read_id, &nw, window_scratch);
 #define NW_AT(pos) get_window_count(&nw, (pos))
 #else
@@ -1875,7 +1772,7 @@ static int find_seeds_with_scratch(
   int *nw = (int *)calloc((size_t)plen, sizeof(int));
 
   if (!dq || !nw) { perror("malloc deque/nw"); exit(1); }
-  count_window_minima(seq, plen, K, prof_genome, prof_reads,
+  count_window_minima(seq, plen, K, prof_genome,
                       hvals, full_hvals, read_id, dq, nw
 #if MINIMAX_TIE_AUDIT
                       , canonical_codes, profile_dq, tie_stats
@@ -2021,10 +1918,9 @@ static int find_seeds_with_scratch(
       char wkstr[65];
       for (int b2 = 0; b2 < K; b2++) wkstr[b2] = wkp[b2];
       wkstr[K] = '\0';
-      fprintf(stderr, "  i=%-6d nw=%-5d g=%-5u r=%-5u h=%-4lu  %s  %s%s\n",
+      fprintf(stderr, "  i=%-6d nw=%-5d g=%-5u h=%-4lu  %s  %s%s\n",
               i, (int)NW_AT(i),
-              (unsigned)prof_genome[i], (unsigned)prof_reads[i],
-              (unsigned long)hvals[i],
+              (unsigned)prof_genome[i], (unsigned long)hvals[i],
               wkstr, NW_AT(i) ? "*" : "",
               seed_bit_is_set(selected, (size_t)i) ? "****" : "");
     }
@@ -2081,7 +1977,6 @@ int find_seeds(const char    *seq,
                const int      plen,
                const int      K,
                const uint16  *prof_genome,
-               const uint16  *prof_reads,
                const int      read_id,
                KposVector    *out
 #if MINIMAX_TIE_AUDIT
@@ -2097,7 +1992,7 @@ int find_seeds(const char    *seq,
   init_candidate_radix_scratch(&candidate_scratch);
   init_canonical_window_scratch(&scratch);
   written = find_seeds_with_scratch(
-      seq, plen, K, prof_genome, prof_reads, read_id, out, NULL,
+      seq, plen, K, prof_genome, read_id, out, NULL,
       &candidate_scratch, &scratch);
   free_canonical_window_scratch(&scratch);
   free_candidate_radix_scratch(&candidate_scratch);
@@ -2107,7 +2002,7 @@ int find_seeds(const char    *seq,
 
   init_candidate_radix_scratch(&candidate_scratch);
   written = find_seeds_with_scratch(
-      seq, plen, K, prof_genome, prof_reads, read_id, out, NULL,
+      seq, plen, K, prof_genome, read_id, out, NULL,
       &candidate_scratch
 #if MINIMAX_TIE_AUDIT
       , tie_stats
@@ -2121,9 +2016,6 @@ int find_seeds(const char    *seq,
 typedef struct
   { KposEntry *entry;
     size_t     len;
-    size_t     cap;
-    DAZZ_DB   *loaded_db;
-    uint64_t   loaded_db_bytes;
     int        ready;
     Periodic_Stats periodic_stats;
 #if MINIMAX_TIE_AUDIT
@@ -2135,36 +2027,25 @@ typedef struct
   { DAZZ_DB       *db;
     DAZZ_STUB     *stub;
     Profile_Index *genome;
-    Profile_Index *reads;
-    char          **block_path;
     BlockResult   *result;
     int            next_block;
     int            end_block;
-    int            wait_for_consumption;
-    int            retain_loaded_db;
-    int            stopping;
-    uint64_t       resident_bytes;
-    uint64_t       resident_db_bytes;
     pthread_mutex_t lock;
     pthread_cond_t  ready;
     pthread_cond_t  consumed;
   } WorkQueue;
 
-static void grow_profiles(int need, int *capacity,
-                          uint16 **prof_genome, uint16 **prof_reads)
+static void grow_profile(int need, int *capacity, uint16 **prof_genome)
 {
   int next = (int)(1.2 * need) + 1000;
   uint16 *genome =
       (uint16 *)realloc(*prof_genome, (size_t)next * sizeof(uint16));
-  uint16 *reads =
-      (uint16 *)realloc(*prof_reads, (size_t)next * sizeof(uint16));
 
-  if (genome == NULL || reads == NULL)
+  if (genome == NULL)
     { perror("realloc profile");
       exit(1);
     }
   *prof_genome = genome;
-  *prof_reads  = reads;
   *capacity    = next;
 }
 
@@ -2189,60 +2070,13 @@ static FILE *open_worker_bases(const DAZZ_DB *db)
   return bases;
 }
 
-static DAZZ_DB *load_worker_block(WorkQueue *queue, int block,
-                                  uint64_t *resident_bytes)
-{
-  DAZZ_DB *loaded = (DAZZ_DB *)calloc(1,sizeof(*loaded));
-  int first = queue->stub->ublocks[block];
-  int last = queue->stub->ublocks[block+1];
-  int i;
-
-  if (loaded == NULL)
-    return NULL;
-  if (Minimaxmer_Open_DB_Serialized(queue->block_path[block],loaded) < 0)
-    goto fail;
-  Trim_DB(loaded);
-  if ((loaded->part != block+1 &&
-       !(queue->stub->nblocks == 1 && loaded->part == 0)) ||
-      loaded->ufirst != first ||
-      loaded->tfirst != first || loaded->nreads != last-first)
-    { fprintf(stderr,
-              "minimaxmer: loaded block %d does not match DB stub\n",
-              block+1);
-      goto fail;
-    }
-  if (loaded->cutoff < K)
-    for (i = 0; i < loaded->nreads; i++)
-      if (loaded->reads[i].rlen < K)
-        { fprintf(stderr,
-                  "minimaxmer: block %d contains a read shorter than K=%d\n",
-                  block+1,K);
-          goto fail;
-        }
-  if (Load_All_Reads(loaded,0) != 0)
-    goto fail;
-  *resident_bytes = sizeof_DB(loaded);
-  pthread_mutex_lock(&queue->lock);
-  queue->resident_db_bytes += *resident_bytes;
-  pthread_mutex_unlock(&queue->lock);
-  return loaded;
-
-fail:
-  if (loaded->reads != NULL || loaded->bases != NULL)
-    Close_DB(loaded);
-  free(loaded);
-  return NULL;
-}
-
 static void *seed_worker(void *arg)
 {
   WorkQueue *queue = (WorkQueue *)arg;
   DAZZ_DB db = *queue->db;
   Profile_Reader *Pg_reader = NULL;
-  Profile_Reader *Pr_reader = NULL;
   char *seq;
   uint16 *prof_genome;
-  uint16 *prof_reads;
   int pmax = 20000;
   KposVector vector = {0};
   CandidateRadixScratch candidate_scratch;
@@ -2250,20 +2084,15 @@ static void *seed_worker(void *arg)
   CanonicalWindowScratch window_scratch;
 #endif
 
-  if (queue->retain_loaded_db)
-    db.bases = NULL;
-  else
-    db.bases = open_worker_bases(queue->db);
+  db.bases = open_worker_bases(queue->db);
   Pg_reader = Open_Profile_Reader(queue->genome);
-  Pr_reader = Open_Profile_Reader(queue->reads);
-  if (Pg_reader == NULL || Pr_reader == NULL)
-    { fprintf(stderr,"minimaxmer: cannot open sequential profile readers\n");
+  if (Pg_reader == NULL)
+    { fprintf(stderr,"copy_minimizer: cannot open sequential profile reader\n");
       exit(1);
     }
   seq = New_Read_Buffer(&db);
   prof_genome = (uint16 *)malloc((size_t)pmax * sizeof(uint16));
-  prof_reads  = (uint16 *)malloc((size_t)pmax * sizeof(uint16));
-  if (prof_genome == NULL || prof_reads == NULL)
+  if (prof_genome == NULL)
     { perror("malloc profile");
       exit(1);
     }
@@ -2271,26 +2100,17 @@ static void *seed_worker(void *arg)
 #if MINIMAX_CANONICAL_WINNOW
   init_canonical_window_scratch(&window_scratch);
 #endif
-  vector.memory_lock = &queue->lock;
-  vector.resident_bytes = &queue->resident_bytes;
 
   while (1)
     { int block;
       int first, last, id;
-      int stop_worker = 0;
       BlockResult *result;
-      DAZZ_DB *loaded_db = NULL;
-      uint64_t loaded_db_bytes = 0;
       Periodic_Stats block_stats = {0};
 #if MINIMAX_TIE_AUDIT
       TieStats block_tie_stats = {0};
 #endif
 
       pthread_mutex_lock(&queue->lock);
-      if (queue->stopping)
-        { pthread_mutex_unlock(&queue->lock);
-          break;
-        }
       block = queue->next_block++;
       pthread_mutex_unlock(&queue->lock);
       if (block >= queue->end_block)
@@ -2299,53 +2119,26 @@ static void *seed_worker(void *arg)
       first = queue->stub->ublocks[block];
       last  = queue->stub->ublocks[block + 1];
       vector.len = 0;
-      if (queue->retain_loaded_db)
-        { loaded_db = load_worker_block(queue,block,&loaded_db_bytes);
-          if (loaded_db == NULL)
-            { fprintf(stderr,"minimaxmer: cannot load DB block %d\n",
-                             block+1);
-              exit(1);
-            }
-        }
 
       for (id = first; id < last; id++)
         { int local_id = id-first;
-          DAZZ_READ *r = queue->retain_loaded_db ?
-                         loaded_db->reads+local_id : db.reads+id;
+          DAZZ_READ *r = db.reads+id;
           int plen = r->rlen - K + 1;
           int64 fetched;
-          if (queue->retain_loaded_db)
-            { memcpy(seq,(char *)loaded_db->bases+r->boff,
-                     (size_t)r->rlen);
-              seq[-1] = '\0';
-              seq[r->rlen] = 4;
-              Upper_Read(seq);
-            }
-          else
-            Load_Read(&db,id,seq,2);
+          Load_Read(&db,id,seq,2);
           fetched = Fetch_Profile_Sequential(
               Pg_reader, (int64)id, pmax, prof_genome);
           if (fetched > pmax)
-            { grow_profiles((int)fetched, &pmax,
-                            &prof_genome, &prof_reads);
+            { grow_profile((int)fetched, &pmax, &prof_genome);
               Fetch_Profile_Sequential(
                   Pg_reader, (int64)id, pmax, prof_genome);
-            }
-
-          fetched = Fetch_Profile_Sequential(
-              Pr_reader, (int64)id, pmax, prof_reads);
-          if (fetched > pmax)
-            { grow_profiles((int)fetched, &pmax,
-                            &prof_genome, &prof_reads);
-              Fetch_Profile_Sequential(
-                  Pr_reader, (int64)id, pmax, prof_reads);
             }
 
           if (plen > 0)
             {
               find_seeds_with_scratch(
-                  seq + K - 1, plen, K, prof_genome, prof_reads,
-                  local_id, &vector, &block_stats,
+                  seq + K - 1, plen, K, prof_genome, local_id,
+                  &vector, &block_stats,
                   &candidate_scratch
 #if MINIMAX_CANONICAL_WINNOW
                   , &window_scratch
@@ -2359,68 +2152,31 @@ static void *seed_worker(void *arg)
 
       if (vector.len > 1)
         qsort(vector.entry, vector.len, sizeof(KposEntry), cmp_kpos);
-      reserve_kpos(&vector, vector.len + 2);
 
       result = queue->result + block;
       pthread_mutex_lock(&queue->lock);
       result->entry = vector.entry;
       result->len   = vector.len;
-      result->cap   = vector.cap;
-      result->loaded_db = loaded_db;
-      result->loaded_db_bytes = loaded_db_bytes;
       result->periodic_stats = block_stats;
 #if MINIMAX_TIE_AUDIT
       result->tie_stats = block_tie_stats;
 #endif
       result->ready = 1;
       pthread_cond_broadcast(&queue->ready);
-      if (queue->stopping)
-        stop_worker = 1;
-      else if (queue->wait_for_consumption)
-        { while (result->ready && !queue->stopping)
-            pthread_cond_wait(&queue->consumed, &queue->lock);
-          if (queue->stopping)
-            stop_worker = 1;
-        }
-      else
-        { queue->resident_bytes -=
-              (uint64_t)vector.accounted_cap * sizeof(KposEntry);
-          queue->resident_db_bytes -= loaded_db_bytes;
-          vector.accounted_cap = 0;
-          vector.entry = NULL;
-          vector.len = vector.cap = 0;
-        }
-      if (stop_worker)
-        { result->entry = NULL;
-          result->len = result->cap = 0;
-          result->loaded_db = NULL;
-          result->loaded_db_bytes = 0;
-          result->ready = 0;
-          queue->resident_db_bytes -= loaded_db_bytes;
-        }
+      while (result->ready)
+        pthread_cond_wait(&queue->consumed, &queue->lock);
       pthread_mutex_unlock(&queue->lock);
-      if (stop_worker)
-        { if (loaded_db != NULL)
-            { Close_DB(loaded_db);
-              free(loaded_db);
-            }
-          break;
-        }
     }
 
-  account_kpos_capacity(&vector,0);
   free(vector.entry);
   free_candidate_radix_scratch(&candidate_scratch);
 #if MINIMAX_CANONICAL_WINNOW
   free_canonical_window_scratch(&window_scratch);
 #endif
   free(prof_genome);
-  free(prof_reads);
   free(seq - 1);
-  if (!queue->retain_loaded_db)
-    fclose((FILE *)db.bases);
+  fclose((FILE *)db.bases);
   Free_Profile_Reader(Pg_reader);
-  Free_Profile_Reader(Pr_reader);
   return NULL;
 }
 
@@ -2439,529 +2195,6 @@ static char *add_suffix(const char *path, const char *suffix)
   return result;
 }
 
-struct Minimaxmer_Context
-  { DAZZ_DB db;
-    int db_open;
-    DAZZ_STUB *stub;
-    char **block_path;
-    Profile_Index *genome;
-    Profile_Index *reads;
-    int retain_loaded_db;
-
-    WorkQueue stream_queue;
-    BlockResult *stream_result;
-    pthread_t *stream_threads;
-    int stream_nthreads;
-    int stream_next_block;
-    int stream_active;
-  };
-
-struct Minimaxmer_Kpos_Writer
-  { FILE *out;
-    FILE *idx;
-    char *path;
-    char *index_path;
-    char *output_tmp;
-    char *index_tmp;
-    uint64_t total;
-    int next_block;
-    int failed;
-  };
-
-static int minimaxmer_init_queue(WorkQueue *queue, DAZZ_DB *db,
-                                DAZZ_STUB *stub, Profile_Index *genome,
-                                Profile_Index *reads, char **block_path,
-                                int retain_loaded_db, BlockResult *result,
-                                int first_block, int end_block,
-                                int wait_for_consumption)
-{
-  memset(queue, 0, sizeof(*queue));
-  queue->db = db;
-  queue->stub = stub;
-  queue->genome = genome;
-  queue->reads = reads;
-  queue->block_path = block_path;
-  queue->retain_loaded_db = retain_loaded_db;
-  queue->result = result;
-  queue->next_block = first_block;
-  queue->end_block = end_block;
-  queue->wait_for_consumption = wait_for_consumption;
-  if (pthread_mutex_init(&queue->lock, NULL) != 0)
-    return -1;
-  if (pthread_cond_init(&queue->ready, NULL) != 0)
-    { pthread_mutex_destroy(&queue->lock);
-      return -1;
-    }
-  if (pthread_cond_init(&queue->consumed, NULL) != 0)
-    { pthread_cond_destroy(&queue->ready);
-      pthread_mutex_destroy(&queue->lock);
-      return -1;
-    }
-  return 0;
-}
-
-static void minimaxmer_destroy_queue(WorkQueue *queue)
-{
-  pthread_cond_destroy(&queue->consumed);
-  pthread_cond_destroy(&queue->ready);
-  pthread_mutex_destroy(&queue->lock);
-}
-
-static int minimaxmer_start_workers(WorkQueue *queue, pthread_t *threads,
-                                    int nthreads)
-{
-  int created = 0;
-  int t;
-
-  for (t = 0; t < nthreads; t++)
-    { int status = pthread_create(threads + t, NULL, seed_worker, queue);
-      if (status != 0)
-        { fprintf(stderr, "minimaxmer: cannot create seed worker %d: %s\n",
-                  t + 1, strerror(status));
-          pthread_mutex_lock(&queue->lock);
-          queue->stopping = 1;
-          pthread_cond_broadcast(&queue->consumed);
-          pthread_cond_broadcast(&queue->ready);
-          pthread_mutex_unlock(&queue->lock);
-          while (created > 0)
-            pthread_join(threads[--created], NULL);
-          for (t = 0; t < queue->stub->nblocks; t++)
-            { BlockResult *result = queue->result+t;
-              if (result->ready)
-                { if (result->loaded_db != NULL)
-                    { Close_DB(result->loaded_db);
-                      free(result->loaded_db);
-                    }
-                  free(result->entry);
-                  memset(result,0,sizeof(*result));
-                }
-            }
-          return -1;
-        }
-      created++;
-    }
-  return 0;
-}
-
-static DAZZ_STUB *minimaxmer_read_stub(const char *db_path, int db_type,
-                                      int nreads)
-{
-  const char *suffix = db_type > 0 ? ".dam" : ".db";
-  size_t path_len = strlen(db_path);
-  size_t suffix_len = strlen(suffix);
-  int has_suffix =
-      path_len >= suffix_len &&
-      strcmp(db_path + path_len - suffix_len, suffix) == 0;
-  char *stub_path = (char *)malloc(
-      path_len + (has_suffix ? 0 : suffix_len) + 1);
-  DAZZ_STUB *stub;
-  int b;
-
-  if (stub_path == NULL)
-    return NULL;
-  snprintf(stub_path, path_len + (has_suffix ? 0 : suffix_len) + 1,
-           "%s%s", db_path, has_suffix ? "" : suffix);
-  stub = Read_DB_Stub(stub_path, DB_STUB_BLOCKS);
-  free(stub_path);
-  if (stub == NULL || stub->nblocks < 1)
-    { if (stub != NULL) Free_DB_Stub(stub);
-      return NULL;
-    }
-  if (stub->ublocks[0] != 0 || stub->ublocks[stub->nblocks] != nreads)
-    { Free_DB_Stub(stub);
-      return NULL;
-    }
-  for (b = 0; b <= stub->nblocks; b++)
-    if (stub->ublocks[b] != stub->tblocks[b])
-      { Free_DB_Stub(stub);
-        return NULL;
-      }
-  for (b = 0; b < stub->nblocks; b++)
-    if ((uint64_t)(stub->ublocks[b + 1] - stub->ublocks[b]) > CN_MAXVAL)
-      { Free_DB_Stub(stub);
-        return NULL;
-      }
-  return stub;
-}
-
-static char **minimaxmer_block_paths(const char *db_path, int db_type,
-                                     int nblocks)
-{
-  const char *suffix = db_type > 0 ? ".dam" : ".db";
-  size_t path_len = strlen(db_path);
-  size_t suffix_len = strlen(suffix);
-  int has_suffix = path_len >= suffix_len &&
-                   strcmp(db_path+path_len-suffix_len,suffix) == 0;
-  size_t root_len = path_len-(has_suffix ? suffix_len : 0);
-  char *root = (char *)malloc(root_len+1);
-  char **paths = (char **)calloc((size_t)nblocks,sizeof(*paths));
-  int b;
-
-  if (root == NULL || paths == NULL)
-    goto fail;
-  memcpy(root,db_path,root_len);
-  root[root_len] = '\0';
-  for (b = 0; b < nblocks; b++)
-    { size_t need;
-      if (nblocks == 1)
-        need = path_len+(has_suffix ? 0 : suffix_len)+1;
-      else
-        need = root_len+32+suffix_len;
-      paths[b] = (char *)malloc(need);
-      if (paths[b] == NULL)
-        goto fail;
-      if (nblocks == 1)
-        snprintf(paths[b],need,"%s%s",db_path,has_suffix ? "" : suffix);
-      else
-        snprintf(paths[b],need,"%s.%d%s",root,b+1,suffix);
-    }
-  free(root);
-  return paths;
-
-fail:
-  if (paths != NULL)
-    for (b = 0; b < nblocks; b++)
-      free(paths[b]);
-  free(paths);
-  free(root);
-  return NULL;
-}
-
-Minimaxmer_Context *Minimaxmer_Open(const char *db_path,
-                                    const char *genome_profile,
-                                    const char *reads_profile,
-                                    int kmer, int window, int spacing)
-{
-  Minimaxmer_Context *context;
-  int db_type;
-
-  if (db_path == NULL || genome_profile == NULL || reads_profile == NULL ||
-      kmer < 1 || kmer > 32 || window < 1 || spacing < 0)
-    return NULL;
-  context = (Minimaxmer_Context *)calloc(1, sizeof(*context));
-  if (context == NULL)
-    return NULL;
-
-  pthread_mutex_lock(&minimaxmer_context_lock);
-  if (minimaxmer_context_active)
-    { pthread_mutex_unlock(&minimaxmer_context_lock);
-      fprintf(stderr,
-              "minimaxmer: only one seed-generation context may be open\n");
-      free(context);
-      return NULL;
-    }
-  minimaxmer_context_active = 1;
-  K = kmer;
-  WSIZE = window;
-  RSPACE = spacing;
-  EXCLUDE_PERIODIC_BP = -1;
-  KMASK = K >= 32 ? UINT64_MAX : ((UINT64_C(1) << (2 * K)) - 1);
-  pthread_mutex_unlock(&minimaxmer_context_lock);
-
-  db_type = Minimaxmer_Open_DB_Serialized((char *)db_path,&context->db);
-  if (db_type < 0)
-    goto fail;
-  context->db_open = 1;
-  if (context->db.part != 0)
-    { fprintf(stderr, "minimaxmer: %s is a DB block, not a whole DB\n",
-              db_path);
-      goto fail;
-    }
-
-  context->genome = Open_Profiles((char *)genome_profile);
-  context->reads = Open_Profiles((char *)reads_profile);
-  if (context->genome == NULL || context->reads == NULL)
-    { fprintf(stderr, "minimaxmer: cannot open seed profiles %s and %s\n",
-              genome_profile, reads_profile);
-      goto fail;
-    }
-  if (context->genome->kmer != kmer || context->reads->kmer != kmer ||
-      context->genome->nreads != context->db.nreads ||
-      context->reads->nreads != context->db.nreads)
-    { fprintf(stderr,
-              "minimaxmer: DB/profile K or read-count mismatch for %s\n",
-              db_path);
-      goto fail;
-    }
-  context->stub =
-      minimaxmer_read_stub(db_path, db_type, context->db.nreads);
-  if (context->stub == NULL)
-    { fprintf(stderr,
-              "minimaxmer: %s must be a whole partitioned DB with identical "
-              "trimmed/untrimmed block boundaries\n", db_path);
-      goto fail;
-    }
-  context->block_path =
-      minimaxmer_block_paths(db_path,db_type,context->stub->nblocks);
-  if (context->block_path == NULL)
-    goto fail;
-  return context;
-
-fail:
-  Minimaxmer_Close(context);
-  return NULL;
-}
-
-void Minimaxmer_Close(Minimaxmer_Context *context)
-{
-  int b;
-
-  if (context == NULL)
-    return;
-  if (context->stream_active)
-    { fprintf(stderr,
-              "minimaxmer: closing an active stream; consume and stop it first\n");
-      return;
-    }
-  if (context->stub != NULL)
-    { if (context->block_path != NULL)
-        for (b = 0; b < context->stub->nblocks; b++)
-          free(context->block_path[b]);
-      free(context->block_path);
-      Free_DB_Stub(context->stub);
-    }
-  if (context->genome != NULL)
-    Free_Profiles(context->genome);
-  if (context->reads != NULL)
-    Free_Profiles(context->reads);
-  if (context->db_open)
-    Close_DB(&context->db);
-  pthread_mutex_lock(&minimaxmer_context_lock);
-  minimaxmer_context_active = 0;
-  pthread_mutex_unlock(&minimaxmer_context_lock);
-  free(context);
-}
-
-int Minimaxmer_Block_Count(const Minimaxmer_Context *context)
-{
-  return context == NULL || context->stub == NULL ? 0 :
-         context->stub->nblocks;
-}
-
-int Minimaxmer_Set_Retain_Loaded_DB(Minimaxmer_Context *context,
-                                    int enabled)
-{
-  if (context == NULL || context->stream_active)
-    return -1;
-  context->retain_loaded_db = enabled != 0;
-  return 0;
-}
-
-int Minimaxmer_Generate_Batch(Minimaxmer_Context *context,
-                              int first_block, int count, int nthreads,
-                              Minimaxmer_Block *blocks)
-{
-  WorkQueue queue;
-  BlockResult *result;
-  pthread_t *threads;
-  int first, end, actual_threads, b, t;
-
-  if (context == NULL || blocks == NULL || context->stream_active ||
-      first_block < 1 || count < 1 || nthreads < 1)
-    return -1;
-  first = first_block - 1;
-  end = first + count;
-  if (first >= context->stub->nblocks)
-    return -1;
-  if (end > context->stub->nblocks)
-    end = context->stub->nblocks;
-  count = end - first;
-  actual_threads = nthreads < count ? nthreads : count;
-
-  result = (BlockResult *)calloc((size_t)context->stub->nblocks,
-                                  sizeof(*result));
-  threads = (pthread_t *)malloc((size_t)actual_threads * sizeof(*threads));
-  if (result == NULL || threads == NULL)
-    { free(result);
-      free(threads);
-      return -1;
-    }
-  if (minimaxmer_init_queue(&queue, &context->db, context->stub,
-                            context->genome, context->reads,
-                            context->block_path,context->retain_loaded_db,
-                            result,
-                            first, end, 0) != 0)
-    { free(result);
-      free(threads);
-      return -1;
-    }
-  if (minimaxmer_start_workers(&queue, threads, actual_threads) != 0)
-    { minimaxmer_destroy_queue(&queue);
-      free(result);
-      free(threads);
-      return -1;
-    }
-  for (t = 0; t < actual_threads; t++)
-    pthread_join(threads[t], NULL);
-
-  for (b = first; b < end; b++)
-    { BlockResult *source = result + b;
-      Minimaxmer_Block *target = blocks + (b - first);
-      if (!source->ready)
-        { fprintf(stderr, "minimaxmer: seed block %d was not generated\n",
-                  b + 1);
-          for (t = first; t < b; t++)
-            free(result[t].entry);
-          minimaxmer_destroy_queue(&queue);
-          free(result);
-          free(threads);
-          return -1;
-        }
-      target->entry = source->entry;
-      target->loaded_db = source->loaded_db;
-      target->len = source->len;
-      target->resident_bytes =
-          source->loaded_db_bytes+
-          (uint64_t)source->cap*sizeof(KposEntry);
-      target->block = b + 1;
-      target->streaming = 0;
-    }
-  minimaxmer_destroy_queue(&queue);
-  free(result);
-  free(threads);
-  return count;
-}
-
-void Minimaxmer_Free_Block(Minimaxmer_Block *block)
-{
-  if (block == NULL || block->streaming)
-    return;
-  if (block->loaded_db != NULL)
-    { Close_DB(block->loaded_db);
-      free(block->loaded_db);
-    }
-  free(block->entry);
-  memset(block, 0, sizeof(*block));
-}
-
-int Minimaxmer_Start_Stream(Minimaxmer_Context *context, int nthreads)
-{
-  if (context == NULL || context->stream_active || nthreads < 1)
-    return -1;
-  if (nthreads > context->stub->nblocks)
-    nthreads = context->stub->nblocks;
-  context->stream_result =
-      (BlockResult *)calloc((size_t)context->stub->nblocks,
-                            sizeof(*context->stream_result));
-  context->stream_threads =
-      (pthread_t *)malloc((size_t)nthreads * sizeof(*context->stream_threads));
-  if (context->stream_result == NULL || context->stream_threads == NULL)
-    goto fail;
-  if (minimaxmer_init_queue(&context->stream_queue, &context->db,
-                            context->stub, context->genome, context->reads,
-                            context->block_path,context->retain_loaded_db,
-                            context->stream_result, 0,
-                            context->stub->nblocks, 1) != 0)
-    goto fail;
-  context->stream_nthreads = nthreads;
-  context->stream_next_block = 0;
-  context->stream_active = 1;
-  if (minimaxmer_start_workers(&context->stream_queue,
-                               context->stream_threads, nthreads) != 0)
-    { minimaxmer_destroy_queue(&context->stream_queue);
-      context->stream_active = 0;
-      goto fail;
-    }
-  return 0;
-
-fail:
-  free(context->stream_threads);
-  free(context->stream_result);
-  context->stream_threads = NULL;
-  context->stream_result = NULL;
-  return -1;
-}
-
-int Minimaxmer_Next_Block(Minimaxmer_Context *context,
-                          Minimaxmer_Block *block)
-{
-  BlockResult *source;
-  int b;
-
-  if (context == NULL || block == NULL || !context->stream_active)
-    return -1;
-  b = context->stream_next_block;
-  if (b >= context->stub->nblocks)
-    return 0;
-  source = context->stream_result + b;
-  pthread_mutex_lock(&context->stream_queue.lock);
-  while (!source->ready)
-    pthread_cond_wait(&context->stream_queue.ready,
-                      &context->stream_queue.lock);
-  pthread_mutex_unlock(&context->stream_queue.lock);
-
-  block->entry = source->entry;
-  block->loaded_db = source->loaded_db;
-  block->len = source->len;
-  block->resident_bytes =
-      source->loaded_db_bytes+
-      (uint64_t)source->cap*sizeof(KposEntry);
-  block->block = b + 1;
-  block->streaming = 1;
-  return 1;
-}
-
-void Minimaxmer_Release_Block(Minimaxmer_Context *context,
-                              Minimaxmer_Block *block)
-{
-  BlockResult *source;
-  DAZZ_DB *loaded_db;
-  uint64_t loaded_db_bytes;
-
-  if (context == NULL || block == NULL || !context->stream_active ||
-      !block->streaming || block->block != context->stream_next_block + 1)
-    return;
-  source = context->stream_result + context->stream_next_block;
-  loaded_db = source->loaded_db;
-  loaded_db_bytes = source->loaded_db_bytes;
-  if (loaded_db != NULL)
-    { Close_DB(loaded_db);
-      free(loaded_db);
-    }
-  pthread_mutex_lock(&context->stream_queue.lock);
-  context->stream_queue.resident_db_bytes -= loaded_db_bytes;
-  source->loaded_db = NULL;
-  source->loaded_db_bytes = 0;
-  source->ready = 0;
-  pthread_cond_broadcast(&context->stream_queue.consumed);
-  pthread_mutex_unlock(&context->stream_queue.lock);
-  context->stream_next_block++;
-  memset(block, 0, sizeof(*block));
-}
-
-int Minimaxmer_Stop_Stream(Minimaxmer_Context *context)
-{
-  int t;
-
-  if (context == NULL || !context->stream_active ||
-      context->stream_next_block != context->stub->nblocks)
-    return -1;
-  for (t = 0; t < context->stream_nthreads; t++)
-    pthread_join(context->stream_threads[t], NULL);
-  minimaxmer_destroy_queue(&context->stream_queue);
-  free(context->stream_threads);
-  free(context->stream_result);
-  context->stream_threads = NULL;
-  context->stream_result = NULL;
-  context->stream_nthreads = 0;
-  context->stream_active = 0;
-  return 0;
-}
-
-uint64_t Minimaxmer_Resident_Bytes(Minimaxmer_Context *context)
-{
-  uint64_t bytes;
-
-  if (context == NULL || !context->stream_active)
-    return 0;
-  pthread_mutex_lock(&context->stream_queue.lock);
-  bytes = context->stream_queue.resident_bytes+
-          context->stream_queue.resident_db_bytes;
-  pthread_mutex_unlock(&context->stream_queue.lock);
-  return bytes;
-}
-
-#ifndef MINIMAXMER_NO_MAIN
 static void minimaxmer_print_periodic_stats_impl(
     const Periodic_Stats *stats, FILE *out, const char *prefix,
     int cutoff)
@@ -2987,104 +2220,6 @@ static void minimaxmer_print_periodic_stats_impl(
           (unsigned long long)stats->periodic_reads,
           (unsigned long long)stats->periodic_seeds_removed);
 }
-#endif
-
-Minimaxmer_Kpos_Writer *Minimaxmer_Open_Kpos_Writer(const char *path,
-                                                     int kmer)
-{
-  Minimaxmer_Kpos_Writer *writer;
-
-  if (path == NULL || kmer < 1 || kmer > 32)
-    return NULL;
-  writer = (Minimaxmer_Kpos_Writer *)calloc(1, sizeof(*writer));
-  if (writer == NULL)
-    return NULL;
-  writer->path = strdup(path);
-  writer->index_path = add_suffix(path, ".idx");
-  writer->output_tmp = add_suffix(path, ".tmp");
-  writer->index_tmp = add_suffix(writer->index_path, ".tmp");
-  if (writer->path == NULL)
-    goto fail;
-  writer->out = fopen(writer->output_tmp, "wb");
-  writer->idx = fopen(writer->index_tmp, "wb");
-  if (writer->out == NULL || writer->idx == NULL ||
-      write_kpos_header_for_k(writer->out, kmer) != 0 ||
-      fwrite(&writer->total, sizeof(writer->total), 1, writer->idx) != 1)
-    goto fail;
-  writer->next_block = 1;
-  return writer;
-
-fail:
-  if (writer->out != NULL) fclose(writer->out);
-  if (writer->idx != NULL) fclose(writer->idx);
-  if (writer->output_tmp != NULL) unlink(writer->output_tmp);
-  if (writer->index_tmp != NULL) unlink(writer->index_tmp);
-  free(writer->path);
-  free(writer->index_path);
-  free(writer->output_tmp);
-  free(writer->index_tmp);
-  free(writer);
-  return NULL;
-}
-
-int Minimaxmer_Write_Kpos_Block(Minimaxmer_Kpos_Writer *writer,
-                                const Minimaxmer_Block *block)
-{
-  if (writer == NULL || block == NULL || writer->failed ||
-      block->block != writer->next_block)
-    return -1;
-  if ((block->len > 0 &&
-       fwrite(block->entry, sizeof(Minimaxmer_Kpos), block->len,
-              writer->out) != block->len) ||
-      UINT64_MAX - writer->total < block->len)
-    writer->failed = 1;
-  else
-    { writer->total += block->len;
-      if (fwrite(&writer->total, sizeof(writer->total), 1, writer->idx) != 1)
-        writer->failed = 1;
-    }
-  if (writer->failed)
-    return -1;
-  writer->next_block++;
-  return 0;
-}
-
-int Minimaxmer_Close_Kpos_Writer(Minimaxmer_Kpos_Writer *writer)
-{
-  int status = 0;
-
-  if (writer == NULL)
-    return 0;
-  if (writer->failed)
-    status = -1;
-  if (!writer->failed && finish_kpos(writer->out, writer->total) != 0)
-    status = -1;
-  if (writer->out != NULL)
-    { if (fclose(writer->out) != 0)
-        status = -1;
-      writer->out = NULL;
-    }
-  if (writer->idx != NULL)
-    { if (fclose(writer->idx) != 0)
-        status = -1;
-      writer->idx = NULL;
-    }
-  if (status == 0 && rename(writer->output_tmp, writer->path) != 0)
-    status = -1;
-  if (status == 0 && rename(writer->index_tmp, writer->index_path) != 0)
-    status = -1;
-  if (status != 0)
-    { unlink(writer->output_tmp);
-      unlink(writer->index_tmp);
-    }
-  free(writer->path);
-  free(writer->index_path);
-  free(writer->output_tmp);
-  free(writer->index_tmp);
-  free(writer);
-  return status;
-}
-
 #if MINIMAX_TIE_AUDIT
 static void write_tie_audit(const char *output_path, const TieStats *stats)
 {
@@ -3145,11 +2280,10 @@ static void write_tie_audit(const char *output_path, const TieStats *stats)
 }
 #endif
 
-#ifndef MINIMAXMER_NO_MAIN
 int main(int argc, char *argv[]) {
   DAZZ_DB _db, *db = &_db;
   int NTHREADS = 1;
-  // Optional flags precede the 4 positional args.
+  // Optional flags precede the 3 positional args.
   { int i, j = 1;
     for (i = 1; i < argc; i++) {
       if (argv[i][0] == '-') {
@@ -3181,9 +2315,9 @@ int main(int argc, char *argv[]) {
     }
     argc = j;
   }
-  if (argc != 5 || K < 1 || K > 32 || WSIZE < 1 || RSPACE < 0 ||
+  if (argc != 4 || K < 1 || K > 32 || WSIZE < 1 || RSPACE < 0 ||
       NTHREADS < 1) {
-    fprintf(stderr, "Usage: %s [-T<int>] [-k<32>] [-w<100>] [-s<100>] [-l<int(-1)>] <db> <ref.prof> <ref.reads.prof> <out.kpos>\n", argv[0]);
+    fprintf(stderr, "Usage: %s [-T<int>] [-k<32>] [-w<100>] [-s<100>] [-l<int(-1)>] <db> <ref.prof> <out.kpos>\n", argv[0]);
     fprintf(stderr, "  -T<N>           : number of DB blocks processed in parallel (default 1)\n");
     fprintf(stderr, "  -k<N>           : k-mer length (<= 32)\n");
     fprintf(stderr, "  -w<N>           : minimizer window width  (larger => sparser seeds)\n");
@@ -3191,7 +2325,6 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "  -l<N>           : exclude selected K-mers overlapping exact period-1/2/3 tracts whose complete-motif length is >N bp (-1 disables; default -1)\n");
     fprintf(stderr, "  <db>            : whole, partitioned DAZZLER dam/db\n");
     fprintf(stderr, "  <ref.prof>      : FastK genome k-mer count profile\n");
-    fprintf(stderr, "  <ref.reads.prof>: FastK reads  k-mer count profile\n");
     fprintf(stderr, "  <out.kpos>      : block-indexed KPOS container; <out.kpos>.idx is also written\n");
     return 1;
   }
@@ -3244,23 +2377,11 @@ int main(int argc, char *argv[]) {
       return 1;
     }
 
-  // Open reads profile (argv[3]).
-  Profile_Index *Pr = Open_Profiles(argv[3]);
-  if (Pr == NULL)
-    { fprintf(stderr, "%s: Cannot open reads profile '%s'\n", argv[0], argv[3]);
-      Free_Profiles(Pg);
-      return 1;
-    }
-  if (Pr->kmer != K)
-    { fprintf(stderr, "%s: reads profile K=%d does not match K=%d\n", argv[0], Pr->kmer, K);
-      Free_Profiles(Pg); Free_Profiles(Pr);
-      return 1;
-    }
-  if (Pg->nreads != db->nreads || Pr->nreads != db->nreads)
+  if (Pg->nreads != db->nreads)
     { fprintf(stderr,
-              "%s: profile/DB read-count mismatch: DB=%d genome-profile=%d reads-profile=%d\n",
-              argv[0], db->nreads, Pg->nreads, Pr->nreads);
-      Free_Profiles(Pg); Free_Profiles(Pr);
+              "%s: profile/DB read-count mismatch: DB=%d genome-profile=%d\n",
+              argv[0], db->nreads, Pg->nreads);
+      Free_Profiles(Pg);
       return 1;
     }
 
@@ -3276,7 +2397,7 @@ int main(int argc, char *argv[]) {
     if (db->part != 0)
       { fprintf(stderr, "%s: requires a whole DB, not block %d\n",
                 argv[0], db->part);
-        Free_Profiles(Pg); Free_Profiles(Pr);
+        Free_Profiles(Pg);
         Close_DB(db);
         return 1;
       }
@@ -3294,7 +2415,7 @@ int main(int argc, char *argv[]) {
     stub_path = (char *)malloc(stub_path_len);
     if (stub_path == NULL)
       { perror("malloc DB stub path");
-        Free_Profiles(Pg); Free_Profiles(Pr);
+        Free_Profiles(Pg);
         Close_DB(db);
         return 1;
       }
@@ -3305,7 +2426,7 @@ int main(int argc, char *argv[]) {
     if (stub == NULL || stub->nblocks < 1)
       { fprintf(stderr, "%s: requires a partitioned DB\n", argv[0]);
         if (stub != NULL) Free_DB_Stub(stub);
-        Free_Profiles(Pg); Free_Profiles(Pr);
+        Free_Profiles(Pg);
         Close_DB(db);
         return 1;
       }
@@ -3315,7 +2436,7 @@ int main(int argc, char *argv[]) {
                 "%s: DB block boundaries do not span all %d input reads\n",
                 argv[0], db->nreads);
         Free_DB_Stub(stub);
-        Free_Profiles(Pg); Free_Profiles(Pr);
+        Free_Profiles(Pg);
         Close_DB(db);
         return 1;
       }
@@ -3325,7 +2446,7 @@ int main(int argc, char *argv[]) {
                   "%s: does not support differing trimmed/untrimmed block boundaries\n",
                   argv[0]);
           Free_DB_Stub(stub);
-          Free_Profiles(Pg); Free_Profiles(Pr);
+          Free_Profiles(Pg);
           Close_DB(db);
           return 1;
         }
@@ -3335,14 +2456,14 @@ int main(int argc, char *argv[]) {
                   "%s: block %d exceeds the copy-tier rid limit (2^29 reads)\n",
                   argv[0], b + 1);
           Free_DB_Stub(stub);
-          Free_Profiles(Pg); Free_Profiles(Pr);
+          Free_Profiles(Pg);
           Close_DB(db);
           return 1;
         }
   }
 
   {
-    const char *output_path = argv[4];
+    const char *output_path = argv[3];
     char *index_path = add_suffix(output_path, ".idx");
     char *output_tmp = add_suffix(output_path, ".tmp");
     char *index_tmp = add_suffix(index_path, ".tmp");
@@ -3387,11 +2508,9 @@ int main(int argc, char *argv[]) {
     queue.db         = db;
     queue.stub       = stub;
     queue.genome     = Pg;
-    queue.reads      = Pr;
     queue.result     = result;
     queue.next_block = 0;
     queue.end_block  = stub->nblocks;
-    queue.wait_for_consumption = 1;
     pthread_mutex_init(&queue.lock, NULL);
     pthread_cond_init(&queue.ready, NULL);
     pthread_cond_init(&queue.consumed, NULL);
@@ -3473,10 +2592,8 @@ int main(int argc, char *argv[]) {
   }
 
   Free_Profiles(Pg);
-  Free_Profiles(Pr);
   Free_DB_Stub(stub);
   Close_DB(db);
 
   return 0;
 }
-#endif
