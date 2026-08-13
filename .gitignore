@@ -18,9 +18,6 @@ fastkdual/compare_profiles*
 fastkdual/validation
 fastkdual/*.log
 
-dev/copy_minimizer
-dev/modimizer
-
 memory/
 tests/
 work*/

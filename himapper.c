@@ -903,12 +903,6 @@ int main(int argc, char *argv[])
                     Prog_Name,NTHREADS);
             exit (1);
           }
-        if (seed_threads > NTHREADS)
-          { fprintf(stderr,
-                    "%s: seed threads (%d) exceed the total -T budget (%d)\n",
-                    Prog_Name,seed_threads,NTHREADS);
-            exit (1);
-          }
         if (seed_mode == SEED_MODE_PIPELINE && seed_threads >= NTHREADS)
           { fprintf(stderr,
                     "%s: pipeline seed threads (%d) must be below the total "

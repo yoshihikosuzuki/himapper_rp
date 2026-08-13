@@ -47,15 +47,13 @@ local-tools:
 	$(MAKE) -C $(FASTKDUAL_DIR) FASTK_DIR=$(abspath $(FASTK_DIR))
 
 clean:
-	rm -f $(ALL) minimaxmer-lib.o HPC.himapper modimizer copy_minimizer
-	rm -f tests/test_minimaxmer_selector
+	rm -f $(ALL) minimaxmer-lib.o HPC.himapper
 	$(MAKE) -C $(FASTKDUAL_DIR) clean
 	rm -fr *.dSYM
 	rm -f himapper.tar.gz
 
 package:
 	make clean
-	tar -zcf himapper.tar.gz README.md LICENSE *.h *.c Makefile \
-	  tests/test_minimaxmer_selector.c $(FASTKDUAL_SRC)
+	tar -zcf himapper.tar.gz README.md LICENSE *.h *.c Makefile $(FASTKDUAL_SRC)
 
-.PHONY: all test-minimaxmer-selector local-tools clean package
+.PHONY: all local-tools clean package

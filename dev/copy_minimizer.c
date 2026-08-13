@@ -310,13 +310,6 @@ static int write_kpos_header_for_k(FILE *out, int kmer)
   return 0;
 }
 
-#ifndef MINIMAXMER_NO_MAIN
-static int write_kpos_header(FILE *out)
-{
-  return write_kpos_header_for_k(out, K);
-}
-#endif
-
 static int finish_kpos(FILE *out, uint64_t n_entries)
 {
   if (fseek(out, 16, SEEK_SET) != 0 ||
@@ -3374,7 +3367,7 @@ int main(int argc, char *argv[]) {
       { perror(index_tmp);
         exit(1);
       }
-    if (write_kpos_header(out) != 0 ||
+    if (write_kpos_header_for_k(out,K) != 0 ||
         fwrite(&total_written, sizeof(uint64_t), 1, idx) != 1)
       { fprintf(stderr, "%s: failed to initialize KPOS output\n", argv[0]);
         exit(1);

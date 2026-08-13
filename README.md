@@ -158,11 +158,6 @@ because it uses `T/T`.  Set `HIMAPPER_SAVE_READ_KPOS` to a nonempty output path
 only when the generated read KPOS must be retained; the default timed run
 writes timing to `seed-map.time` and does not save it.
 
-The rejected block-KPOS radix, K=32 hash-mix, window-run batching, and Splay
-update experiments have been removed from the production source.  Their
-frozen experiment records remain under `work_real/experiments/` and
-`work_real_wg/experiments/` for reproducibility.
-
 A multi-block reads DB produces `reads.1.ref.las`,
 `reads.2.ref.las`, and so on. A single-block DB produces `reads.ref.las`.
 
