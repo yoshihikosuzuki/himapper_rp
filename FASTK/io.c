@@ -2019,7 +2019,7 @@ static void read_DB_stub(char *path, int *cut, int *all)
       Clean_Exit(1);
     }
 
-  if (fscanf(dbfile,"size = %11lld cutoff = %9d all = %1d\n",&size,cut,all) != 3)
+  if (fscanf(dbfile,"size = %lld cutoff = %9d all = %1d\n",&size,cut,all) != 3)
     goto stub_trash;
 
   fclose(dbfile);

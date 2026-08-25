@@ -556,7 +556,7 @@ DAZZ_STUB *Read_DB_Stub(char *path, int what)
   if (fscanf(dbfile,DB_NBLOCK,&nblocks) != 1)
     goto stub_trash;
 
-  if (fscanf(dbfile,DB_PARAMS,&size,&cutoff,&all) != 3)
+  if (fscanf(dbfile,DB_PARAMS_SCAN,&size,&cutoff,&all) != 3)
     goto stub_trash;
 
   if (what & DB_STUB_BLOCKS)
@@ -617,7 +617,7 @@ int Fetch_Block_Range(char *path, int trim, int n, int *first, int *last)
       return (0);
     }
 
-  if (fscanf(dbfile,DB_PARAMS,&size,&cutoff,&all) != 3)
+  if (fscanf(dbfile,DB_PARAMS_SCAN,&size,&cutoff,&all) != 3)
     goto stub_error;
   for (i = 1; i <= n; i++)
     if (fscanf(dbfile,DB_BDATA,&ufirst,&tfirst) != 2)
@@ -783,7 +783,7 @@ int Open_DB(char* path, DAZZ_DB *db)
           goto error2;
         }
     else
-      { if (fscanf(dbvis,DB_PARAMS,&size,&cutoff,&all) != 3)
+      { if (fscanf(dbvis,DB_PARAMS_SCAN,&size,&cutoff,&all) != 3)
           { EPRINTF(EPLACE,"%s: Stub file (.db) of %s is junk\n",Prog_Name,root);
             goto error2;
           }

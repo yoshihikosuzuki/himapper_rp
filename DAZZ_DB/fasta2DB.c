@@ -662,7 +662,7 @@ int main(int argc, char *argv[])
         }
       dbpos = ftello(ostub);
       fprintf(ostub,DB_NBLOCK,0);
-      if (fscanf(istub,DB_PARAMS,&size,&cutoff,&allflag) != 3)
+      if (fscanf(istub,DB_PARAMS_SCAN,&size,&cutoff,&allflag) != 3)
         { fprintf(stderr,"%s: %s.db is corrupted, read failed\n",Prog_Name,root);
           goto error;
         }

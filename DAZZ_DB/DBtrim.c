@@ -165,7 +165,7 @@ int main(int argc, char *argv[])
     FSCANF(dbfile,DB_NBLOCK,&nblocks)
 
     FTELLO(dbpos,dbfile)
-    FSCANF(dbfile,DB_PARAMS,&size,&cutoff,&all)
+    FSCANF(dbfile,DB_PARAMS_SCAN,&size,&cutoff,&all)
     FSEEKO(dbfile,dbpos,SEEK_SET)
     FPRINTF(dbfile,DB_PARAMS,size,CUTOFF,ALL)
   }

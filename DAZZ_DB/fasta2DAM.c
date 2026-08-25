@@ -586,7 +586,7 @@ int main(int argc, char *argv[])
         }
       dbpos = ftello(ostub);
       fprintf(ostub,DB_NBLOCK,0);
-      if (fscanf(istub,DB_PARAMS,&size,&cutoff,&allflag) != 3)
+      if (fscanf(istub,DB_PARAMS_SCAN,&size,&cutoff,&allflag) != 3)
         { fprintf(stderr,"%s: %s.dam is corrupted, read failed 3\n",Prog_Name,root);
           goto error;
         }

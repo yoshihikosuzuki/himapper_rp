@@ -118,4 +118,11 @@ void Free_Profiles(Profile_Index *P);
 
 int64 Fetch_Profile(Profile_Index *P, int64 id, int64 plen, uint16 *profile);
 
+typedef struct Profile_Reader Profile_Reader;
+
+Profile_Reader *Open_Profile_Reader(Profile_Index *P);
+void            Free_Profile_Reader(Profile_Reader *R);
+
+int64 Fetch_Profile_Sequential(Profile_Reader *R, int64 id, int64 plen,
+                               uint16 *profile);
 #endif // _LIBFASTK

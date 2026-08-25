@@ -1,26 +1,29 @@
 CC = gcc
 CFLAGS = -O3 -Wall -Wextra -Wno-unused-result -fno-strict-aliasing
 DAZZ_DB_DIR = DAZZ_DB
-CPPFLAGS += -I$(DAZZ_DB_DIR)
+FASTK_DIR = FASTK
+CPPFLAGS += -I$(DAZZ_DB_DIR) -I$(FASTK_DIR)
 
 DAZZ_DB_SRC = $(DAZZ_DB_DIR)/DB.c $(DAZZ_DB_DIR)/QV.c
 DAZZ_DB_HDR = $(DAZZ_DB_DIR)/DB.h $(DAZZ_DB_DIR)/QV.h
+FASTK_SRC = $(FASTK_DIR)/libfastk.c
+FASTK_HDR = $(FASTK_DIR)/libfastk.h $(FASTK_DIR)/gene_core.h
 
 ALL = himapper minimaxmer dump_kpos
 
 all: $(ALL)
 
-minimaxmer: minimaxmer.c minimaxmer.h nthash.h $(DAZZ_DB_SRC) $(DAZZ_DB_HDR) libfastk.c libfastk.h gene_core.h copynum.h
-	$(CC) $(CPPFLAGS) $(CFLAGS) -DSKIP_GENE_CORE -o minimaxmer minimaxmer.c $(DAZZ_DB_SRC) libfastk.c -lpthread -lm
+minimaxmer: minimaxmer.c minimaxmer.h nthash.h $(DAZZ_DB_SRC) $(DAZZ_DB_HDR) $(FASTK_SRC) $(FASTK_HDR) copynum.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) -DSKIP_GENE_CORE -o minimaxmer minimaxmer.c $(DAZZ_DB_SRC) $(FASTK_SRC) -lpthread -lm
 
-minimaxmer-lib.o: minimaxmer.c minimaxmer.h nthash.h $(DAZZ_DB_HDR) libfastk.h gene_core.h copynum.h
+minimaxmer-lib.o: minimaxmer.c minimaxmer.h nthash.h $(DAZZ_DB_HDR) $(FASTK_HDR) copynum.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) \
 	  -DMINIMAXMER_NO_MAIN -DSKIP_GENE_CORE -c -o $@ minimaxmer.c
 
 himapper: himapper.c map.c map.h align.c align.h minimaxmer.h minimaxmer-lib.o \
-          $(DAZZ_DB_SRC) $(DAZZ_DB_HDR) libfastk.c libfastk.h copynum.h
+	          $(DAZZ_DB_SRC) $(DAZZ_DB_HDR) $(FASTK_SRC) $(FASTK_HDR) copynum.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -DSKIP_GENE_CORE -o himapper himapper.c map.c align.c \
-	  minimaxmer-lib.o $(DAZZ_DB_SRC) libfastk.c -lpthread -lm
+	  minimaxmer-lib.o $(DAZZ_DB_SRC) $(FASTK_SRC) -lpthread -lm
 
 dump_kpos: dump_kpos.c copynum.h
 	$(CC) $(CFLAGS) -o dump_kpos dump_kpos.c
