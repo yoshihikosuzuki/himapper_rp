@@ -1,0 +1,39 @@
+# DAZZ_DB executables
+/fasta2DB
+/DB2fasta
+/quiva2DB
+/DB2quiva
+/DBsplit
+/DBdust
+/Catrack
+/DBshow
+/DBstats
+/DBrm
+/DBmv
+/DBcp
+/simulator
+/fasta2DAM
+/DAM2fasta
+/rangen
+/arrow2DB
+/DB2arrow
+/DBwipe
+/DBtrim
+/DB2ONE
+
+# Compiler and linker outputs
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.dll.a
+*.exe
+*.exp
+*.lib
+*.dSYM/
+
+# Packaging output
+/dazz.db.tar.gz
