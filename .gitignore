@@ -13,10 +13,6 @@ copy_minimizer
 minimaxmer
 minimaxmer-lib.o
 dump_kpos
-fastkdual/FastKdual
-fastkdual/compare_profiles*
-fastkdual/validation
-fastkdual/*.log
 
 tests/
 work*/

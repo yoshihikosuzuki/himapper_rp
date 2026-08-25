@@ -5,6 +5,7 @@ of the production build:
 
 - `copy_minimizer`: copy-number-oriented minimizer variant
 - `modimizer`: modulo-hash selector variant
+- `dump_kpos`: block-indexed KPOS container inspector and ASCII dumper
 
 Build or clean both programs from the repository root with:
 
@@ -18,6 +19,7 @@ The standalone command lines are:
 ```text
 copy_minimizer [-T<N>] [-k<N>] [-w<N>] [-s<N>] [-l<N>] <db> <genome.prof> <out.kpos>
 modimizer      [-T<N>] [-k<N>]                   [-l<N>] <db> <genome.prof> <out.kpos>
+dump_kpos <file.kpos> [block]
 ```
 
 `MINIMAX_SELECTOR_FLAGS` applies only to `copy_minimizer`.  It can be
