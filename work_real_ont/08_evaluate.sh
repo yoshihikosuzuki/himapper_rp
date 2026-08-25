@@ -17,9 +17,12 @@ TOOLS=(
   wm2="$D_WM2/mapping.tsv"
 )
 
+RDNAGAP="$REPO/work_real_wg/experiments_archived_20260731/hotspot_coverage/annotations/hg002v1.1.rDNA_GAP.envelope.bed"
+[[ -s "$RDNAGAP" ]]
+
 python3 "$SCRIPTS/eval.py" \
   --mapping-truth "$READS_CONFIDENT_MAPPING_TRUTH" \
-  --exclude-truth-bed "$REPO/work_real_wg/eval/hg002v1.1.rDNA_GAP_and_active_HOR.bed" \
+  --exclude-truth-bed "$RDNAGAP" \
   --strata hapmer --strata alignment \
   --liftover-paf "$D_REF/mat_vs_pat.paf" \
   --liftover-paf "$D_REF/pat_vs_mat.paf" \

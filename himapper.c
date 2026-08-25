@@ -27,7 +27,7 @@
 #include "minimaxmer.h"
 
 static char *Usage[] =
-  { "[-1vpzCNG] [-k<int(20)>] [-t<int>] [-M<int>] [-T<int(4)>] [-P<dir(/tmp)>]",
+  { "[-1vpzCNG] [-k<int(32)>] [-t<int>] [-M<int>] [-T<int(4)>] [-P<dir(/tmp)>]",
     "         [-e<double(.85)] [-s<int(100)>] [-n<double(1.00)>]",
     "         [seed generation long options]",
     "         [-m<track>]+  <reference:dam> <ref.kpos|all> <reads:db> <reads.kpos|all|generate>",
@@ -141,7 +141,6 @@ typedef struct
     int  out;
   } Event;
 
-// TODO: hl,dlにはない
 static void reheap(int s, Event **heap, int hsize)
 { int      c, l, r;
   Event   *hs, *hr, *hl;
@@ -173,7 +172,6 @@ static void reheap(int s, Event **heap, int hsize)
     heap[c] = hs;
 }
 
-// TODO: hlにはない
 static int64 merge_size(DAZZ_DB *block, int mtop)
 { Event       ev[mtop+1];
   Event      *heap[mtop+2];
@@ -246,7 +244,6 @@ static int64 merge_size(DAZZ_DB *block, int mtop)
   return (nsize);
 }
 
-// TODO: hlにはない
 static DAZZ_TRACK *merge_tracks(DAZZ_DB *block, int mtop, int64 nsize)
 { DAZZ_TRACK *ntrack;
   Event       ev[mtop+1];
@@ -433,7 +430,6 @@ static void reference_block_view(DAZZ_DB *view, DAZZ_DB *whole,
     }
 }
 
-// TODO: hl,dlにはない
 static void complement(char *s, int len)
 { char *t;
   int   c;
@@ -450,7 +446,6 @@ static void complement(char *s, int len)
     *s = (char) (3-*s);
 }
 
-// TODO: hl,dlにはない
 static DAZZ_DB *complement_DB(DAZZ_DB *block, int inplace)
 { static DAZZ_DB _cblock, *cblock = &_cblock;
   int            nreads;
@@ -577,7 +572,6 @@ void Clean_Exit(int val)
 int main(int argc, char *argv[])
 { DAZZ_DB    _refdb, _ablock, _bblock;
   DAZZ_DB    *refdb = &_refdb, *ablock = &_ablock, *bblock = &_bblock;
-  // TODO: ここに[a|b]class
   char       *afile,  *bfile;
   char       *aroot,  *broot, *apwd;
   char       *kpos_path;
@@ -709,7 +703,7 @@ int main(int argc, char *argv[])
 
     KMER_LEN  = 32;
     MAX_REPS  = 0;
-    AVE_ERROR = .97;
+    AVE_ERROR = .85;
     SPACING   = 100;       //   Globally visible to map.c
     BEST_TIE  = 1.0;   // -n: near-optimal threshold; report a same-region
                        //     secondary only if its score >= BEST_TIE*best.
@@ -762,9 +756,8 @@ int main(int argc, char *argv[])
             if (KMER_LEN <= 16 || KMER_LEN > 48)
               { fprintf(stderr,"%s: K-mer length must be between 17 and 48\n",Prog_Name);
                 exit (1);
-              }   // TODO: このKMER_LENに対応しているか確認
+              }
             break;
-            // TODO: hlだと -m は MASK_DIFF_THRES。こちらもそうする？
           // case 'm':
           //   if (MTOP >= MMAX)
           //     { MMAX  = 1.2*MTOP + 10;
@@ -947,7 +940,6 @@ int main(int argc, char *argv[])
   //  For reference argv[1]: get file path parts (apwd/aroot), whether it is a dam or db,
   //    number of blocks, and set alignment specification with its frequencies.
 
-  // TODO: ここからmapper-specific
   { int     p, part, nfiles, tlast, plen;
     char   *cat, *bptr, *fptr;
     char    fname[MAX_NAME], prolog[MAX_NAME];
@@ -959,7 +951,7 @@ int main(int argc, char *argv[])
       aroot = Root(argv[1],".dam");
     else
       aroot = Root(argv[1],".db");
-    apwd = PathTo(argv[1]);   // TODO: hlだとapath
+    apwd = PathTo(argv[1]);
 
     bptr = rindex(aroot,'.');
     if (bptr != NULL && bptr[1] != '\0' && bptr[1] != '-')
@@ -1018,7 +1010,6 @@ int main(int argc, char *argv[])
 
     settings = New_Align_Spec(AVE_ERROR, SPACING, dbase.freq, 1);
   }
-  // TODO: ここまでmapper-specific
 
   if ((integrated_seed ?
        Set_Filter_Params_Exact(KMER_LEN,MAX_REPS,map_threads) :

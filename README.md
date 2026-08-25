@@ -2,33 +2,10 @@
 
 Fast, haplotype-aware HiFi read mapper using relative k-mer profiles.
 
-## Local DAZZ_DB and FASTK
+## Incorporated repositories
 
-himapper is built against the `DAZZ_DB/` clone in this repository, and the
-preparation workflows call `DAZZ_DB/fasta2DAM`, `DAZZ_DB/DBshow`,
-`DAZZ_DB/DBsplit`, and `FASTK/FastK` by absolute path.  Build the local
-dependencies and himapper with:
-
-```sh
-make local-tools
-make
-```
-
-On compute nodes without the system curl development files, load the dependency
-documented by `~/code/install-scripts/pg/app/fastk.sh` while building:
-
-```sh
-source /bio/lmod/lmod/init/bash
-module purge
-module use /bio/package/.modulefiles
-module load curl/7.65.3
-make local-tools
-module purge
-make
-```
-
-The local DAZZ_DB parser accepts block sizes wider than the historical
-11-character field while retaining the fixed-width stub layout when writing.
+- DAZZ_DB: a3eefd4
+- FASTK: 0e24fb4
 
 ## Current workflow
 
@@ -254,7 +231,7 @@ entirely repetitive.
 
 ```
 2. HPC.damapper [-vbpzCN]
-                [-k<int(20)>] [-t<int>] [-M<int>] [-e<double(.85)] [-s<int(100)]
+                [-k<int(32)>] [-t<int>] [-M<int>] [-e<double(.85)] [-s<int(100)]
                 [-n<double(1.)>] [-m<track>]+ [-B<int(4)>] [-T<int(4)>] [-f<name>]
                 <ref:db|dam> <reads:db|dam> [<first:int>[-<last:int>]]
 ```

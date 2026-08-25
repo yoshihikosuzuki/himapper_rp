@@ -1,13 +1,13 @@
 .vscode/
 __pycache__/
 
-DAZZ_DB
+DEV_NOTE.md
+backup/
+
 DALIGNER
 DAMAPPER
-FASTK
 
 himapper
-HPC.himapper
 modimizer
 copy_minimizer
 minimaxmer
@@ -18,7 +18,6 @@ fastkdual/compare_profiles*
 fastkdual/validation
 fastkdual/*.log
 
-memory/
 tests/
 work*/
 !work*/*.sh
