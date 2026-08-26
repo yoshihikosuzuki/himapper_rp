@@ -2246,8 +2246,8 @@ static void *seed_worker(void *arg)
 {
   WorkQueue *queue = (WorkQueue *)arg;
   DAZZ_DB db = *queue->db;
-  Profile_Reader *Pg_reader = NULL;
-  Profile_Reader *Pr_reader = NULL;
+  Profile_Index *Pg = NULL;
+  Profile_Index *Pr = NULL;
   char *seq;
   uint16 *prof_genome;
   uint16 *prof_reads;
@@ -2262,10 +2262,10 @@ static void *seed_worker(void *arg)
     db.bases = NULL;
   else
     db.bases = open_worker_bases(queue->db);
-  Pg_reader = Open_Profile_Reader(queue->genome);
-  Pr_reader = Open_Profile_Reader(queue->reads);
-  if (Pg_reader == NULL || Pr_reader == NULL)
-    { fprintf(stderr,"minimaxmer: cannot open sequential profile readers\n");
+  Pg = Clone_Profiles(queue->genome);
+  Pr = Clone_Profiles(queue->reads);
+  if (Pg == NULL || Pr == NULL)
+    { fprintf(stderr,"minimaxmer: cannot clone profile indexes\n");
       exit(1);
     }
   seq = New_Read_Buffer(&db);
@@ -2331,22 +2331,18 @@ static void *seed_worker(void *arg)
             }
           else
             Load_Read(&db,id,seq,2);
-          fetched = Fetch_Profile_Sequential(
-              Pg_reader, (int64)id, pmax, prof_genome);
+          fetched = Fetch_Profile(Pg, (int64)id, pmax, prof_genome);
           if (fetched > pmax)
             { grow_profiles((int)fetched, &pmax,
                             &prof_genome, &prof_reads);
-              Fetch_Profile_Sequential(
-                  Pg_reader, (int64)id, pmax, prof_genome);
+              Fetch_Profile(Pg, (int64)id, pmax, prof_genome);
             }
 
-          fetched = Fetch_Profile_Sequential(
-              Pr_reader, (int64)id, pmax, prof_reads);
+          fetched = Fetch_Profile(Pr, (int64)id, pmax, prof_reads);
           if (fetched > pmax)
             { grow_profiles((int)fetched, &pmax,
                             &prof_genome, &prof_reads);
-              Fetch_Profile_Sequential(
-                  Pr_reader, (int64)id, pmax, prof_reads);
+              Fetch_Profile(Pr, (int64)id, pmax, prof_reads);
             }
 
           if (plen > 0)
@@ -2427,8 +2423,8 @@ static void *seed_worker(void *arg)
   free(seq - 1);
   if (!queue->retain_loaded_db)
     fclose((FILE *)db.bases);
-  Free_Profile_Reader(Pg_reader);
-  Free_Profile_Reader(Pr_reader);
+  Free_Profiles(Pg);
+  Free_Profiles(Pr);
   return NULL;
 }
 

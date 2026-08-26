@@ -2074,7 +2074,7 @@ static void *seed_worker(void *arg)
 {
   WorkQueue *queue = (WorkQueue *)arg;
   DAZZ_DB db = *queue->db;
-  Profile_Reader *Pg_reader = NULL;
+  Profile_Index *Pg = NULL;
   char *seq;
   uint16 *prof_genome;
   int pmax = 20000;
@@ -2085,9 +2085,9 @@ static void *seed_worker(void *arg)
 #endif
 
   db.bases = open_worker_bases(queue->db);
-  Pg_reader = Open_Profile_Reader(queue->genome);
-  if (Pg_reader == NULL)
-    { fprintf(stderr,"copy_minimizer: cannot open sequential profile reader\n");
+  Pg = Clone_Profiles(queue->genome);
+  if (Pg == NULL)
+    { fprintf(stderr,"copy_minimizer: cannot clone profile index\n");
       exit(1);
     }
   seq = New_Read_Buffer(&db);
@@ -2126,12 +2126,10 @@ static void *seed_worker(void *arg)
           int plen = r->rlen - K + 1;
           int64 fetched;
           Load_Read(&db,id,seq,2);
-          fetched = Fetch_Profile_Sequential(
-              Pg_reader, (int64)id, pmax, prof_genome);
+          fetched = Fetch_Profile(Pg, (int64)id, pmax, prof_genome);
           if (fetched > pmax)
             { grow_profile((int)fetched, &pmax, &prof_genome);
-              Fetch_Profile_Sequential(
-                  Pg_reader, (int64)id, pmax, prof_genome);
+              Fetch_Profile(Pg, (int64)id, pmax, prof_genome);
             }
 
           if (plen > 0)
@@ -2176,7 +2174,7 @@ static void *seed_worker(void *arg)
   free(prof_genome);
   free(seq - 1);
   fclose((FILE *)db.bases);
-  Free_Profile_Reader(Pg_reader);
+  Free_Profiles(Pg);
   return NULL;
 }
 
