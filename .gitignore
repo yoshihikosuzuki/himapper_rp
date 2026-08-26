@@ -2,17 +2,14 @@
 __pycache__/
 
 DEV_NOTE.md
-backup/
+CN_UNIQ_W.md
 
-DALIGNER
-DAMAPPER
+DALIGNER/
+DAMAPPER/
 
 himapper
-modimizer
-copy_minimizer
 minimaxmer
 minimaxmer-lib.o
-dump_kpos
 
 tests/
 work*/
@@ -20,4 +17,3 @@ work*/
 !work*/scripts/
 !work*/scripts/*.py
 !work*/scripts/*.awk
-CN_UNIQ_W.md

@@ -13,6 +13,11 @@ ALL = himapper minimaxmer
 
 all: $(ALL)
 
+local-tools:
+	$(MAKE) -C $(DAZZ_DB_DIR)
+	$(MAKE) -C $(FASTK_DIR)
+	$(MAKE) -C fastkdual FastKdual
+
 minimaxmer: minimaxmer.c minimaxmer.h nthash.h $(DAZZ_DB_SRC) $(DAZZ_DB_HDR) $(FASTK_SRC) $(FASTK_HDR) copynum.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -DSKIP_GENE_CORE -o minimaxmer minimaxmer.c $(DAZZ_DB_SRC) $(FASTK_SRC) -lpthread -lm
 
@@ -33,3 +38,5 @@ clean:
 package:
 	make clean
 	tar -zcf himapper.tar.gz README.md LICENSE *.h *.c Makefile
+
+.PHONY: all fastkdual local-tools clean package
