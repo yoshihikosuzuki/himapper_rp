@@ -12,6 +12,7 @@ minimaxmer
 minimaxmer-lib.o
 
 tests/
+plots/
 work*/
 !work*/*.sh
 !work*/scripts/

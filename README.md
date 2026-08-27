@@ -77,6 +77,12 @@ himapper -1 -T16 \
   reads.dam .reads.minimax.kpos
 ```
 
+Seed-hit chaining uses bounded backward dynamic programming by default.  Its
+primary predecessor window is fixed at `max_iter=1000`, and its minimap2-style
+skip heuristic uses `max_skip=12`; a one-anchor `max_ii` rescue is retained.
+The existing edge-validity and transition-score rules and global
+candidate-dominance behavior are unchanged.
+
 Read seed generation can instead be fused with mapping.  Serial mode gives
 seed generation and mapping the full `-T` thread budget in turn and passes each
 sorted KPOS block directly in memory.  It is the no-overlap control for the

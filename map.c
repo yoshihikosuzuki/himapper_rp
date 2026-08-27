@@ -69,15 +69,11 @@ static double SPECIAL_LOG_POWERS[41];
 #define MAXGRAM \
   50000  //  Cap on k-mer count histogram (in count_thread, merge_thread)
 
-//  Number of distinct-diagonal predecessor candidates considered per side
-//  while chaining.  P=1 is the original recurrence; P=2 also tests the closest
-//  feasible endpoint on the next distinct diagonal.  Set this to 1 or 2 before
-//  rebuilding himapper.
-#define CHAIN_PRED_WIDTH 2
-#if CHAIN_PRED_WIDTH != 1 && CHAIN_PRED_WIDTH != 2
-#error "CHAIN_PRED_WIDTH must be 1 or 2"
-#endif
-#define CHAIN_PRED_MAX 2
+//  Fixed bounds for the backward-DP seed chainer.  MAX_ITER caps the primary
+//  predecessor window; MAX_SKIP is the minimap2-style skip threshold.  A
+//  one-anchor max_ii rescue may additionally be tested outside a stopped scan.
+#define CHAIN_DP_MAX_ITER 1000
+#define CHAIN_DP_MAX_SKIP 12
 
 // #define DEBUG_SEED_HIT      //  Print every seed hit: ref_id/pos,
 // read_id/pos, kmer string
@@ -2056,166 +2052,23 @@ static int chain_length(Splay* x) {
   return (n);
 }
 
-static Splay* predOf(Splay* x, int thresh) {
-  x = x->lft;
-  if (x == NULL || x->bmax < thresh) return (NULL);
-  while (1) {
-    if (x->rgt != NULL && x->rgt->bmax >= thresh)
-      x = x->rgt;
-    else if (x->bpos >= thresh)
-      return (x);
-    else {
-      x = x->lft;
-      if (x == NULL) return (NULL);
-    }
-  }
-}
+//  Score one already-processed hit as a predecessor of current.  Both A and B
+//  must move forward by at most MAX_GAP.  The added span and diagonal-drift
+//  penalty are the same as in the preceding splay recurrence.
+static inline int chain_dp_cost(Splay* current, Splay* prior) {
+  int cost, da, db, span;
 
-static Splay* leftmost(Splay* x, int diag, int thresh) {
-  Splay* a;
+  da = current->apos - prior->apos;
+  db = current->bpos - prior->bpos;
+  if (da < 0 || da > MAX_GAP || db < 0 || db > MAX_GAP) return (INT_MIN);
 
-  a = NULL;
-  while (x != NULL)
-    if (diag > x->diag)
-      x = x->lft;
-    else if (diag < x->diag)
-      x = x->rgt;
-    else {
-      if (x->lft != NULL && x->lft->bmax >= thresh) {
-        if (x->bpos >= thresh) a = x;
-        x = x->lft;
-      } else if (x->bpos >= thresh)
-        return (x);
-      else
-        x = x->rgt;
-    }
-  return (a);
-}
-
-static Splay* succOf(Splay* x, int thresh) {
-  x = x->rgt;
-  if (x == NULL || x->bmin > thresh) return (NULL);
-  while (1) {
-    if (x->lft != NULL && x->lft->bmin <= thresh)
-      x = x->lft;
-    else if (x->bpos <= thresh)
-      return (x);
-    else {
-      x = x->rgt;
-      if (x == NULL) return (NULL);
-    }
-  }
-}
-
-#if CHAIN_PRED_WIDTH > 1
-typedef struct {
-  Splay* node[CHAIN_PRED_MAX];
-  int n;
-} Chain_Pred_List;
-
-static int chain_pred_cost(Splay* current, Splay* prior, int side) {
-  int cost;
-
-  if (side == 0) {
-    if (current->apos >= prior->apos + Kmer)
-      cost = prior->cost + Kmer;
-    else
-      cost = prior->cost + (current->apos - prior->apos);
-  } else {
-    if (current->bpos >= prior->bpos + Kmer)
-      cost = prior->cost + Kmer;
-    else
-      cost = prior->cost + (current->bpos - prior->bpos);
-  }
+  span = da < db ? da : db;
+  if (span > Kmer) span = Kmer;
+  cost = prior->cost + span;
   if (JUNCTION_PEN)
     cost -= (DRIFT_PEN_W * abs(current->diag - prior->diag)) / 100;
   return (cost);
 }
-
-//  Return the closest feasible endpoint in a subtree known to be above the
-//  diagonal boundary.  This is predOf's bmax-pruned one-path traversal.
-static Splay* chain_pred_any_above(Splay* x, int thresh) {
-  if (x == NULL || x->bmax < thresh) return (NULL);
-  while (1) {
-    if (x->rgt != NULL && x->rgt->bmax >= thresh)
-      x = x->rgt;
-    else if (x->bpos >= thresh)
-      return (x);
-    else {
-      x = x->lft;
-      if (x == NULL) return (NULL);
-    }
-  }
-}
-
-//  Return the closest feasible endpoint whose diagonal is strictly above
-//  bound.  The boundary descent plus at most one unrestricted subtree descent
-//  visits O(tree height) nodes.
-static Splay* chain_pred_above(Splay* x, int bound, int thresh) {
-  Splay* near;
-
-  if (x == NULL || x->bmax < thresh) return (NULL);
-  if (x->diag <= bound) return (chain_pred_above(x->lft, bound, thresh));
-
-  near = chain_pred_above(x->rgt, bound, thresh);
-  if (near != NULL) return (near);
-  if (x->bpos >= thresh) return (x);
-  return (chain_pred_any_above(x->lft, thresh));
-}
-
-//  succOf's bmin-pruned counterpart for a subtree known to be below the
-//  diagonal boundary.
-static Splay* chain_pred_any_below(Splay* x, int thresh) {
-  if (x == NULL || x->bmin > thresh) return (NULL);
-  while (1) {
-    if (x->lft != NULL && x->lft->bmin <= thresh)
-      x = x->lft;
-    else if (x->bpos <= thresh)
-      return (x);
-    else {
-      x = x->rgt;
-      if (x == NULL) return (NULL);
-    }
-  }
-}
-
-//  Return the closest feasible endpoint whose diagonal is strictly below
-//  bound, symmetrically to chain_pred_above.
-static Splay* chain_pred_below(Splay* x, int bound, int thresh) {
-  Splay* near;
-
-  if (x == NULL || x->bmin > thresh) return (NULL);
-  if (x->diag >= bound) return (chain_pred_below(x->rgt, bound, thresh));
-
-  near = chain_pred_below(x->lft, bound, thresh);
-  if (near != NULL) return (near);
-  if (x->bpos <= thresh) return (x);
-  return (chain_pred_any_below(x->rgt, thresh));
-}
-
-static void chain_pred_list(Splay* current, Splay* primary, int side,
-                            int thresh, int width, Chain_Pred_List* list) {
-  Splay* next;
-  int bound;
-
-  list->n = 0;
-  bound = current->diag;
-  if (primary != NULL) {
-    list->node[list->n++] = primary;
-    bound = primary->diag;
-  }
-
-  while (list->n < width) {
-    if (side == 0)
-      next = chain_pred_above(current, bound, thresh);
-    else
-      next = chain_pred_below(current, bound, thresh);
-    if (next == NULL) break;
-    list->node[list->n++] = next;
-    bound = next->diag;
-  }
-}
-#endif
 
 //  Print contents of splay tree h in decreasing order, suppressing any
 //  successors
@@ -2369,6 +2222,7 @@ static void* chain_thread(void* arg) {
 #endif
 
   Splay *sbase, *sfree;  //  Splay space, allocated linearly
+  int* dp_touch;         //  Marks predecessors already reached at an anchor
 
   int cmax, cfree;  //  Candidate space, free list
   Candidate* cbase;
@@ -2462,6 +2316,9 @@ static void* chain_thread(void* arg) {
 
     sbase = Malloc(sizeof(Splay) * (maxk + 1), "Allocating splay free space\n");
     if (sbase == NULL) Clean_Exit(1);
+    dp_touch = Malloc(sizeof(int) * (maxk + 1),
+                      "Allocating bounded-DP touch vector\n");
+    if (dp_touch == NULL) Clean_Exit(1);
 
     cover = data->cover;
     comax = data->comax;
@@ -2504,6 +2361,7 @@ static void* chain_thread(void* arg) {
     int ncan;
     Splay *chain, *expired, *queue, *qlast;
     int cand;
+    int dp_st, dp_max_ii;
 
     //  Diagonal bucket size and range depends on A-reads length and average
     //  error rate
@@ -2513,6 +2371,8 @@ static void* chain_thread(void* arg) {
     expired = NULL;
     queue = NULL;
     qlast = NULL;
+    dp_st = 0;
+    dp_max_ii = -1;
     cand = aread[ar].coff;
     ncan = 0;
 
@@ -2671,13 +2531,13 @@ static void* chain_thread(void* arg) {
         chain = NULL;
         expired = NULL;
         queue = NULL;
+        dp_st = 0;
+        dp_max_ii = -1;
       }
 
       //  Add next k-mer match to its best chain extension
 
       {
-        Splay *l, *r;
-        int lcost, rcost;
         int htier = CN_TIER(hits[nidx].apos);  //  copy tier of this seed
 
         apos = CN_VAL(hits[nidx].apos) + 1;  //  strip copy-tier (see merge_thread)
@@ -2702,109 +2562,60 @@ static void* chain_thread(void* arg) {
         chain = sfree++;
         update(chain);
 
-#if CHAIN_PRED_WIDTH == 1
-        l = predOf(chain, bpos - MAX_GAP);
-        if (l != NULL) l = leftmost(chain, l->diag, bpos - MAX_GAP);
-        r = succOf(chain, bpos);
-        lcost = rcost = 0;
-        if (l != NULL) {
-          if (apos >= l->apos + Kmer)
-            lcost = l->cost + Kmer;
-          else
-            lcost = l->cost + (apos - l->apos);
-          //  Diagonal-drift penalty: |Agap - Bgap| = the implied indel between
-          //  this hit and its predecessor.  Collinear hits (a real alignment)
-          //  drift ~0; chaining across a repeat copy jumps in B (large drift).
-          //  Charging it keeps a clean collinear chain from being out-scored by
-          //  one that wanders through duplicated copies (cf. report junction pen).
-          if (JUNCTION_PEN) lcost -= (DRIFT_PEN_W * abs(chain->diag - l->diag)) / 100;
-        }
-        if (r != NULL) {
-          if (bpos >= r->bpos + Kmer)
-            rcost = r->cost + Kmer;
-          else
-            rcost = r->cost + (bpos - r->bpos);
-          if (JUNCTION_PEN) rcost -= (DRIFT_PEN_W * abs(chain->diag - r->diag)) / 100;
-        }
-        if (lcost > rcost)
-          rcost = 0;
-        else
-          lcost = 0;
-
-        if (lcost > 0) {
-          chain->from = l;
-          chain->cost = lcost;
-          chain->nuniq = l->nuniq + (htier == 1);
-          if (l->from == NULL)
-            chain->orig = l;
-          else
-            chain->orig = l->orig;
-          if (lcost >= chain->orig->orig->cost) {
-            chain->orig->orig = chain;
-            if (abs(l->diag - chain->diag) <= .2 * (chain->apos - l->apos)) {
-              del(chain, l);
-              l->bmin = -1;
-            }
-          }
-        } else if (rcost > 0) {
-          chain->from = r;
-          chain->cost = rcost;
-          chain->nuniq = r->nuniq + (htier == 1);
-          if (r->from == NULL)
-            chain->orig = r;
-          else
-            chain->orig = r->orig;
-          if (rcost >= chain->orig->orig->cost) {
-            chain->orig->orig = chain;
-            if (abs(r->diag - chain->diag) <= .2 * (chain->apos - r->apos)) {
-              del(chain, r);
-              r->bmin = -1;
-            }
-          }
-        } else {
-          chain->from = NULL;
-          chain->cost = Kmer;
-          chain->orig = chain;
-          chain->nuniq = (htier == 1);
-        }
-#else
         {
-          Chain_Pred_List left, right;
           Splay* best;
-          int bestcost, i;
+          int bestcost, dp_i, end_j, j, n_skip;
 
-          l = predOf(chain, bpos - MAX_GAP);
-          if (l != NULL) l = leftmost(chain, l->diag, bpos - MAX_GAP);
-          r = succOf(chain, bpos);
-          chain_pred_list(chain, l, 0, bpos - MAX_GAP, CHAIN_PRED_WIDTH,
-                          &left);
-          chain_pred_list(chain, r, 1, bpos, CHAIN_PRED_WIDTH, &right);
+          //  SeedPair radix order makes sbase[0..dp_i) nondecreasing in query
+          //  position.  Keep DP state in that array even after an endpoint is
+          //  removed from the splay tree used to emit candidate chains.
+          dp_i = (int)(chain - sbase);
+          dp_touch[dp_i] = 0;
+          while (dp_st < dp_i &&
+                 sbase[dp_st].apos < chain->apos - MAX_GAP)
+            dp_st += 1;
+          if (dp_i - dp_st > CHAIN_DP_MAX_ITER)
+            dp_st = dp_i - CHAIN_DP_MAX_ITER;
 
-          lcost = (l == NULL ? 0 : chain_pred_cost(chain, l, 0));
-          rcost = (r == NULL ? 0 : chain_pred_cost(chain, r, 1));
-          if (lcost > rcost) {
-            best = l;
-            bestcost = lcost;
-          } else {
-            best = r;
-            bestcost = rcost;
-          }
-          if (bestcost <= 0) {
-            best = NULL;
-            bestcost = 0;
-          }
+          best = NULL;
+          bestcost = 0;  //  Preserve the existing restart rule.
+          n_skip = 0;
+          for (j = dp_i - 1; j >= dp_st; j--) {
+            Splay* prior = sbase + j;
+            int cost = chain_dp_cost(chain, prior);
 
-          for (i = (l == NULL ? 0 : 1); i < left.n; i++) {
-            int cost = chain_pred_cost(chain, left.node[i], 0);
+            if (cost == INT_MIN) continue;
             if (cost > bestcost) {
-              best = left.node[i];
+              best = prior;
               bestcost = cost;
+              if (n_skip > 0) n_skip -= 1;
+            } else if (dp_touch[j] == dp_i) {
+              n_skip += 1;
+              if (n_skip > CHAIN_DP_MAX_SKIP) break;
             }
+            if (prior->from != NULL)
+              dp_touch[prior->from - sbase] = dp_i;
           }
-          for (i = (r == NULL ? 0 : 1); i < right.n; i++) {
-            int cost = chain_pred_cost(chain, right.node[i], 1);
-            if (cost > bestcost) {
-              best = right.node[i];
+          end_j = j;
+
+          //  Retain minimap2's max_ii state and one-anchor rescue.  The
+          //  rescued edge still has to pass the full two-axis feasibility test.
+          if (dp_max_ii < 0 ||
+              chain->apos - sbase[dp_max_ii].apos > MAX_GAP) {
+            int max = INT_MIN;
+
+            dp_max_ii = -1;
+            for (j = dp_i - 1; j >= dp_st; j--)
+              if (max < sbase[j].cost) {
+                max = sbase[j].cost;
+                dp_max_ii = j;
+              }
+          }
+          if (dp_max_ii >= 0 && dp_max_ii < end_j) {
+            int cost = chain_dp_cost(chain, sbase + dp_max_ii);
+
+            if (cost != INT_MIN && cost > bestcost) {
+              best = sbase + dp_max_ii;
               bestcost = cost;
             }
           }
@@ -2819,8 +2630,17 @@ static void* chain_thread(void* arg) {
               chain->orig = best->orig;
             if (bestcost >= chain->orig->orig->cost) {
               chain->orig->orig = chain;
-              if (abs(best->diag - chain->diag) <=
-                  .2 * (chain->apos - best->apos)) {
+              //  del() is valid only while best remains in the active tree.
+              if (best->apos < chain->apos - MAX_GAP ||
+                  best->apos > chain->apos) {
+                fprintf(stderr,
+                        "%s: internal bounded-DP predecessor range error\n",
+                        Prog_Name);
+                Clean_Exit(1);
+              }
+              if (best->bmin >= 0 &&
+                  abs(best->diag - chain->diag) <=
+                      .2 * (chain->apos - best->apos)) {
                 del(chain, best);
                 best->bmin = -1;
               }
@@ -2831,8 +2651,12 @@ static void* chain_thread(void* arg) {
             chain->orig = chain;
             chain->nuniq = (htier == 1);
           }
+
+          if (dp_max_ii < 0 ||
+              (chain->apos - sbase[dp_max_ii].apos <= MAX_GAP &&
+               sbase[dp_max_ii].cost < chain->cost))
+            dp_max_ii = dp_i;
         }
-#endif
 
         chain->nxt = NULL;
         if (queue != NULL)
@@ -2875,6 +2699,7 @@ static void* chain_thread(void* arg) {
   //  Clean up
 
   free(sbase);
+  free(dp_touch);
 
   data->jmax = jmax;
   data->jbase = jbase;
