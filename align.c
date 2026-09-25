@@ -50,6 +50,8 @@
 *                                                                                        *
 \****************************************************************************************/
 
+typedef struct { int parent, matches, op; } History_Node;
+
 typedef struct            //  Hidden from the user, working space for each thread
   { int     vecmax;
     void   *vector;
@@ -61,6 +63,12 @@ typedef struct            //  Hidden from the user, working space for each threa
     void   *trace;
     int     alnmax;
     void   *alnpts;
+    int     capture;
+    History_Node *history;
+    int hlen, hcap;
+    int *heads, hlo, hhi;
+    Cigar forward_cigar, local_cigar;
+    size_t history_peak;
   } _Work_Data;
 
 Work_Data *New_Work_Data()
@@ -69,6 +77,7 @@ Work_Data *New_Work_Data()
   work = (_Work_Data *) Malloc(sizeof(_Work_Data),"Allocating work data block");
   if (work == NULL)
     EXIT(NULL);
+  memset(work,0,sizeof(*work));
   work->vecmax = 0;
   work->vector = NULL;
   work->pntmax = 0;
@@ -136,6 +145,10 @@ static int enlarge_trace(_Work_Data *work, int newmax)
 
 void Free_Work_Data(Work_Data *ework)
 { _Work_Data *work = (_Work_Data *) ework;
+  free(work->history);
+  free(work->heads);
+  Cigar_Free(&work->forward_cigar);
+  Cigar_Free(&work->local_cigar);
   if (work->vector != NULL)
     free(work->vector);
   if (work->cells != NULL)
@@ -147,6 +160,70 @@ void Free_Work_Data(Work_Data *ework)
   if (work->alnpts != NULL)
     free(work->alnpts);
   free(work);
+}
+
+void Enable_Trace_History(Work_Data *ework, int enabled)
+{ ((_Work_Data *)ework)->capture=enabled; }
+const Cigar *Local_Cigar(Work_Data *ework)
+{ return &((_Work_Data *)ework)->local_cigar; }
+static size_t history_bytes(Work_Data *ework)
+{ _Work_Data *w=ework;
+  return (size_t)w->hcap*sizeof(History_Node) +
+         (size_t)(w->hhi-w->hlo)*sizeof(int) +
+         (w->forward_cigar.cap+w->local_cigar.cap)*sizeof(uint32_t);
+}
+size_t Trace_History_Bytes(Work_Data *ework)
+{ return ((_Work_Data *)ework)->history_peak; }
+size_t Alignment_Work_Bytes(Work_Data *ework)
+{ _Work_Data *w=ework;
+  return (size_t)w->vecmax + (size_t)w->celmax*(4*sizeof(int)) +
+         w->pntmax + w->tramax + w->alnmax + history_bytes(w);
+}
+
+/* A separate diagonal vector leaves the existing DP layout/tie-breaking intact.
+   Only the live diagonal range is allocated, never the full reference length. */
+static void history_range(_Work_Data *w, int lo, int hi, int reset)
+{
+  if (!w->heads || lo<w->hlo || hi>=w->hhi) {
+    int nlo=lo-128, nhi=hi+129;
+    if (w->heads && !reset) {
+      if (w->hlo<nlo) nlo=w->hlo;
+      if (w->hhi>nhi) nhi=w->hhi;
+    }
+    int *p=Malloc((size_t)(nhi-nlo)*sizeof(int),"Traceback diagonal heads");
+    if (!p) exit(1);
+    for (int i=0; i<nhi-nlo; ++i) p[i]=-1;
+    if (w->heads && !reset)
+      memcpy(p+w->hlo-nlo,w->heads,(size_t)(w->hhi-w->hlo)*sizeof(int));
+    free(w->heads); w->heads=p; w->hlo=nlo; w->hhi=nhi;
+  } else if (reset) {
+    for (int i=lo; i<=hi; ++i) w->heads[i-w->hlo]=-1;
+  }
+  if (reset) w->hlen=0;
+}
+static int history_node(_Work_Data *w, int parent, int op, int matches)
+{
+  if (w->hlen==w->hcap) {
+    if (w->hcap > INT_MAX/2) { fprintf(stderr,"Traceback too large\n"); exit(1); }
+    int cap=w->hcap ? w->hcap+w->hcap/2+1024 : 4096;
+    w->history=Realloc(w->history,(size_t)cap*sizeof(History_Node),"Traceback nodes");
+    if (!w->history) exit(1);
+    w->hcap=cap;
+  }
+  int id=w->hlen++;
+  w->history[id]=(History_Node){parent,matches,op};
+  return id;
+}
+static void history_cigar(_Work_Data *w, int tip, Cigar *c, int reverse)
+{
+  c->n=0;
+  for (int p=tip; p>=0; p=w->history[p].parent) {
+    Cigar_Push(c,CG_EQ,w->history[p].matches);
+    if (w->history[p].op) Cigar_Push(c,w->history[p].op,1);
+  }
+  if (reverse) Cigar_Reverse(c);
+  size_t bytes=history_bytes(w);
+  if (bytes>w->history_peak) w->history_peak=bytes;
 }
 
 
@@ -380,6 +457,7 @@ static int forward_wave(_Work_Data *work, _Align_Spec *spec, Alignment *align, P
   int     moreha, morehb;
   int     more, morem, lasta;
   int     aclip, bclip;
+  int capture=work->capture, trimhist=-1, morehist=-1;
 
   hgh = maxd;
   low = *mind;
@@ -416,6 +494,8 @@ static int forward_wave(_Work_Data *work, _Align_Spec *spec, Alignment *align, P
 
   /* Compute 0-wave starting from mid-line */
 
+  if (capture) history_range(work,low-1,hgh+1,1);
+
   more  = 1;
   aclip =  INT32_MAX;
   bclip = -INT32_MAX;
@@ -433,11 +513,13 @@ static int forward_wave(_Work_Data *work, _Align_Spec *spec, Alignment *align, P
     a  = aseq + hgh;
     for (k = hgh; k >= low; k--)
       { int     y, c, d;
+        int hy0=0, hnode=-1;
         int     ha, hb;
         int     na, nb;
         Pebble *pb;
 
         y = (mida-k) >> 1;
+        hy0=y;
 
         if (avail >= cmax-1)
           { cmax  = ((int) (avail*1.2)) + 10000;
@@ -491,6 +573,10 @@ static int forward_wave(_Work_Data *work, _Align_Spec *spec, Alignment *align, P
             y += 1;
           }
         c = (y << 1) + k;
+        if (capture) {
+          hnode=history_node(work,-1,0,y-hy0);
+          work->heads[k-work->hlo]=hnode;
+        }
 
         while (y+k >= na)
           { if (avail >= cmax)
@@ -536,7 +622,7 @@ static int forward_wave(_Work_Data *work, _Align_Spec *spec, Alignment *align, P
         if (c > besta)
           { besta  = trima = lasta = c;
             besty  = trimy = y;
-            trimha = ha;
+            trimha = ha; if (capture) trimhist=hnode;
             trimhb = hb;
           }
 
@@ -561,7 +647,7 @@ static int forward_wave(_Work_Data *work, _Align_Spec *spec, Alignment *align, P
             { morem  = M[aclip];
               morea  = V[aclip];
               morey  = (morea - aclip)/2;
-              moreha = HA[aclip];
+              moreha = HA[aclip]; if (capture) morehist=work->heads[aclip-work->hlo];
               morehb = HB[aclip];
             }
         }
@@ -571,7 +657,7 @@ static int forward_wave(_Work_Data *work, _Align_Spec *spec, Alignment *align, P
             { morem  = M[bclip];
               morea  = V[bclip];
               morey  = (morea - bclip)/2;
-              moreha = HA[bclip];
+              moreha = HA[bclip]; if (capture) morehist=work->heads[bclip-work->hlo];
               morehb = HB[bclip];
             }
         }
@@ -589,12 +675,14 @@ static int forward_wave(_Work_Data *work, _Align_Spec *spec, Alignment *align, P
   while (more && lasta >= besta - TRIM_MLAG)
     { int     k, n;
       int     ua, ub;
+      int uh=-1;
       BVEC    t;
       int     am, ac, ap;
       char   *a;
 
       low -= 1;
       hgh += 1;
+      if (capture) history_range(work,low-1,hgh+1,0);
 
       if (low <= vmin || hgh >= vmax)
         { int   span, wing;
@@ -697,10 +785,12 @@ static int forward_wave(_Work_Data *work, _Align_Spec *spec, Alignment *align, P
       ua = ub = -1;
       for (k = hgh; k >= low; k--)
         { int     y, m;
+          int pred=-1, hop=0, hy0=0, hnode=-1, oldhead=-1;
           int     ha, hb;
           int     c, d;
           BVEC    b;
           Pebble *pb;
+          if (capture) oldhead=work->heads[k-work->hlo];
 
           ap = ac;
           ac = am;
@@ -709,6 +799,7 @@ static int forward_wave(_Work_Data *work, _Align_Spec *spec, Alignment *align, P
           if (ac < am)
             if (am < ap)
               { c  = ap+1;
+                if (capture) { pred=uh; hop=CG_D; }
                 m  = n;
                 b  = t;
                 ha = ua;
@@ -716,6 +807,7 @@ static int forward_wave(_Work_Data *work, _Align_Spec *spec, Alignment *align, P
               }
             else
               { c  = am+1;
+                if (capture) { pred=work->heads[d-work->hlo]; hop=CG_I; }
                 m  = M[d];
                 b  = T[d]; 
                 ha = HA[d];
@@ -724,6 +816,7 @@ static int forward_wave(_Work_Data *work, _Align_Spec *spec, Alignment *align, P
           else
             if (ac < ap)
               { c  = ap+1;
+                if (capture) { pred=uh; hop=CG_D; }
                 m  = n;
                 b  = t;
                 ha = ua;
@@ -731,6 +824,7 @@ static int forward_wave(_Work_Data *work, _Align_Spec *spec, Alignment *align, P
               }
             else
               { c  = ac+2;
+                if (capture) { pred=oldhead; hop=CG_X; }
                 m  = M[k];
                 b  = T[k];
                 ha = HA[k];
@@ -742,6 +836,7 @@ static int forward_wave(_Work_Data *work, _Align_Spec *spec, Alignment *align, P
           b <<= 1;
 
           y = (c-k) >> 1;
+          hy0=y;
           while (1)
             { c = bseq[y];
               if (c == 4)
@@ -764,6 +859,7 @@ static int forward_wave(_Work_Data *work, _Align_Spec *spec, Alignment *align, P
               b = (b << 1) | 1;
             }
           c = (y << 1) + k;
+          if (capture) hnode=history_node(work,pred,hop,y-hy0);
 
           while (y+k >= NA[k])
             { if (cells[ha].mark < NA[k])
@@ -823,7 +919,7 @@ static int forward_wave(_Work_Data *work, _Align_Spec *spec, Alignment *align, P
                       { trima  = c;
                         trimy  = y;
                         trimd  = dif;
-                        trimha = ha;
+                        trimha = ha; if (capture) trimhist=hnode;
                         trimhb = hb;
                       }
                 }
@@ -833,6 +929,7 @@ static int forward_wave(_Work_Data *work, _Align_Spec *spec, Alignment *align, P
           n  = M[k];
           ua = HA[k];
           ub = HB[k];
+          if (capture) { uh=oldhead; work->heads[k-work->hlo]=hnode; }
           V[k]  = c;
           T[k]  = b;
           M[k]  = m;
@@ -852,7 +949,7 @@ static int forward_wave(_Work_Data *work, _Align_Spec *spec, Alignment *align, P
                   morea  = V[aclip];
                   morey  = (morea - aclip)/2;
                   mored  = dif;
-                  moreha = HA[aclip];
+                  moreha = HA[aclip]; if (capture) morehist=work->heads[aclip-work->hlo];
                   morehb = HB[aclip];
                 }
             }
@@ -863,7 +960,7 @@ static int forward_wave(_Work_Data *work, _Align_Spec *spec, Alignment *align, P
                   morea  = V[bclip];
                   morey  = (morea - bclip)/2;
                   mored  = dif;
-                  moreha = HA[bclip];
+                  moreha = HA[bclip]; if (capture) morehist=work->heads[bclip-work->hlo];
                   morehb = HB[bclip];
                 }
             }
@@ -905,7 +1002,7 @@ static int forward_wave(_Work_Data *work, _Align_Spec *spec, Alignment *align, P
       { trimx  = morea-morey;
         trimy  = morey;
         trimd  = mored;
-        trimha = moreha;
+        trimha = moreha; if (capture) trimhist=morehist;
         trimhb = morehb;
       }
     else
@@ -1004,6 +1101,7 @@ static int forward_wave(_Work_Data *work, _Align_Spec *spec, Alignment *align, P
   }
 
   *mind = low;
+  if (capture) history_cigar(work,trimhist,&work->forward_cigar,1);
   return (0);
 }
 
@@ -1042,6 +1140,7 @@ static int reverse_wave(_Work_Data *work, _Align_Spec *spec, Alignment *align, P
   int     moreha, morehb;
   int     more, morem, lasta;
   int     aclip, bclip;
+  int capture=work->capture, trimhist=-1, morehist=-1;
 
   hgh = maxd;
   low = mind;
@@ -1076,6 +1175,8 @@ static int reverse_wave(_Work_Data *work, _Align_Spec *spec, Alignment *align, P
     avail = 0;
   }
 
+  if (capture) history_range(work,low-1,hgh+1,1);
+
   more  = 1;
   aclip = -INT32_MAX;
   bclip =  INT32_MAX;
@@ -1093,11 +1194,13 @@ static int reverse_wave(_Work_Data *work, _Align_Spec *spec, Alignment *align, P
     a = aseq + low;
     for (k = low; k <= hgh; k++)
       { int     y, c, d;
+        int hy0=0, hnode=-1;
         int     ha, hb;
         int     na, nb;
         Pebble *pb;
 
         y = (mida-k) >> 1;
+        hy0=y;
 
         if (avail >= cmax-1)
           { cmax  = ((int) (avail*1.2)) + 10000;
@@ -1149,6 +1252,10 @@ static int reverse_wave(_Work_Data *work, _Align_Spec *spec, Alignment *align, P
             y -= 1;
           }
         c = (y << 1) + k;
+        if (capture) {
+          hnode=history_node(work,-1,0,hy0-y);
+          work->heads[k-work->hlo]=hnode;
+        }
 
         while (y+k <= na)
           { if (avail >= cmax)
@@ -1194,7 +1301,7 @@ static int reverse_wave(_Work_Data *work, _Align_Spec *spec, Alignment *align, P
         if (c < besta)
           { besta  = trima = lasta = c;
             besty  = trimy = y;
-            trimha = ha;
+            trimha = ha; if (capture) trimhist=hnode;
             trimhb = hb;
           }
 
@@ -1219,7 +1326,7 @@ static int reverse_wave(_Work_Data *work, _Align_Spec *spec, Alignment *align, P
             { morem  = M[aclip];
               morea  = V[aclip];
               morey  = (morea - aclip)/2;
-              moreha = HA[aclip];
+              moreha = HA[aclip]; if (capture) morehist=work->heads[aclip-work->hlo];
               morehb = HB[aclip];
             }
         }
@@ -1229,7 +1336,7 @@ static int reverse_wave(_Work_Data *work, _Align_Spec *spec, Alignment *align, P
             { morem  = M[bclip];
               morea  = V[bclip];
               morey  = (morea - bclip)/2;
-              moreha = HA[bclip];
+              moreha = HA[bclip]; if (capture) morehist=work->heads[bclip-work->hlo];
               morehb = HB[bclip];
             }
         }
@@ -1245,12 +1352,14 @@ static int reverse_wave(_Work_Data *work, _Align_Spec *spec, Alignment *align, P
   while (more && lasta <= besta + TRIM_MLAG)
     { int    k, n;
       int    ua, ub;
+      int uh=-1;
       BVEC   t;
       int    am, ac, ap;
       char  *a;
 
       low -= 1;
       hgh += 1;
+      if (capture) history_range(work,low-1,hgh+1,0);
 
       if (low <= vmin || hgh >= vmax)
         { int   span, wing;
@@ -1352,10 +1461,12 @@ static int reverse_wave(_Work_Data *work, _Align_Spec *spec, Alignment *align, P
       ua = ub = -1;
       for (k = low; k <= hgh; k++)
         { int     y, m;
+          int pred=-1, hop=0, hy0=0, hnode=-1, oldhead=-1;
           int     ha, hb;
           int     c, d;
           BVEC    b;
           Pebble *pb;
+          if (capture) oldhead=work->heads[k-work->hlo];
 
           am = ac;
           ac = ap;
@@ -1364,6 +1475,7 @@ static int reverse_wave(_Work_Data *work, _Align_Spec *spec, Alignment *align, P
           if (ac > ap)
             if (ap > am)
               { c = am-1;
+                if (capture) { pred=uh; hop=CG_D; }
                 m  = n;
                 b  = t;
                 ha = ua;
@@ -1371,6 +1483,7 @@ static int reverse_wave(_Work_Data *work, _Align_Spec *spec, Alignment *align, P
               }
             else
               { c  = ap-1;
+                if (capture) { pred=work->heads[d-work->hlo]; hop=CG_I; }
                 m  = M[d];
                 b  = T[d];
                 ha = HA[d];
@@ -1379,6 +1492,7 @@ static int reverse_wave(_Work_Data *work, _Align_Spec *spec, Alignment *align, P
           else
             if (ac > am)
               { c  = am-1;
+                if (capture) { pred=uh; hop=CG_D; }
                 m  = n;
                 b  = t;
                 ha = ua;
@@ -1386,6 +1500,7 @@ static int reverse_wave(_Work_Data *work, _Align_Spec *spec, Alignment *align, P
               }
             else
               { c  = ac-2;
+                if (capture) { pred=oldhead; hop=CG_X; }
                 m  = M[k];
                 b  = T[k];
                 ha = HA[k];
@@ -1397,6 +1512,7 @@ static int reverse_wave(_Work_Data *work, _Align_Spec *spec, Alignment *align, P
           b <<= 1;
 
           y = (c-k) >> 1;
+          hy0=y;
           while (1)
             { c = bseq[y];
               if (c == 4)
@@ -1419,6 +1535,7 @@ static int reverse_wave(_Work_Data *work, _Align_Spec *spec, Alignment *align, P
               b = (b << 1) | 1;
             }
           c = (y << 1) + k;
+          if (capture) hnode=history_node(work,pred,hop,hy0-y);
 
           while (y+k <= NA[k])
             { if (cells[ha].mark > NA[k])
@@ -1477,7 +1594,7 @@ static int reverse_wave(_Work_Data *work, _Align_Spec *spec, Alignment *align, P
                       { trima  = c;
                         trimy  = y;
                         trimd  = dif;
-                        trimha = ha;
+                        trimha = ha; if (capture) trimhist=hnode;
                         trimhb = hb;
                       }
                 }
@@ -1487,6 +1604,7 @@ static int reverse_wave(_Work_Data *work, _Align_Spec *spec, Alignment *align, P
           n  = M[k];
           ua = HA[k];
           ub = HB[k];
+          if (capture) { uh=oldhead; work->heads[k-work->hlo]=hnode; }
           V[k]  = c;
           T[k]  = b;
           M[k]  = m;
@@ -1506,7 +1624,7 @@ static int reverse_wave(_Work_Data *work, _Align_Spec *spec, Alignment *align, P
                   morea  = V[aclip];
                   morey  = (morea - aclip)/2;
                   mored  = dif;
-                  moreha = HA[aclip];
+                  moreha = HA[aclip]; if (capture) morehist=work->heads[aclip-work->hlo];
                   morehb = HB[aclip];
                 }
             }
@@ -1517,7 +1635,7 @@ static int reverse_wave(_Work_Data *work, _Align_Spec *spec, Alignment *align, P
                   morea  = V[bclip];
                   morey  = (morea - bclip)/2;
                   mored  = dif;
-                  moreha = HA[bclip];
+                  moreha = HA[bclip]; if (capture) morehist=work->heads[bclip-work->hlo];
                   morehb = HB[bclip];
                 }
             }
@@ -1559,7 +1677,7 @@ static int reverse_wave(_Work_Data *work, _Align_Spec *spec, Alignment *align, P
       { trimx  = morea-morey;
         trimy  = morey;
         trimd  = mored;
-        trimha = moreha;
+        trimha = moreha; if (capture) trimhist=morehist;
         trimhb = morehb;
       }
     else
@@ -1713,6 +1831,7 @@ static int reverse_wave(_Work_Data *work, _Align_Spec *spec, Alignment *align, P
     bpath->trace = btrace + btlen;
   }
 
+  if (capture) history_cigar(work,trimhist,&work->local_cigar,0);
   return (0);
 }
 
@@ -1813,6 +1932,13 @@ Path *Local_Alignment(Alignment *align, Work_Data *ework, Align_Spec *espec,
   printf("R1 (%d,%d) => (%d,%d) %d\n",
          (anti+low)/2,(anti-low)/2,apath->abpos,apath->bbpos,apath->diffs);
 #endif
+
+  if (work->capture) {
+    Cigar_Append(&work->local_cigar,&work->forward_cigar);
+    if (ACOMP(align->flags)) Cigar_Reverse(&work->local_cigar);
+    size_t bytes=history_bytes(work);
+    if (bytes>work->history_peak) work->history_peak=bytes;
+  }
 
   bpath->diffs = apath->diffs;
   if (ACOMP(align->flags))

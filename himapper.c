@@ -24,6 +24,8 @@
 
 #include <DB.h>
 #include "map.h"
+#include "mapq.h"
+#include "paf.h"
 #include "minimaxmer.h"
 
 static char *Usage[] =
@@ -598,6 +600,11 @@ int main(int argc, char *argv[])
   int         integrated_seed = 0;
   int         map_threads;
 
+  Paf_Source *paf_ref_source=NULL, *paf_read_source=NULL;
+  Paf_Name *paf_ref_names=NULL;
+  int paf_options=0;
+  const char *mapq_value=NULL;
+
   Align_Spec *settings;
 
   int    COVER, NOMAP;
@@ -696,10 +703,42 @@ int main(int argc, char *argv[])
               }
             seed_save_path = argv[i];
           }
+        else if (strcmp(argv[i],"--paf") == 0 ||
+                 strcmp(argv[i],"--paf-ref-fai") == 0 ||
+                 strcmp(argv[i],"--paf-read-fai") == 0 ||
+                 strcmp(argv[i],"--paf-method") == 0)
+          { const char *option=argv[i];
+            paf_options=1;
+            if (++i>=argc) { fprintf(stderr,"%s needs a value\n",option); exit(1); }
+            if (!strcmp(option,"--paf")) PAF_PATH=argv[i];
+            else if (!strcmp(option,"--paf-ref-fai")) PAF_REF_FAI=argv[i];
+            else if (!strcmp(option,"--paf-read-fai")) PAF_READ_FAI=argv[i];
+            else if (!strcmp(argv[i],"pts")) PAF_HISTORY=0;
+            else if (!strcmp(argv[i],"history")) PAF_HISTORY=1;
+            else { fprintf(stderr,"--paf-method must be pts or history\n"); exit(1); }
+          }
+        else if (strcmp(argv[i],"--keep-las") == 0) { PAF_KEEP_LAS=1; paf_options=1; }
+        else if (strcmp(argv[i],"--paf-stats") == 0) PAF_STATS=1;
+        else if (strcmp(argv[i],"--mapq") == 0)
+          { MAPQ_MODE = 1;
+            if (i+1 < argc &&
+                (strcmp(argv[i+1],"none") == 0 || strcmp(argv[i+1],"heuristic") == 0))
+              mapq_value = argv[i+1];
+          }
+        else if (strncmp(argv[i],"--mapq=",7) == 0)
+          { fprintf(stderr,"%s: --mapq takes no value; use --mapq to estimate MAPQ,"
+                           " or omit it to write 255\n",Prog_Name);
+            exit (1);
+          }
         else
           argv[j++] = argv[i];
       }
     argc = j;
+
+    if (MAPQ_MODE && !PAF_PATH)
+      { fprintf(stderr,"%s: --mapq requires --paf FILE\n",Prog_Name);
+        exit (1);
+      }
 
     KMER_LEN  = 32;
     MAX_REPS  = 0;
@@ -805,6 +844,12 @@ int main(int argc, char *argv[])
         argv[j++] = argv[i];
     argc = j;
 
+    if (argc != 5 && mapq_value != NULL)
+      { fprintf(stderr,"%s: --mapq takes no value (remove '%s');"
+                       " omit --mapq to write 255\n",Prog_Name,mapq_value);
+        exit (1);
+      }
+
     VERBOSE   = flags['v'];   //  Globally declared in map.h
     // PROFILE   = flags['p'];
     COVER     = flags['C'];
@@ -838,6 +883,12 @@ int main(int argc, char *argv[])
         fprintf(stderr,"          off => sort .las by A-read,A-position pairs");
         fprintf(stderr," (default for mapping)\n");
         // fprintf(stderr,"      -p: Output repeat profile track\n");
+        fprintf(stderr,"      --paf FILE: Write =/X CIGAR PAF instead of LAS.\n");
+        fprintf(stderr,"      --paf-method pts|history: selected-path reconstruction (default) or discovery traceback.\n");
+        fprintf(stderr,"      --paf-ref-fai FILE / --paf-read-fai FILE: original FASTA indexes (required for DAM).\n");
+        fprintf(stderr,"      --keep-las: retain LAS alongside PAF.\n");
+        fprintf(stderr,"      --paf-stats: measure alignment/output CPU and workspace (also usable with LAS only).\n");
+        fprintf(stderr,"      --mapq: estimate PAF MAPQ (default 255; requires --paf).\n");
         fprintf(stderr,"      -C: Output reference vs reads .las.\n");
         fprintf(stderr,"      -N: Do not output reads vs reference .las.\n");
         fprintf(stderr,"\n");
@@ -927,6 +978,17 @@ int main(int argc, char *argv[])
         }
       else
         mflag = FLAG_DOA;
+
+    if (PAF_PATH && !PAF_KEEP_LAS) {
+      if (COVER || NOMAP) { fprintf(stderr,"PAF-only output cannot use -C/-N; add --keep-las\n"); exit(1); }
+      mflag=0;
+    }
+    if (!PAF_PATH && paf_options) {
+      fprintf(stderr,"PAF options require --paf FILE\n"); exit(1);
+    }
+    if (PAF_PATH && (!*PAF_PATH || !strcmp(PAF_PATH,"-"))) {
+      fprintf(stderr,"--paf requires an output file path; stdout is reserved for mapping logs\n"); exit(1);
+    }
 
     // if (NOMAP && PROFILE)
     //   { fprintf(stderr,"%s: Cannot specify both N and p flags together\n",Prog_Name);
@@ -1048,6 +1110,12 @@ int main(int argc, char *argv[])
 
     read_DB(refdb,argv[1],MASK,MSTAT,0,KMER_LEN);
     ref_bytes = sizeof_DB(refdb);
+    if (PAF_PATH) {
+      paf_ref_source=Paf_Open_Source(refdb,argv[1],isdam,PAF_REF_FAI);
+      paf_ref_names=Paf_Read_Names(paf_ref_source,refdb);
+      Paf_Close_Source(paf_ref_source); paf_ref_source=NULL;
+    }
+
 
     ref_cache = (Ref_Block_Cache *)
         calloc((size_t)nblocks,sizeof(Ref_Block_Cache));
@@ -1079,6 +1147,10 @@ int main(int argc, char *argv[])
         Close_DB(&probe);
         Clean_Exit(1);
       }
+    if (PAF_PATH) {
+      paf_read_source=Paf_Open_Source(&probe,argv[3],bdam,PAF_READ_FAI);
+      Paf_Open_Output();
+    }
     Close_DB(&probe);
 
     bsuffix = bdam ? ".dam" : ".db";
@@ -1143,6 +1215,8 @@ int main(int argc, char *argv[])
 
     for (b = 1; b <= read_blocks; b++)
       { Minimaxmer_Block stream_block = {0};
+        Paf_Name *paf_read_names=NULL;
+        int paf_nreads=0;
         Minimaxmer_Block *generated_block = NULL;
         uint64 seed_resident_bytes = 0;
 
@@ -1233,6 +1307,11 @@ int main(int argc, char *argv[])
               bindex = Load_Kpos_Block(read_kpos,b,0,bblock,&blen);
           }
 
+        if (PAF_PATH) {
+          paf_nreads=bblock->nreads;
+          paf_read_names=Paf_Read_Names(paf_read_source,bblock);
+          Paf_Set_Names(paf_read_names,paf_ref_names);
+        }
         Begin_Mapping_Block(bblock);
         started = 0;
         for (k = 1; k <= nblocks; k++)
@@ -1329,6 +1408,7 @@ int main(int argc, char *argv[])
         if (VERBOSE)
           printf("\nFinding best matches for block %s\n",broot);
         Reporter(broot,bblock,aroot,refdb,settings,mflag);
+        Paf_Free_Names(paf_read_names,paf_nreads);
         Stop_Filter_Workers();
 
         if (integrated_seed)
@@ -1393,6 +1473,9 @@ int main(int argc, char *argv[])
     free(ref_cache);
     Free_DB_Stub(read_stub);
     Free_DB_Stub(ref_stub);
+    Paf_Free_Names(paf_ref_names,refdb->nreads);
+    Paf_Close_Source(paf_read_source);
+    if (PAF_PATH) Paf_Close_Output();
     Close_DB(refdb);
     free(base);
     free(bpwd);

@@ -17,6 +17,7 @@
 #define _A_MODULE
 
 #include <DB.h>
+#include "cigar.h"
 
 #define TRACE_XOVR 125   //  If the trace spacing is not more than this value, then can
                          //    and do compress traces pts to 8-bit unsigned ints
@@ -164,6 +165,13 @@ void Complement_Seq(char *a, int n);
   typedef void Work_Data;
 
   Work_Data *New_Work_Data();
+
+  /* Optional full traceback during Local_Alignment, off by default. The result
+     follows the returned A-path orientation and lives until the next call. */
+  void Enable_Trace_History(Work_Data *work, int enabled);
+  const Cigar *Local_Cigar(Work_Data *work);
+  size_t Trace_History_Bytes(Work_Data *work);
+  size_t Alignment_Work_Bytes(Work_Data *work);
 
   void       Free_Work_Data(Work_Data *work);
 
