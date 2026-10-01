@@ -120,7 +120,9 @@ typedef struct
    secondary mappings, and invalid/incomplete evidence receive zero.
    identity and unique_ratio must be finite and in [0,1].  An absent aligned
    competitor has aligned=0; an absent unaligned competitor has drop_score=0.
-   The result is rounded to the nearest integer and restricted to [0,60]. */
+   Valid positive main scores strictly exceeding every aligned competitor
+   (or with no aligned competitor) have a floor of 1, including after the
+   discarded-chain and joined-fragment caps.  Other results remain in [0,60]. */
 
 int Mapq_Calculate(const Mapq_Input *input, const Mapq_Competition *competition,
                    int min_chain_score, double unique_ratio);

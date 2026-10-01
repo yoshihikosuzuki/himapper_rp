@@ -78,8 +78,11 @@ int Mapq_Calculate(const Mapq_Input *input, const Mapq_Competition *competition,
         q = cap;
     }
 
-  if (q <= 0.)
-    return 0;
+  /* Like minimap2's DP-score floor, preserve a one-point distinction when
+     the selected alignment strictly beats every aligned competitor (or has
+     none).  Invalid evidence and tied/better competitors returned above. */
+  if (q < .501)
+    return 1;
   if (q >= 60.)
     return 60;
   return (int) (q + .499);
@@ -616,14 +619,16 @@ static int mapq_joined_cap(int original, const Mapq_Input *input, double unique_
 { double q;
   int    denominator = input->chain_score;
 
-  if (!original || competitor_score <= 0)
+  if (original <= 1 || competitor_score <= 0)
     return original;
   if (denominator < own_score)
     denominator = own_score;
   q = mapq_scale(input,unique_ratio) *
       (1. - clip_ratio((double) competitor_score / denominator));
-  if (q <= 0.)
-    return 0;
+  /* A positive original quality has already passed the strict alignment
+     score check.  Unaligned joined support may lower it, but keeps its floor. */
+  if (q < .501)
+    return 1;
   if (q >= original)
     return original;
   return (int) (q + .499);
@@ -1538,8 +1543,9 @@ void Mapq_Assign_Retained(Mapq_Work *work, int n, const Mapq_Shadow *shadows,
   work->joined_stamp = 0;
   work->ntargets = 0;
   for (int i = 0; i < n; ++i)
-    { if (work->group_quality[i]) work->support_targets[work->ntargets++] = ~i;
-      if (work->local_quality[i]) work->support_targets[work->ntargets++] = i;
+    { /* Joined support cannot lower a quality already at the score floor. */
+      if (work->group_quality[i] > 1) work->support_targets[work->ntargets++] = ~i;
+      if (work->local_quality[i] > 1) work->support_targets[work->ntargets++] = i;
     }
   if (!work->ntargets)
     return;
