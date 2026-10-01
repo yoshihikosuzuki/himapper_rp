@@ -11,8 +11,13 @@ module load ${_DALIGNER} ${_PYTHON}
 set -x
 THREADS=${SLURM_CPUS_PER_TASK:-16}
 HIM="$REPO/himapper"
-RUN_DIR="$D_HIMAPPER/ref-seed_read-seed"
-HIMAPPER_TMP="$WG_TMP_ROOT/himapper"
+METHOD=${1:-pts}
+case "$METHOD" in
+  pts) RUN_DIR="$D_HIMAPPER/ref-seed_read-seed"; PAF_ARGS=(--keep-las) ;;
+  history) RUN_DIR="$D_HIMAPPER/history"; PAF_ARGS=() ;;
+  *) echo 'Expected pts or history' >&2; exit 2 ;;
+esac
+HIMAPPER_TMP="$WG_TMP_ROOT/himapper-${METHOD}-${SLURM_JOB_ID:-local}"
 mkdir -p "$RUN_DIR" "$HIMAPPER_TMP"
 cd "$RUN_DIR"
 
@@ -37,9 +42,13 @@ if [[ "$MAP_START" == map ]]; then
     exit 1
   fi
 
-  SEED_MODE=${HIMAPPER_SEED_MODE:-pipeline}
+  SEED_MODE=${HIMAPPER_SEED_MODE:-separate}
   SEED_THREAD_OVERRIDE=${HIMAPPER_SEED_THREADS:-}
   case "$SEED_MODE" in
+    separate)
+      SEED_THREADS=0
+      MAP_THREADS=$THREADS
+      ;;
     serial)
       if [[ -n "$SEED_THREAD_OVERRIDE" ]]; then
         if [[ ! "$SEED_THREAD_OVERRIDE" =~ ^[0-9]{1,3}$ ]] ||
@@ -87,6 +96,11 @@ if [[ "$MAP_START" == map ]]; then
     --seed-window "$HIMAPPER_WS"
     --seed-spacing "$HIMAPPER_WS"
   )
+  READ_SEEDS=generate
+  if [[ "$SEED_MODE" == separate ]]; then
+    SEED_ARGS=()
+    READ_SEEDS="$D_HIMAPPER/.reads.minimax.kpos"
+  fi
   if [[ -n "${HIMAPPER_SAVE_READ_KPOS:-}" ]]; then
     SEED_ARGS+=(--save-read-kpos "$HIMAPPER_SAVE_READ_KPOS")
   fi
@@ -99,10 +113,14 @@ case "$MAP_START" in
   map)
     run_timed "$RUN_DIR/seed-map.time" \
       "$HIM" -k"$KMER" -1 -v -T"$THREADS" -P"$HIMAPPER_TMP" \
-      "${SEED_ARGS[@]}" \
+      --mapq --paf "$RUN_DIR/map.paf" --paf-method "$METHOD" \
+      --paf-ref-fai "${REF}.fai" --paf-read-fai "${READS}.fai" \
+      "${PAF_ARGS[@]}" "${SEED_ARGS[@]}" \
       ref.dam "$D_HIMAPPER/.ref.minimax.kpos" \
-      reads.dam generate
-    LAcat "reads.@1-${NB}.ref.las" > "$RUN_DIR/reads.ref.las"
+      reads.dam "$READ_SEEDS"
+    if [[ "$METHOD" == pts ]]; then
+      LAcat "reads.@1-${NB}.ref.las" > "$RUN_DIR/reads.ref.las"
+    fi
     ;;
   placement)
     if [[ ! -s "$RUN_DIR/reads.ref.las" ]]; then
@@ -116,6 +134,10 @@ case "$MAP_START" in
     ;;
 esac
 
+if [[ "$METHOD" == history ]]; then
+  touch "$RUN_DIR/COMPLETE"
+  exit 0
+fi
 REF_LAYOUT="$RUN_DIR/ref.dam.layout"
 MAPPING_TMP="$RUN_DIR/mapping.tsv.${SLURM_JOB_ID:?}.tmp"
 "$DAZZ_DB_ROOT/DBshow" -n ref.dam > "$REF_LAYOUT"
@@ -127,3 +149,5 @@ LAshow reads ref.dam "$RUN_DIR/reads.ref.las" 2>/dev/null \
   > "$MAPPING_TMP"
 mv -f "$MAPPING_TMP" "$RUN_DIR/mapping.tsv"
 trap - EXIT
+
+touch "$RUN_DIR/COMPLETE"

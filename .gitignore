@@ -11,6 +11,11 @@ himapper
 minimaxmer
 minimaxmer-lib.o
 
+static/
+evaluation/
+dev/mapper_experiments/
+dev/mapq_tests/
+docs/
 tests/
 plots/
 work*/
@@ -18,3 +23,6 @@ work*/
 !work*/scripts/
 !work*/scripts/*.py
 !work*/scripts/*.awk
+work_truth/
+work_nucflag_las_probe/
+mapping_truth/

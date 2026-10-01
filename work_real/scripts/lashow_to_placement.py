@@ -8,10 +8,14 @@ For reverse hits, however, LAshow assumes that the whole scaffold was reverse
 complemented, whereas himapper reverse complements each N-delimited DAM contig.
 ``--ref-layout`` supplies the metadata needed to correct that difference.
 
-By default, group DALIGNER START/NEXT pieces into candidate chains and emit
-the chain with the largest query-coordinate span for each read:
+By default, reconstruct DALIGNER START/NEXT chains, join compatible nearby
+chains (100,000 bp distance, 1% overlap), and emit the path with the largest
+union of aligned query intervals for each read:
   columns: read_name  hap  ctg  start  end  strand
-With --all, emit every candidate chain in LAshow input order:
+This shared default applies to both ONT and HiFi. --no-merge-chains restores
+the historical largest-query-bounding-span chain selection.
+With --all, emit every ORIGINAL START/NEXT chain in LAshow input order,
+without between-chain joining:
   columns: read_name  hap  ctg  start  end  strand  ref_bounding_span
 
 Coordinates are zero-based, half-open FASTA-scaffold coordinates.  The final
@@ -25,13 +29,18 @@ hap = mat/pat from the contig-name suffix (_MATERNAL/_PATERNAL).
 Usage:
   DBshow -n ref.dam > ref.dam.layout
   LAshow reads.dam ref.dam reads.ref.las | \\
-    lashow_to_placement.py [--all] --ref-layout ref.dam.layout \\
+    lashow_to_placement.py [--all | --no-merge-chains] \\
+      [--merge-distance 100000] [--merge-overlap-percent 1] \\
+      --ref-layout ref.dam.layout \\
       <reads.names> <ctg.names> > mapping.tsv
   (reads.names / ctg.names: one name per line, in DAM/fasta order)
 """
 import argparse
 import re
 import sys
+
+DEFAULT_MERGE_DISTANCE = 100000
+DEFAULT_MERGE_OVERLAP_PERCENT = 1
 
 NUM = r"[\d,]+"
 LINE = re.compile(
@@ -268,7 +277,7 @@ def bound_chain(chain):
 
 
 def choose_chain(chains):
-    """Select maximum query-span chain, retaining the first exact tie."""
+    """Historical selector: maximum query span, first exact tie."""
     if not chains:
         raise ValueError("cannot choose from an empty chain collection")
     best = bound_chain(chains[0])
@@ -280,6 +289,101 @@ def choose_chain(chains):
             best = bounded
             best_span = span
     return best
+
+
+def query_interval_union(intervals):
+    """Count aligned query bases once, without rewarding internal gaps."""
+    merged = []
+    for start, end in sorted(intervals):
+        if end <= start:
+            raise ValueError("empty/reversed aligned query interval")
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return tuple(merged)
+
+
+def choose_merged_chain(chains, distance=DEFAULT_MERGE_DISTANCE,
+                        overlap_percent=DEFAULT_MERGE_OVERLAP_PERCENT):
+    """Select the exact maximum aligned-query-union path of compatible chains.
+
+    Both query and oriented-reference endpoints must advance on the same read,
+    reference, DAM contig and strand. Signed gaps gq/gr satisfy
+    max(abs(gq), abs(gr), abs(gq-gr)) <= distance. Overlap on each axis is at
+    most overlap_percent of the shorter chain's bounding span on that axis.
+    Ties prefer fewer chains, then the earliest original chain-index sequence.
+    Truth coordinates, gap penalties and search-state cutoffs are not used.
+
+    Keep this implementation self-contained: experiment snapshots copy this
+    script as a single file. The historical START/NEXT groups remain intact.
+    """
+    if distance < 0 or not 0 <= overlap_percent < 100:
+        raise ValueError("invalid chain merge distance or overlap percentage")
+    if not chains:
+        raise ValueError("cannot choose from an empty chain collection")
+    bounded = [bound_chain(chain) for chain in chains]
+    if len(chains) == 1:
+        return bounded[0]
+    queries = [query_interval_union(
+        (s["query_start"], s["query_end"]) for s in chain
+    ) for chain in chains]
+    oriented = [
+        (b["reference_start"], b["reference_end"]) if b["strand"] == "+"
+        else (-b["reference_end"], -b["reference_start"])
+        for b in bounded
+    ]
+
+    def compatible(i, j):
+        a, b = bounded[i], bounded[j]
+        if any(a[key] != b[key] for key in (
+            "read_index", "reference_index", "contig_index", "strand"
+        )):
+            return False
+        aus, aue = oriented[i]
+        bus, bue = oriented[j]
+        if not (a["query_start"] < b["query_start"]
+                and a["query_end"] < b["query_end"]
+                and aus < bus and aue < bue):
+            return False
+        gq = b["query_start"] - a["query_end"]
+        gr = bus - aue
+        return (
+            max(abs(gq), abs(gr), abs(gq - gr)) <= distance
+            and 100 * max(0, -gq) <= overlap_percent * min(
+                a["query_end"] - a["query_start"],
+                b["query_end"] - b["query_start"])
+            and 100 * max(0, -gr) <= overlap_percent * min(aue - aus, bue - bus)
+        )
+
+    order = sorted(range(len(chains)), key=lambda i: (
+        bounded[i]["query_start"], bounded[i]["query_end"], i))
+    states = [{} for _ in chains]
+    best_path = best_key = None
+    for j in order:
+        states[j][queries[j]] = (j,)
+        for i in order:
+            if not compatible(i, j):
+                continue
+            for query, path in states[i].items():
+                merged = query_interval_union((*query, *queries[j]))
+                candidate = (*path, j)
+                previous = states[j].get(merged)
+                if previous is None or (len(candidate), candidate) < (len(previous), previous):
+                    states[j][merged] = candidate
+        # Equal unions ending at the same chain have identical future gains;
+        # retaining the preferred path is exact, not a beam approximation.
+        for query, path in states[j].items():
+            key = (-sum(end - start for start, end in query), len(path), path)
+            if best_key is None or key < best_key:
+                best_key, best_path = key, path
+    selected = [bounded[i] for i in best_path]
+    result = dict(selected[0])
+    for key in ("query_start", "reference_start"):
+        result[key] = min(b[key] for b in selected)
+    for key in ("query_end", "reference_end"):
+        result[key] = max(b[key] for b in selected)
+    return result
 
 
 def emit_placement(placement, reads, scaffolds, *, include_span=False):
@@ -300,12 +404,16 @@ def emit_placement(placement, reads, scaffolds, *, include_span=False):
     print("\t".join(fields))
 
 
-def emit_read(read_index, chains, reads, scaffolds, *, emit_all):
+def emit_read(read_index, chains, reads, scaffolds, *, emit_all,
+              merge_distance=DEFAULT_MERGE_DISTANCE,
+              merge_overlap_percent=DEFAULT_MERGE_OVERLAP_PERCENT):
     """Emit either every chain or the representative chain for one read."""
     if emit_all:
         placements = [bound_chain(chain) for chain in chains]
-    else:
+    elif merge_distance is None:
         placements = [choose_chain(chains)]
+    else:
+        placements = [choose_merged_chain(chains, merge_distance, merge_overlap_percent)]
     for placement in placements:
         if placement["read_index"] != read_index:
             raise ValueError("one read group contains a foreign chain segment")
@@ -325,6 +433,8 @@ def convert_chains(
     scaffold_lengths,
     *,
     emit_all=False,
+    merge_distance=DEFAULT_MERGE_DISTANCE,
+    merge_overlap_percent=DEFAULT_MERGE_OVERLAP_PERCENT,
 ):
     """Stream sorted LAshow rows and emit bounded candidate chains."""
     current_read = None
@@ -356,6 +466,8 @@ def convert_chains(
                     reads,
                     scaffolds,
                     emit_all=emit_all,
+                    merge_distance=merge_distance,
+                    merge_overlap_percent=merge_overlap_percent,
                 )
             current_read = read_index
             chains = []
@@ -383,6 +495,8 @@ def convert_chains(
             reads,
             scaffolds,
             emit_all=emit_all,
+            merge_distance=merge_distance,
+            merge_overlap_percent=merge_overlap_percent,
         )
 
 
@@ -398,6 +512,18 @@ def main():
         ),
     )
     ap.add_argument(
+        "--no-merge-chains", action="store_true",
+        help="restore historical maximum-query-bounding-span single-chain selection",
+    )
+    ap.add_argument(
+        "--merge-distance", type=int, default=DEFAULT_MERGE_DISTANCE,
+        help="maximum absolute query/reference gap and gap difference, in bp [100000]",
+    )
+    ap.add_argument(
+        "--merge-overlap-percent", type=int, default=DEFAULT_MERGE_OVERLAP_PERCENT,
+        help="maximum overlap as percent of the shorter chain span on each axis [1]",
+    )
+    ap.add_argument(
         "--ref-layout",
         required=True,
         help="output of 'DBshow -n ref.dam'",
@@ -405,6 +531,10 @@ def main():
     ap.add_argument("reads_names", help="read names, one per line, in DAM/fasta order")
     ap.add_argument("ctg_names", help="contig names, one per line, in DAM/fasta order")
     args = ap.parse_args()
+    if args.merge_distance < 0:
+        ap.error("--merge-distance must be nonnegative")
+    if not 0 <= args.merge_overlap_percent < 100:
+        ap.error("--merge-overlap-percent must be between 0 and 99")
     reads = load_names(args.reads_names)
     ctgs = load_names(args.ctg_names)
     contigs, scaffold_lengths = load_ref_layout(args.ref_layout, ctgs)
@@ -416,6 +546,8 @@ def main():
         contigs,
         scaffold_lengths,
         emit_all=args.all,
+        merge_distance=None if args.no_merge_chains else args.merge_distance,
+        merge_overlap_percent=args.merge_overlap_percent,
     )
 
 

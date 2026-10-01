@@ -1,6 +1,6 @@
 # himapper_rp
 
-Fast, haplotype-aware HiFi read mapper using relative k-mer profiles.
+Fast, haplotype-aware HiFi read mapper using k-mer count profiles.
 
 ## Incorporated repositories
 
@@ -57,7 +57,7 @@ The `PERIODIC_MASK_V1` counters named `*_mask_bases` report the full maximal
 tract span actually masked, including a possible terminal partial motif unit;
 the cutoff comparison itself always uses complete motif units.
 
-The default seed selector keeps the historical
+The default seed selector keeps the
 `(genome_count, -reads_count, canonical_ntHash % 2003)` priority.  When a
 window has several occurrences of the same minimum tuple, it uses robust
 winnowing: the selected occurrence is retained while it remains a minimum.
@@ -144,6 +144,48 @@ writes timing to `seed-map.time` and does not save it.
 A multi-block reads DB produces `reads.1.ref.las`,
 `reads.2.ref.las`, and so on. A single-block DB produces `reads.ref.las`.
 
+### Native PAF with base-level CIGAR
+
+Use `--paf FILE` to write one PAF directly from the selected alignments across
+all read blocks. Its `cg:Z:` tag uses `=`, `X`, `I`, and `D`. This works with
+HiFi and ONT reads and with existing or generated read seeds:
+
+```sh
+himapper -1 -T16 \
+  --paf mappings.paf --paf-method pts \
+  --paf-ref-fai ref.fa.fai --paf-read-fai reads.fa.fai \
+  ref.dam .ref.minimax.kpos reads.dam .reads.minimax.kpos
+```
+
+For DAM inputs, the `.fai` files must describe the original FASTA inputs in
+their original order. They preserve scaffold/read lengths and coordinates,
+including terminal Ns. Create them once with `samtools faidx` if needed.
+
+`pts` (default) reconstructs only selected alignments, skips exact tracepoint
+intervals, and reuses the mapper's resident sequences. `history` preserves the
+base-level path during candidate alignment, using additional traceback and
+candidate-CIGAR memory. Both retain the existing placement/selection rules;
+their detailed indel placement can differ. Add `--keep-las` for the existing
+LAS files as well, or `--paf-stats` for CPU/workspace counters (also usable
+without `--paf`). Without `--keep-las`, PAF output skips LAS writing and sorting.
+
+PAF MAPQ is `255` (not estimated) by default. Add `--mapq` to estimate MAPQ
+from competing chains and alignments. This flag takes no value.
+This requires `--paf` and works with HiFi/ONT and both CIGAR methods. Values
+range from 0 to 60; secondary records receive 0. The heuristic does not change
+alignment selection, coordinates, or CIGARs. Its values are not calibrated
+error probabilities or directly equivalent to minimap2 MAPQ. Omit `--mapq`
+to retain the default 255.
+
+For NucFlag comparisons using MAPQ, preserve these values when converting
+PAF to BAM: omit `--mapq-constant 1` from the existing experiment converter
+command. See [MAPQ notes](MAPQ.md) for the formula, evidence,
+bounded storage, diagnostics and limitations.
+
+Records are not sorted; parallel output order can vary.
+For output semantics, implementation details, and measured
+tradeoffs, see [CIGAR PAF notes](docs/himapper_cigar_paf.md).
+
 When converting LAS output back to FASTA scaffold coordinates, first retain
 the N-delimited DAM layout and pass it to the placement converter:
 
@@ -158,9 +200,19 @@ The layout is required because a FASTA scaffold containing N runs becomes
 multiple DAM contigs.  Forward LAshow coordinates already contain `fpulse`;
 the converter adjusts only reverse hits for himapper's per-contig reverse
 complement convention.  By default, the converter reconstructs DALIGNER
-START/NEXT chains and emits the maximum-query-span chain for each read.
-Pass `--all` only for secondary diagnostics; it emits every reconstructed
-candidate chain in input order, one chain per row.  Because this produces
+START/NEXT chains, joins compatible nearby chains, and selects the path with
+the largest union of aligned query intervals for each read. The shared ONT
+and HiFi default is `--merge-distance 100000 --merge-overlap-percent 1`:
+chains must share the reference, N-delimited DAM contig and strand, advance
+on both query and oriented-reference axes, and have absolute query/reference
+gaps and gap difference at most 100 kb. Overlap is at most 1% of the shorter
+chain's bounding span on each axis. Ties prefer fewer chains, then earlier
+input chain indices. The emitted placement bounds the selected path.
+`--no-merge-chains` restores the historical maximum-query-bounding-span
+single-chain selection. The defaults apply when placements are regenerated;
+existing TSV files and frozen experiment scripts retain their original results.
+Pass `--all` only for secondary diagnostics; it emits every original START/NEXT
+chain without joining, in input order, one chain per row. Because this produces
 multiple rows per read, do not use it as input to primary evaluation or
 coverage plotting.
 

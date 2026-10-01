@@ -52,8 +52,8 @@ run_timed "$RUN_DIR/map.time" \
   reads.dam "$D_HIMAPPER/.reads.minimax.kpos"
 
 LAcat "reads.@1-${NB}.ref.las" > "$RUN_DIR/reads.ref.las"
-# The shared converter is chain-aware by default and emits the maximum
-# query-span START/NEXT chain for each read.
+# The shared converter joins nearby chains (100 kb / 1% overlap) by default
+# and selects the path with the largest union of aligned query intervals.
 LAshow reads ref.dam "$RUN_DIR/reads.ref.las" 2>/dev/null \
   | python3 "$SCRIPTS/lashow_to_placement.py" \
       --ref-layout "$REF_LAYOUT" \

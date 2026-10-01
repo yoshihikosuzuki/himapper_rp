@@ -25,9 +25,9 @@ minimaxmer-lib.o: minimaxmer.c minimaxmer.h nthash.h $(DAZZ_DB_HDR) $(FASTK_HDR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) \
 	  -DMINIMAXMER_NO_MAIN -DSKIP_GENE_CORE -c -o $@ minimaxmer.c
 
-himapper: himapper.c map.c map.h align.c align.h minimaxmer.h minimaxmer-lib.o \
+himapper: himapper.c map.c map.h mapq.c mapq.h align.c align.h cigar.c cigar.h paf.c paf.h minimaxmer.h minimaxmer-lib.o \
 	          $(DAZZ_DB_SRC) $(DAZZ_DB_HDR) $(FASTK_SRC) $(FASTK_HDR) copynum.h
-	$(CC) $(CPPFLAGS) $(CFLAGS) -DSKIP_GENE_CORE -o himapper himapper.c map.c align.c \
+	$(CC) $(CPPFLAGS) $(CFLAGS) -DSKIP_GENE_CORE -o himapper himapper.c map.c mapq.c align.c cigar.c paf.c \
 	  minimaxmer-lib.o $(DAZZ_DB_SRC) $(FASTK_SRC) -lpthread -lm
 
 clean:

@@ -7,6 +7,11 @@
 #SBATCH -N 1
 set -euo pipefail
 source config.sh
+# This historical pipeline must not overwrite the centralized v1.1 originals.
+if [[ -L "$D_REF/hg002.mat.fa.gz" || -L "$D_REF/hg002.pat.fa.gz" ]]; then
+  printf 'HG002 references are already centralized in static/hg002/v1.1; reuse the existing files.\n' >&2
+  exit 1
+fi
 module load ${_SAMTOOLS}
 set -x
 THREADS=${SLURM_CPUS_PER_TASK:-8}

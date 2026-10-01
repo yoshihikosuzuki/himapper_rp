@@ -1661,7 +1661,7 @@ static int MG_comp;
 
 typedef struct
   { Mapq_Shadow shadow[MAPQ_SHADOW_MAX];
-    Mapq_Join_Catalog joined;
+    Mapq_Fragment_Store fragments;
     uint64_t    next_id;
     size_t      word;
     int         length, nshadow, lost_score;
@@ -1718,7 +1718,7 @@ static void mapq_shadow(int ar, const Mapq_Shadow *s)
 static void mapq_release(void)
 {
   for (int i = 0; i < MQ_nreads; i++)
-    Mapq_Free_Join_Catalog(&MQ_reads[i].joined);
+    Mapq_Free_Fragment_Store(&MQ_reads[i].fragments);
   free(MQ_reads);
   free(MQ_repeat);
   free(MQ_overflow);
@@ -2363,6 +2363,7 @@ typedef struct {
   size_t mapq_peak;
   uint64_t mapq_hist[61];
   Mapq_Fragment_Stats fragment_stats;
+  size_t fragment_report_peak;
 } Report_Arg;
 
 static void* chain_thread(void* arg) {
@@ -2858,9 +2859,9 @@ static void* chain_thread(void* arg) {
     aread[ar].coff = cand;
     nfilt += ncan;
 
-    if (fragments && !Mapq_Fragment_Build(fragments,Kmer,MAX_GAP,
-                                         JUNCTION_PEN ? DRIFT_PEN_W : 0,
-                                         &MQ_reads[ar].joined))
+    if (fragments && !Mapq_Fragment_Save(fragments,Kmer,MAX_GAP,
+                                        JUNCTION_PEN ? DRIFT_PEN_W : 0,
+                                        &MQ_reads[ar].fragments))
       Clean_Exit(1);
 
 #ifdef TEST_CHAIN
@@ -3406,6 +3407,7 @@ static void* report_thread(void* arg) {
   int *sort_nuniq;    //  scratch used to keep nuniq paired through AMATCH_SORT
   Mapq_Evidence *match_evidence = NULL, *sort_evidence = NULL;
   Mapq_Work *mapq_work = NULL;
+  Mapq_Fragment_Work *mapq_fragments = NULL;
 
   int COmax;
   int nparts;
@@ -3449,9 +3451,10 @@ static void* report_thread(void* arg) {
   sort_nuniq = Malloc(sizeof(int) * Omax, "Allocating copy-evidence sort scratch");
   if (MAPQ_MODE) {
     mapq_work = Mapq_New_Work();
+    mapq_fragments = Mapq_New_Fragment_Work(PAF_STATS);
     match_evidence = Malloc(sizeof(Mapq_Evidence)*Omax,"Allocating MAPQ evidence");
     sort_evidence = Malloc(sizeof(Mapq_Evidence)*Omax,"Allocating MAPQ sort scratch");
-    if (!mapq_work || !match_evidence || !sort_evidence) Clean_Exit(1);
+    if (!mapq_work || !mapq_fragments || !match_evidence || !sort_evidence) Clean_Exit(1);
     data->mapq_peak = Mapq_Work_Bytes(mapq_work)+2*(size_t)Omax*sizeof(Mapq_Evidence);
   }
 
@@ -3860,10 +3863,14 @@ static void* report_thread(void* arg) {
         q->local_score = (int)((q->qe-q->qb)-DIFF_SCORE*p->diffs);
         q->identity = Mapq_Identity(q->qe-q->qb,q->re-q->rb,p->diffs);
         q->evidence = match_evidence[c];
+        q->trace = tbuf->trace + (uint64) p->trace;
+        q->trace_length = p->tlen;
+        q->trace_spacing = SPACING;
         ranks[c] = (int)(perm[c]-linker);
       }
-      Mapq_Assign(mapq_work,novl,MQ_reads[ar].shadow,MQ_reads[ar].nshadow,
-                   hithr,MQ_reads[ar].repeat_bases,&overflow,&read->joined);
+      Mapq_Assign_Retained(mapq_work,novl,read->shadow,read->nshadow,
+                            hithr,read->repeat_bases,&overflow,&read->fragments,
+                            mapq_fragments);
       bytes = Mapq_Work_Bytes(mapq_work)+2*(size_t)Omax*sizeof(Mapq_Evidence);
       if (bytes > data->mapq_peak) data->mapq_peak = bytes;
       if (PAF_STATS) data->mapq_cpu += Paf_Thread_Seconds()-started;
@@ -4025,6 +4032,14 @@ static void* report_thread(void* arg) {
   free(sort_evidence);
   free(match_evidence);
   Mapq_Free_Work(mapq_work);
+  if (mapq_fragments) {
+    Mapq_Fragment_Stats stats = Mapq_Fragment_Statistics(mapq_fragments);
+
+    data->fragment_stats.joins += stats.joins;
+    data->fragment_stats.cpu_seconds += stats.cpu_seconds;
+    data->fragment_report_peak = stats.allocated_bytes;
+    Mapq_Free_Fragment_Work(mapq_fragments);
+  }
   if (MR_doB) free(bmatch);
   free(amatch);
   free(acomp - 1);
@@ -4091,6 +4106,7 @@ void Begin_Mapping_Block(DAZZ_DB* block)
   tfilt = 0;
   for (i = 0; i < NTHREADS; i++) {
     memset(&parmr[i].fragment_stats,0,sizeof(Mapq_Fragment_Stats));
+    parmr[i].fragment_report_peak = 0;
     parmr[i].abeg =
         (int)filter_partition((int64)block->nreads, i);
     parmr[i].aend =
@@ -4536,11 +4552,11 @@ void Reporter(char* aname, DAZZ_DB* ablock, char* bname, DAZZ_DB* bblock,
 
   if (MAPQ_MODE && PAF_STATS) {
     uint64_t histogram[61] = {0}, shadows = 0, overflow = 0, repeats = 0;
-    uint64_t joined = 0, fragment_input = 0, fragment_skipped = 0, fragment_joins = 0;
+    uint64_t fragment_records = 0, fragment_input = 0, fragment_skipped = 0, fragment_joins = 0;
     size_t workspace = (size_t)MQ_nreads*sizeof(Mapq_Read) +
                         (MQ_words*(NTHREADS+2)+2)*sizeof(uint64_t);
     size_t candidate_bytes = 0;
-    size_t joined_bytes = 0, fragment_workspace = 0;
+    size_t fragment_bytes = 0, fragment_workspace = 0, fragment_report_workspace = 0;
     double cpu = 0, fragment_cpu = 0;
     int j;
 
@@ -4548,8 +4564,8 @@ void Reporter(char* aname, DAZZ_DB* ablock, char* bname, DAZZ_DB* bblock,
       shadows += MQ_reads[i].nshadow;
       overflow += MQ_reads[i].lost_score != 0;
       repeats += MQ_reads[i].repeat_bases;
-      joined += MQ_reads[i].joined.n;
-      joined_bytes += Mapq_Join_Bytes(&MQ_reads[i].joined);
+      fragment_records += MQ_reads[i].fragments.n;
+      fragment_bytes += Mapq_Fragment_Store_Bytes(&MQ_reads[i].fragments);
     }
     for (i = 0; i < NTHREADS; i++) {
       cpu += parmr[i].mapq_cpu;
@@ -4559,20 +4575,23 @@ void Reporter(char* aname, DAZZ_DB* ablock, char* bname, DAZZ_DB* bblock,
       fragment_joins += parmr[i].fragment_stats.joins;
       fragment_cpu += parmr[i].fragment_stats.cpu_seconds;
       fragment_workspace += parmr[i].fragment_stats.allocated_bytes;
+      fragment_report_workspace += parmr[i].fragment_report_peak;
       candidate_bytes += (size_t)parmr[i].cmax*
                            (sizeof(Candidate)-offsetof(Candidate,nseed));
       for (j = 0; j <= 60; j++) histogram[j] += parmr[i].mapq_hist[j];
     }
-    workspace += joined_bytes;
+    workspace += fragment_bytes+fragment_report_workspace;
     fprintf(stderr,"MAPQ_STATS\tmethod=heuristic\tcatalog_cpu=%.6f\tworkspace_bytes=%zu"
                    "\tcandidate_metadata_bytes=%zu\tshadow_records=%"PRIu64
                    "\toverflow_reads=%"PRIu64"\trepeat_bases=%"PRIu64
-                   "\tjoined_records=%"PRIu64"\tjoined_bytes=%zu"
+                   "\tfragment_store_records=%"PRIu64"\tfragment_store_bytes=%zu"
                    "\tfragment_cpu=%.6f\tfragment_workspace_bytes=%zu"
+                   "\tfragment_report_workspace_bytes=%zu"
                    "\tfragment_input=%"PRIu64"\tfragment_skipped=%"PRIu64
                    "\tfragment_joins=%"PRIu64"\thist=",
-            cpu,workspace,candidate_bytes,shadows,overflow,repeats,joined,joined_bytes,
-            fragment_cpu,fragment_workspace,fragment_input,fragment_skipped,fragment_joins);
+            cpu,workspace,candidate_bytes,shadows,overflow,repeats,fragment_records,fragment_bytes,
+            fragment_cpu,fragment_workspace,fragment_report_workspace,
+            fragment_input,fragment_skipped,fragment_joins);
     for (j = 0; j <= 60; j++) fprintf(stderr,"%s%"PRIu64,j ? "," : "",histogram[j]);
     fputc('\n',stderr);
   }

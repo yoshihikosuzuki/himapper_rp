@@ -14,7 +14,7 @@ TOOLS=(
   himapper="$D_HIMAPPER/ref-seed_read-seed/mapping.tsv"
   minimap2="$D_MM2/mapping.tsv"
   wm="$D_WM/mapping.tsv"
-#   wm2="$D_WM2/mapping.tsv"
+  wm2="$D_WM2/mapping.tsv"
 )
 
 RESOURCE_ARGS=()
@@ -24,26 +24,6 @@ if [[ -s "$FUSED_HIMAPPER_TIME" ]]; then
     --fused-read-seed-map-time "himapper=$FUSED_HIMAPPER_TIME"
   )
 fi
-
-# Rebuild and validate the derived mask so the summary always records the
-# current source annotations. Alignment strata cover the full Q60 truth set
-# and are filtered to the same masked population inside eval.py.
-# python3 "$REPO/work_real/scripts/build_eval_exclusion_mask.py" \
-#   --rdna-gap-bed "$EVAL_RDNA_GAP_BED" \
-#   --censat-bed "$EVAL_CENSAT_BED" \
-#   --output-bed "$EVAL_EXCLUSION_BED" \
-#   --metadata "$EVAL_EXCLUSION_METADATA" \
-#   --expected-intervals 84 \
-#   --expected-bp 164859611
-
-# for required in \
-#   "$D_EVAL/hapmer_strata.tsv" \
-#   "$EVAL_ALIGNMENT_STRATA"; do
-#   if [[ ! -s "$required" ]]; then
-#     echo "missing required evaluation stratum: $required" >&2
-#     exit 2
-#   fi
-# done
 
 SUMMARY_TMP="$D_EVAL/.summary.${SLURM_JOB_ID:-$$}.tmp"
 trap 'rm -f "$SUMMARY_TMP"' EXIT

@@ -99,6 +99,7 @@ def main():
     parser.add_argument("--metadata", required=True)
     parser.add_argument("--expected-intervals", type=int)
     parser.add_argument("--expected-bp", type=int)
+    parser.add_argument("--reference-label", default="T2T-HG002v1.1")
     args = parser.parse_args()
 
     rdna_records = load_bed(args.rdna_gap_bed)
@@ -135,7 +136,7 @@ def main():
         ("command", shlex.join(sys.argv)),
         ("python", platform.python_version()),
         ("coordinate_system", "0-based_half-open"),
-        ("reference", "T2T-HG002v1.1"),
+        ("reference", args.reference_label),
         ("rdna_gap_source", os.path.realpath(args.rdna_gap_bed)),
         ("rdna_gap_source_sha256", sha256(args.rdna_gap_bed)),
         ("rdna_gap_source_records", str(len(rdna_records))),

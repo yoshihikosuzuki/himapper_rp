@@ -20,6 +20,7 @@ _WINNOWMAP="winnowmap/2.03"
 _MERYL="meryl/1.3"
 _YAK="yak/0.1"
 _PYTHON="python/3.10.14"
+_SAMTOOLS="samtools/1.18"
 
 TIME_BIN="/usr/bin/time"
 run_timed() {
@@ -41,17 +42,17 @@ mkdir -p "$D_REF" "$D_READS" "$D_TRIO" "$D_EVAL" \
   "$D_HIMAPPER" "$D_MM2" "$D_WM" "$D_WM2"
 
 # Evaluation annotations and derived exclusion mask.
-EVAL_ANNOTATION_DIR="$WR/experiments/hotspot_coverage/annotations"
-EVAL_RDNA_GAP_BED="$EVAL_ANNOTATION_DIR/hg002v1.1.rDNA_GAP.envelope.bed"
-EVAL_CENSAT_BED="$EVAL_ANNOTATION_DIR/hg002v1.1.cenSatv2.0.bed"
-EVAL_EXCLUSION_BED="$D_EVAL/hg002v1.1.rDNA_GAP_and_active_HOR.bed"
-EVAL_EXCLUSION_METADATA="$D_EVAL/hg002v1.1.rDNA_GAP_and_active_HOR.metadata.tsv"
+EVAL_ANNOTATION_DIR="$REPO/static/hg002/v1.2/annotations"
+EVAL_RDNA_GAP_BED="$EVAL_ANNOTATION_DIR/hg002v1.2.rDNA_GAP.envelope.bed"
+EVAL_CENSAT_BED="$EVAL_ANNOTATION_DIR/hg002v1.2.cenSatv2.0.bed"
+EVAL_EXCLUSION_BED="$D_EVAL/hg002v1.2.rDNA_GAP_and_active_HOR.bed"
+EVAL_EXCLUSION_METADATA="$D_EVAL/hg002v1.2.rDNA_GAP_and_active_HOR.metadata.tsv"
 EVAL_ALIGNMENT_STRATA="$D_EVAL/alignment_strata.tsv"
 
 # Inputs and derived read cohort
 REF="$D_REF/dip.fa"
 READS_ALL="$D_READS/hg002.hifi.fastq.gz"
-TRUTH_SOURCE_PAF="$D_READS/truth_source.wm2.paf"
+TRUTH_SOURCE_PAF="$D_WM2/map.paf"
 READS="$D_READS/wg.reads.fa"
 READS_BASE="wg.reads"
 READ_NAMES="$D_READS/$READS_BASE.names"
@@ -63,7 +64,7 @@ MIN_READ_LENGTH=10000
 MIN_QUERY_COVERAGE=0.90
 MIN_TRUTH_MAPQ=60
 KMER=32
-HIMAPPER_WS=${HIMAPPER_WS:-100}
+HIMAPPER_WS=${HIMAPPER_WS:-200}
 MM2_K=19
 MM2_W=19
 DB_BLOCK_SIZE=200
@@ -75,4 +76,4 @@ CN_HASH_TIE=1
 CN_DUMP=0
 
 # Node-local/intermediate scratch; override at submission if needed.
-WG_TMP_ROOT=${WG_TMP_ROOT:-/grid2/yoshihiko_s/himapper_wg}
+WG_TMP_ROOT=${WG_TMP_ROOT:-/grid2/yoshihiko_s/himapper_wg_v1.2}

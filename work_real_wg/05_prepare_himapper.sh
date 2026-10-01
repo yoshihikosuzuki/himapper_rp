@@ -28,26 +28,31 @@ sha256sum "$DAZZ_DB_ROOT/fasta2DAM" "$DAZZ_DB_ROOT/DBshow" \
   "$REPO/fastkdual/FastKdual" "$REPO/minimaxmer"
 
 "$DAZZ_DB_ROOT/fasta2DAM" ref "$REF"
-"$DAZZ_DB_ROOT/fasta2DAM" reads "$READS"
+# The fixed read DB and its self-count table/profile are reused from archive.
+test -s reads.dam
+test -s reads.ktab
+test -s reads.prof
 
 "$DAZZ_DB_ROOT/DBsplit" -s200 -f ref.dam
-"$DAZZ_DB_ROOT/DBsplit" -s200 -f reads.dam
 
 ln -sf "$READ_NAMES" reads.names
 cut -f1 "${REF}.fai" > ref.names
 
 run_timed "$D_HIMAPPER/ref-profile.time" \
   "$FASTK_ROOT/FastK" -k"$KMER" -v -T"$THREADS" -t1 -p -P"$FASTK_TMP" ref.dam
-run_timed "$D_HIMAPPER/reads-dual-profile.time" \
-  "$REPO/fastkdual/FastKdual" -k"$KMER" -v -T"$THREADS" -t1 \
-  -p:ref -Nreads -Rreads.ref -P"$FASTK_TMP" reads.dam
+run_timed "$D_HIMAPPER/reads-ref-profile.time" \
+  "$FASTK_ROOT/FastK" -k"$KMER" -v -T"$THREADS" \
+  -p:ref -Nreads.ref -P"$FASTK_TMP" reads.dam
 run_timed "$D_HIMAPPER/ref-vs-reads-profile.time" \
   "$FASTK_ROOT/FastK" -k"$KMER" -v -T"$THREADS" -t1 -p:reads -Nref.reads \
   -P"$FASTK_TMP" ref.dam
 
-# Generate reference seeds.  Read seeds are generated in memory by himapper
-# during stage 07, so no intermediate read KPOS is written here.
+# Save both seed sets for the pts/history comparisons.
 run_timed "$D_HIMAPPER/ref-seeds.time" \
   "$REPO/minimaxmer" -T"$THREADS" -k"$KMER" \
   -w"$HIMAPPER_WS" -s"$HIMAPPER_WS" -l10 \
   ref.dam ref.prof ref.reads.prof "$D_HIMAPPER/.ref.minimax.kpos"
+run_timed "$D_HIMAPPER/read-seeds.time" \
+  "$REPO/minimaxmer" -T"$THREADS" -k"$KMER" \
+  -w"$HIMAPPER_WS" -s"$HIMAPPER_WS" -l-1 \
+  reads.dam reads.ref.prof reads.prof "$D_HIMAPPER/.reads.minimax.kpos"

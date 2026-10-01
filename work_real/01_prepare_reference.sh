@@ -7,6 +7,11 @@
 #SBATCH -N 1
 set -euo pipefail
 source config.sh
+# Keep the exact v1.1 FASTA used by historical mappings and indexes.
+if [[ -L "$REF_ALL" || -L "$REF" ]]; then
+  printf 'HG002 reference FASTAs are centralized; use the existing links instead of rebuilding in place.\n' >&2
+  exit 1
+fi
 module load ${_SAMTOOLS} ${_MINIMAP2}
 set -x
 THREADS=${SLURM_CPUS_PER_TASK:-16}
